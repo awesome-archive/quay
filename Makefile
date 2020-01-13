@@ -140,14 +140,11 @@ docker-build: pkgs build
 	git checkout $(NAME)
 	echo $(TAG)
 
-app-sre-docker-build:
-	# get named head (ex: branch, tag, etc..)
-	export NAME=$(shell git rev-parse --abbrev-ref HEAD)
-	# checkout commit so .git/HEAD points to full sha (used in Dockerfile)
-	echo "$(SHA)"
-	git checkout $(SHA)
-	$(BUILD_CMD) -t ${IMG} .
-	git checkout $(NAME)
+app-sre-docker-build-rhel7:
+	$(BUILD_CMD) -t ${IMG} -f Dockerfile.osbs .
+
+app-sre-docker-build-centos7:
+	$(BUILD_CMD) -t ${IMG} -f Dockerfile.centos7.osbs .
 
 run: license
 	goreman start
@@ -178,3 +175,7 @@ yapf-diff:
 
 yapf-test:
 	if [ `yapf -d -p $(MODIFIED_FILES) | wc -l` -gt 0 ] ; then false ; else true ;fi
+
+
+black:
+	black --line-length 100 --target-version py27 .
