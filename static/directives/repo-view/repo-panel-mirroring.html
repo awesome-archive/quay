@@ -81,6 +81,14 @@
             </td>
           </tr>
           <tr>
+            <td style="border-bottom: none"><label for="create_skopeo_timeout">Skopeo timeout interval: </label></td>
+            <td style="border-bottom: none"><input class="form-control" id="skopeo_timeout_interval" type="number" ng-model="vm.skopeoTimeout" placeholder="300" required min="300" max="43200"></input></td>
+            <td style="border-bottom: none">seconds</td>
+          </tr>
+          <tr>
+            <td colspan="3" style="text-align: center">Minimum timeout length: 300 seconds (5 minutes). Maximum timeout length: 43200 seconds (12 hours).</td>
+          </tr>
+          <tr>
             <td><label for="choose_robot">Robot User</label></td>
             <td>
               <span class="entity-search"
@@ -89,6 +97,7 @@
                     skip-permissions="true"
                     placeholder="'Select a ' + (repository.is_organization ? 'team or ' : '') + 'user...'"
                     current-entity="vm.robot"
+                    allowed-entities="['robot']"
                     pull-right="true"></span>
             </td>
           </tr>
@@ -132,6 +141,19 @@
               <input type="checkbox"
                       ng-model="vm.verifyTLS"
                       id="sync_verify_tls"></input>
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <label for="sync_unsigned_images">Accept Unsigned Images</label><br>
+              <small>
+                Allow unsigned images to be mirrored.
+              </small>
+            </td>
+            <td>
+              <input type="checkbox"
+                      ng-model="vm.unsignedImages"
+                      id="sync_unsigned_images"></input>
             </td>
           </tr>
           <tr>
@@ -251,6 +273,16 @@
           </td>
         </tr>
         <tr>
+          <td>
+            <label for="skopeo_timeout_interval">Skopeo timeout</label>
+          </td>
+          <td>
+            <a class="co-modify-link" ng-click="vm.showChangeSkopeoTimeoutInterval()">
+              {{ vm.skopeoTimeout | humanizeInterval }}
+            </a>
+          </td>
+        </tr>
+        <tr>
           <td><label for="view_sync_start_date">Next Sync Date</label></td>
           <td>
             <a style="float: left"
@@ -303,6 +335,17 @@
           </td>
           <td>
             <input type="checkbox" ng-click="vm.toggleVerifyTLS()" ng-checked="vm.verifyTLS"></input>
+          </td>
+        </tr>
+        <tr>
+          <td>
+            <label>Accept Unsigned Images</label><br>
+            <small>
+              Allow unsigned images to be mirrored.
+            </small>
+          </td>
+          <td>
+            <input type="checkbox" ng-click="vm.toggleUnsignedImages()" ng-checked="vm.unsignedImages"></input>
           </td>
         </tr>
         <tr>
@@ -361,124 +404,144 @@
 
     <!-- Modal: Change mirroring sync date dialog -->
     <div class="cor-confirm-dialog"
-         dialog-context="vm.syncStartDateChanges"
-         dialog-action="vm.changeSyncStartDate(info, callback)"
-         dialog-title="Update next synchronization date"
-         dialog-action-title="Update"
-         dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      Next Synchronization Date:
-      <span id="change_sync_start_date"
-            class="datetime-picker"
-            datetime="vm.syncStartDateChanges.values.sync_start_date"></span>
-    </form>
-  </div>
+          dialog-context="vm.syncStartDateChanges"
+          dialog-action="vm.changeSyncStartDate(info, callback)"
+          dialog-title="Update next synchronization date"
+          dialog-action-title="Update"
+          dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        Next Synchronization Date:
+        <span id="change_sync_start_date"
+              class="datetime-picker"
+              datetime="vm.syncStartDateChanges.values.sync_start_date"></span>
+      </form>
+    </div>
 
-  <!-- Modal: Change mirroring sync interval -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.syncIntervalChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update next synchronization date"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>Synchronization Interval</label>
-      <div>
-        <span class="interval-input" seconds="vm.syncIntervalChanges.values.sync_interval"></span>
-      </div>
-    </form>
-  </div>
+    <!-- Modal: Change mirroring sync interval -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.syncIntervalChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update sync interval"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>Synchronization Interval</label>
+        <div>
+          <span class="interval-input" seconds="vm.syncIntervalChanges.values.sync_interval"></span>
+        </div>
+      </form>
+    </div>
 
-  <!-- Modal: Change external repository -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.externalRepositoryChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update external repository"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      External Repository
-      <input type="text"
-             class="form-control"
-             ng-model="vm.externalRepositoryChanges.values.external_reference">
-    </form>
-  </div>
+    <!-- Modal: Change Skopeo Mirror Timeout -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.skopeoTimeoutChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update skopeo timeout"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label for="skopeo_timeout_interval_change" style="margin: 0px; vertical-align: middle;">Timeout: </label>
+        <input style="width: 60%; display: inline-flex;" class="form-control" id="skopeo_timeout_interval_change" type="number" ng-model="vm.skopeoTimeoutChanges.values.skopeo_timeout_interval" placeholder="300" required min="300" max="43200"></input>
+        <span style="vertical-align: middle;"> seconds</span>
+        <p></p>
+        <p style="text-align: left;">Minimum value: 300 seconds (5 minutes). Maximum value: 43200 seconds (12 hours).</p>
+      </form>
+    </div>
 
-  <!-- Modal: Change Credentials -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.credentialsChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update Credentials"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>Username</label>
-      <input type="text"
-             class="form-control"
-             ng-model="vm.credentialsChanges.values.external_registry_username">
-      <label>Password</label>
-      <input type="password"
-             class="form-control"
-             ng-model="vm.credentialsChanges.values.external_registry_password">
-    </form>
-  </div>
 
-  <!-- Modal: Change Tag Pattern -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.tagChanges"
-       dialog-action="vm.changeTagRules(info, callback)"
-       dialog-title="Update Tag Filter"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>Tags</label>
-      <input type="text" class="form-control" ng-model="vm.tagChanges.values.rule_value">
-    </form>
-  </div>
+    <!-- Modal: Change external repository -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.externalRepositoryChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update external repository"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        External Repository
+        <input type="text"
+              class="form-control"
+              ng-model="vm.externalRepositoryChanges.values.external_reference">
+      </form>
+    </div>
 
-  <!-- Modal: Change "HTTP Proxy" -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.httpProxyChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update HTTP Proxy"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>HTTP_PROXY</label>
-      <input type="text"
-             class="form-control"
-             ng-model="vm.httpProxyChanges.values.external_registry_config.proxy.http_proxy">
-    </form>
-  </div>
+    <!-- Modal: Change Credentials -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.credentialsChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update Credentials"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>Username</label>
+        <input type="text"
+               class="form-control"
+               ng-model="vm.credentialsChanges.values.external_registry_username"
+               autocomplete="new-username">
+        <label>Password</label>
+        <input type="password"
+               class="form-control"
+               ng-model="vm.credentialsChanges.values.external_registry_password"
+               autocomplete="new-password">
+      </form>
+    </div>
 
-  <!-- Modal: Change "HTTPs Proxy" -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.httpsProxyChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update HTTP Proxy"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>HTTPS_PROXY</label>
-      <input type="text"
-             class="form-control"
-             ng-model="vm.httpsProxyChanges.values.external_registry_config.proxy.https_proxy">
-    </form>
-  </div>
+    <!-- Modal: Change Tag Pattern -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.tagChanges"
+        dialog-action="vm.changeTagRules(info, callback)"
+        dialog-title="Update Tag Filter"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>Tags</label>
+        <input type="text" class="form-control" ng-model="vm.tagChanges.values.rule_value">
+      </form>
+    </div>
 
-  <!-- Modal: Change "No Proxy" -->
-  <div class="cor-confirm-dialog"
-       dialog-context="vm.noProxyChanges"
-       dialog-action="vm.changeConfig(info, callback)"
-       dialog-title="Update HTTP Proxy"
-       dialog-action-title="Update"
-       dialog-form="context.mirroringform">
-    <form name="context.mirroringform" class="co-single-field-dialog">
-      <label>NO_PROXY</label>
-      <input type="text"
-             class="form-control"
-             ng-model="vm.noProxyChanges.values.external_registry_config.proxy.no_proxy">
-    </form>
-  </div>
+    <!-- Modal: Change "HTTP Proxy" -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.httpProxyChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update HTTP Proxy"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>HTTP_PROXY</label>
+        <input type="text"
+              class="form-control"
+              ng-model="vm.httpProxyChanges.values.external_registry_config.proxy.http_proxy">
+      </form>
+    </div>
 
+    <!-- Modal: Change "HTTPs Proxy" -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.httpsProxyChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update HTTP Proxy"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>HTTPS_PROXY</label>
+        <input type="text"
+              class="form-control"
+              ng-model="vm.httpsProxyChanges.values.external_registry_config.proxy.https_proxy">
+      </form>
+    </div>
+
+    <!-- Modal: Change "No Proxy" -->
+    <div class="cor-confirm-dialog"
+        dialog-context="vm.noProxyChanges"
+        dialog-action="vm.changeConfig(info, callback)"
+        dialog-title="Update HTTP Proxy"
+        dialog-action-title="Update"
+        dialog-form="context.mirroringform">
+      <form name="context.mirroringform" class="co-single-field-dialog">
+        <label>NO_PROXY</label>
+        <input type="text"
+              class="form-control"
+              ng-model="vm.noProxyChanges.values.external_registry_config.proxy.no_proxy">
+      </form>
+    </div>
+
+  </div>
 </div>

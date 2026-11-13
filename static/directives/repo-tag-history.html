@@ -2,6 +2,7 @@
    <div class="cor-loader" ng-if="!historyEntries"></div>
 
    <span class="co-filter-box">
+    <label><input type="checkbox" ng-model="options.showFuture">Show Future</label>
     <input class="form-control" type="text" ng-model="filter" placeholder="Filter History...">
    </span>
 
@@ -17,6 +18,7 @@
           <td class="history-col">Tag Change</td>
           <td class="datetime-col hidden-sm hidden-xs">Date/Time</td>
           <td class="revert-col hidden-sm hidden-xs"><span ng-if="repository.can_write && !inReadOnlyMode">Revert</span></td>
+          <td class="delete-col hidden-sm hidden-xs"><span ng-if="Config.PERMANENTLY_DELETE_TAGS && repository.can_write && !inReadOnlyMode && repository.tag_expiration_s > 0">Permanently Delete</span></td>
         </thead>
         <tbody>
           <tr style="height: 20px;"><td colspan="4"></td></tr>
@@ -39,36 +41,31 @@
                   <span ng-switch-when="recreate">
                     was recreated pointing to
                     <manifest-link repository="repository"
-                          image-id="entry.docker_image_id"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                   </span>
                   <span ng-switch-when="create">
                     was created pointing to
                     <manifest-link repository="repository"
-                          image-id="entry.docker_image_id"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                   </span>
                   <span ng-switch-when="delete">
-                    was deleted
+                    <span ng-if="::isFuture(entry)">will expire</span>
+                    <span ng-if="::!isFuture(entry)">was deleted</span>
                   </span>
                   <span ng-switch-when="move">
                     was moved to
                     <manifest-link repository="repository"
-                          image-id="entry.docker_image_id"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                     from
                     <manifest-link repository="repository"
-                          image-id="entry.old_docker_image_id"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
                   </span>
                   <span ng-switch-when="revert">
                     was reverted to
                     <manifest-link repository="repository"
-                          image-id="entry.docker_image_id"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                     from
                     <manifest-link repository="repository"
-                          image-id="entry.old_docker_image_id"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
                   </span>
                 </span>
@@ -83,27 +80,37 @@
               </div>
             </td>
             <td class="revert-col hidden-xs hidden-sm">
-              <div ng-if="!entry.date_break && repository.can_write && !inReadOnlyMode" class="history-revert">
+              <div ng-if="!entry.date_break && repository.can_write && !inReadOnlyMode && !isFuture(entry)" class="history-revert">
                 <span ng-switch on="entry.action">
                   <a ng-switch-when="delete" ng-click="askRestoreTag(entry, true)">
                     Restore to
                     <manifest-link repository="repository"
-                          image-id="entry.docker_image_id"
                           manifest-digest="entry.manifest_digest"></manifest-link>
                   </a>
                   <a ng-switch-when="move" ng-click="askRestoreTag(entry, false)">
                     Revert to
                     <manifest-link repository="repository"
-                          image-id="entry.old_docker_image_id"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
                   </a>
                   <a ng-switch-when="revert" ng-click="askRestoreTag(entry, false)">
                     Restore to
                     <manifest-link repository="repository"
-                          image-id="entry.old_docker_image_id"
                           manifest-digest="entry.old_manifest_digest"></manifest-link>
                   </a>
                 </span>
+              </div>
+            </td>
+            <td class="delete-col hidden-xs hidden-sm">
+              <div ng-if="Config.PERMANENTLY_DELETE_TAGS && !entry.date_break && repository.can_write && !inReadOnlyMode && !isFuture(entry) && (entry.action=='delete' || entry.action == 'revert') && repository.tag_expiration_s > 0" class="history-delete">
+                <a ng-click="askPermanentlyDeleteTag(entry)">
+                  Delete <b>{{entry.tag_name}}</b>
+                  <manifest-link ng-if="entry.action=='delete'" repository="repository"
+                        manifest-digest="entry.manifest_digest"></manifest-link>
+                  <manifest-link ng-if="entry.action=='revert'"  repository="repository"
+                        manifest-digest="entry.old_manifest_digest"></manifest-link>
+                </a>
+                <i class="fa fa-info-circle dropdown-toggle" data-toggle="dropdown" data-title="The tag deleted cannot be restored within the time machine window and
+                references to the tag will be removed from tag history. Any active tags matching the name and manifest will not be effected." bs-tooltip></i>
               </div>
             </td>
           </tr>
@@ -112,7 +119,6 @@
    </div>
 
   <div class="tag-operations-dialog" repository="repository" repository-tags="repositoryTags"
-     image-loader="imageLoader"
      action-handler="tagActionHandler"></div>
 
  </div>

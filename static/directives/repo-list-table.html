@@ -31,6 +31,19 @@
       <a ng-click="orderBy('last_modified_datetime')">Last Modified</a>
     </td>
     <td class="hidden-xs"
+        ng-class="tablePredicateClass('state', options.predicate, options.reverse)"
+        style="min-width: 20px;"
+        ng-show="repoMirroringEnabled">
+      <a ng-click="orderBy('state')">State</a>
+    </td>
+
+    <td class="hidden-xs"
+        ng-class="tablePredicateClass('quota_report', options.predicate, options.reverse)"
+        style="min-width: 20px;"
+        ng-if="quotaManagementEnabled">
+      <a ng-click="orderBy('quota_report.quota_bytes')">Quota Consumed</a>
+    </td>
+    <td class="hidden-xs"
         ng-class="tablePredicateClass('popularity', options.predicate, options.reverse)"
         style="min-width: 20px;">
       <a ng-click="orderBy('popularity')">Activity</a>
@@ -38,7 +51,7 @@
     <td class="hidden-xs"
         ng-class="tablePredicateClass('is_starred', options.predicate, options.reverse)"
         style="width: 70px"
-        ng-if="loggedIn && repoKind != 'application' && !inReadOnlyMode">
+        ng-if="loggedIn && !inReadOnlyMode">
       <a ng-click="orderBy('is_starred')">Star</a>
     </td>
    </thead>
@@ -47,26 +60,38 @@
      <tr ng-repeat="repository in orderedRepositories.entries | slice:(reposPerPage * options.page):(reposPerPage * (options.page + 1))">
        <td class="repo-name-icon">
           <span class="avatar" size="24" data="::getAvatarData(repository.namespace)"></span>
-          <a href="/repository/{{ ::repository.namespace }}/{{ ::repository.name }}" ng-if="repoKind != 'application'">
+          <a href="/repository/{{ ::repository.namespace }}/{{ ::repository.name }}">
             <span class="namespace">{{ ::repository.namespace }}</span>
             <span class="name">{{ ::repository.name }}</span>
           </a>
-          <a href="/application/{{ ::repository.namespace }}/{{ ::repository.name }}" ng-if="repoKind == 'application'">
-            <span class="namespace">{{ ::repository.namespace }}</span>
-            <span class="name">{{ ::repository.name }}</span>
-          </a>
-        </td>
+       </td>
        <td class="last-modified">
          <span ng-if="::repository.last_modified">
            {{ ::repository.last_modified * 1000 | amCalendar }}
          </span>
          <span class="empty" ng-if="::!repository.last_modified">(Empty Repository)</span>
        </td>
+       <td class="repo-state" ng-show="repoMirroringEnabled">
+        <span>
+          {{ ::repository.state.replace('_', ' ').toLowerCase() }}
+        </span>
+      </td>
+
+       <td class="repo-quota hidden-xs" ng-show="quotaManagementEnabled">
+         <span ng-if="::repository.quota_report.quota_bytes">
+           <span ng-bind="::bytesToHumanReadableString(repository.quota_report.quota_bytes)"></span>
+         </span>
+         <span ng-if="::!repository.quota_report.quota_bytes"></span>
+         <span ng-if="::repository.quota_report.configured_quota">
+	       ({{ ::quotaPercentConsumed(repository) }}%)
+         </span>
+      </td>
+
        <td class="popularity hidden-xs">
          <span class="strength-indicator" value="::repository.popularity" maximum="::maxPopularity"
                log-base="10"></span>
        </td>
-       <td ng-show="loggedIn && repoKind != 'application' && !inReadOnlyMode">
+       <td ng-show="loggedIn && !inReadOnlyMode">
         <span class="repo-star" repository="::repository"
               star-toggled="starToggled({'repository': repository})"></span>
        </td>

@@ -1,48 +1,60 @@
 import logging
-import features
 
-from app import storage, image_replication_queue
-from data.database import (Image, ImageStorage, Repository, User, ImageStoragePlacement,
-                           ImageStorageLocation)
+import features
+from app import image_replication_queue, storage
 from data import model
+from data.database import (
+    ImageStorage,
+    ImageStorageLocation,
+    ImageStoragePlacement,
+    Manifest,
+    ManifestBlob,
+    Repository,
+    User,
+)
 from util.registry.replication import queue_storage_replication
 
+
 def backfill_replication():
-  encountered = set()
-  query = (Image
-           .select(Image, ImageStorage, Repository, User)
-           .join(ImageStorage)
-           .switch(Image)
-           .join(Repository)
-           .join(User))
+    encountered = set()
 
-  for image in query:
-    if image.storage.uuid in encountered:
-      continue
+    query = (
+        ManifestBlob.select(ManifestBlob, Repository, User)
+        .join(ImageStorage)
+        .switch(ManifestBlob)
+        .join(Repository)
+        .join(User)
+    )
 
-    namespace = image.repository.namespace_user
-    locations = model.user.get_region_locations(namespace)
-    locations_required = locations | set(storage.default_locations)
+    for manifest in query:
+        if manifest.blob.uuid in encountered:
+            continue
 
-    query = (ImageStoragePlacement
-             .select(ImageStoragePlacement, ImageStorageLocation)
-             .where(ImageStoragePlacement.storage == image.storage)
-             .join(ImageStorageLocation))
+        namespace = manifest.repository.namespace_user
+        locations = model.user.get_region_locations(namespace)
+        locations_required = locations | set(storage.default_locations)
 
-    existing_locations = set([p.location.name for p in query])
-    locations_missing = locations_required - existing_locations
-    if locations_missing:
-      print "Enqueueing image storage %s to be replicated" % (image.storage.uuid)
-      encountered.add(image.storage.uuid)
+        query = (
+            ImageStoragePlacement.select(ImageStoragePlacement, ImageStorageLocation)
+            .where(ImageStoragePlacement.storage == manifest.blob)
+            .join(ImageStorageLocation)
+        )
 
-      if not image_replication_queue.alive([image.storage.uuid]):
-        queue_storage_replication(image.repository.namespace_user.username, image.storage)
+        existing_locations = set([p.location.name for p in query])
+        locations_missing = locations_required - existing_locations
+        if locations_missing:
+            print("Enqueueing manifest blob %s to be replicated" % (manifest.blob.uuid))
+            encountered.add(manifest.blob.uuid)
+
+            if not image_replication_queue.alive([manifest.blob.uuid]):
+                queue_storage_replication(
+                    manifest.repository.namespace_user.username, manifest.blob
+                )
 
 
-if __name__ == '__main__':
-  logging.basicConfig(level=logging.INFO)
-  if not features.STORAGE_REPLICATION:
-    print "Storage replication is not enabled"
-  else:
-    backfill_replication()
-
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    if not features.STORAGE_REPLICATION:
+        print("Storage replication is not enabled")
+    else:
+        backfill_replication()

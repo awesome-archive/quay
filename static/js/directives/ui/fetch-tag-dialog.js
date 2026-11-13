@@ -26,6 +26,12 @@ angular.module('quay').directive('fetchTagDialog', function () {
         $scope.formats = [];
 
         $scope.formats.push({
+          'title': 'Podman Pull (by tag)',
+          'icon': 'podman-icon',
+          'command': 'podman pull {hostname}/{namespace}/{name}:{tag}'
+        });
+
+        $scope.formats.push({
           'title': 'Docker Pull (by tag)',
           'icon': 'docker-icon',
           'command': 'docker pull {hostname}/{namespace}/{name}:{tag}'
@@ -33,27 +39,14 @@ angular.module('quay').directive('fetchTagDialog', function () {
 
         if ($scope.currentTag && $scope.currentTag.manifest_digest) {          
           $scope.formats.push({
+            'title': 'Podman Pull (by digest)',
+            'icon': 'podman-icon',
+            'command': 'podman pull {hostname}/{namespace}/{name}@{manifest_digest}'
+          });
+          $scope.formats.push({
             'title': 'Docker Pull (by digest)',
             'icon': 'docker-icon',
             'command': 'docker pull {hostname}/{namespace}/{name}@{manifest_digest}'
-          });
-        }
-
-        if ($scope.repository && $scope.currentTag && !$scope.currentTag.is_manifest_list) {
-          $scope.formats.push({
-            'title': 'Squashed Docker Image',
-            'icon': 'ci-squashed',
-            'command': 'curl -L -f {http}://{pull_user}:{pull_password}@{hostname}/c1/squash/{namespace}/{name}/{tag} | docker load',
-            'require_creds': true,
-            'has_creds': UserService.isNamespaceAdmin($scope.repository.namespace)
-          });
-        }
-
-        if (Features.ACI_CONVERSION && $scope.currentTag && !$scope.currentTag.is_manifest_list) {
-          $scope.formats.push({
-            'title': 'rkt Fetch',
-            'icon': 'rocket-icon',
-            'command': 'rkt fetch {hostname}/{namespace}/{name}:{tag}'
           });
         }
       };

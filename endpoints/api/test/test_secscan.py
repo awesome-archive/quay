@@ -1,30 +1,43 @@
 import base64
-
-import pytest
-
-from data.registry_model import registry_model
-from endpoints.api.test.shared import conduct_api_call
-from endpoints.api.secscan import RepositoryImageSecurity, RepositoryManifestSecurity
-
 from test.fixtures import *
 
-@pytest.mark.parametrize('endpoint', [
-  RepositoryImageSecurity,
-  RepositoryManifestSecurity,
-])
-def test_get_security_info_with_pull_secret(endpoint, client):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tag = registry_model.get_repo_tag(repository_ref, 'latest', include_legacy_image=True)
-  manifest = registry_model.get_manifest_for_tag(tag, backfill_if_necessary=True)
+import pytest
+from mock import patch
 
-  params = {
-    'repository': 'devtable/simple',
-    'imageid': tag.legacy_image.docker_image_id,
-    'manifestref': manifest.digest,
-  }
+from data.registry_model import registry_model
+from endpoints.api.secscan import RepositoryManifestSecurity
+from endpoints.api.test.shared import conduct_api_call
+from endpoints.test.shared import gen_basic_auth
 
-  headers = {
-    'Authorization': 'Basic %s' % base64.b64encode('devtable:password'),
-  }
 
-  conduct_api_call(client, endpoint, 'GET', params, None, headers=headers, expected_code=200)
+@pytest.mark.parametrize(
+    "endpoint, anonymous_allowed, auth_headers, expected_code",
+    [
+        pytest.param(RepositoryManifestSecurity, True, gen_basic_auth("devtable", "password"), 200),
+        pytest.param(
+            RepositoryManifestSecurity, False, gen_basic_auth("devtable", "password"), 200
+        ),
+        pytest.param(RepositoryManifestSecurity, True, None, 401),
+        pytest.param(RepositoryManifestSecurity, False, None, 401),
+    ],
+)
+def test_get_security_info_with_pull_secret(
+    endpoint, anonymous_allowed, auth_headers, expected_code, client
+):
+    with patch("features.ANONYMOUS_ACCESS", anonymous_allowed):
+        repository_ref = registry_model.lookup_repository("devtable", "simple")
+        tag = registry_model.get_repo_tag(repository_ref, "latest")
+        manifest = registry_model.get_manifest_for_tag(tag)
+
+        params = {
+            "repository": "devtable/simple",
+            "manifestref": manifest.digest,
+        }
+
+        headers = {}
+        if auth_headers is not None:
+            headers["Authorization"] = auth_headers
+
+        conduct_api_call(
+            client, endpoint, "GET", params, None, headers=headers, expected_code=expected_code
+        )

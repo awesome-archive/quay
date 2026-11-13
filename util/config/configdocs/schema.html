@@ -215,27 +215,6 @@ Schema for Red Hat Quay<ul class="level0">
 </div>
 </li>
 <li class="schema item">
-<div class="name">BITTORRENT_ANNOUNCE_URL</div>
-<div class="type">[string]</div>
-<div class="required"></div>
-<div class="docs">
-<div class="title"></div>
-<div class="description">The URL of the announce endpoint on the bittorrent tracker</div>
-<div class="pattern">Pattern: ^http(s)?://(.)+$</div>
-<div class="x-example">Example: <code>https://localhost:6881/announce</code></div>
-</div>
-</li>
-<li class="schema item">
-<div class="name">BITTORRENT_PIECE_SIZE</div>
-<div class="type">[number]</div>
-<div class="required"></div>
-<div class="docs">
-<div class="title"></div>
-<div class="description">The bittorent piece size to use. If not specified, defaults to 512 * 1024.</div>
-<div class="x-example">Example: <code>524288</code></div>
-</div>
-</li>
-<li class="schema item">
 <div class="name">CONTACT_INFO</div>
 <div class="type">[array]</div>
 <div class="required"></div>
@@ -255,7 +234,7 @@ Schema for Red Hat Quay<ul class="level0">
 <div class="title"></div>
 <div class="description">Adds a link to send an e-mail</div>
 <div class="pattern">Pattern: ^mailto:(.)+$</div>
-<div class="x-example">Example: <code>mailto:support@quay.io</code></div>
+<div class="x-example">Example: <code>mailto:admin@example.com</code></div>
 </div>
 </li>
 <li class="schema item">
@@ -266,7 +245,7 @@ Schema for Red Hat Quay<ul class="level0">
 <div class="title"></div>
 <div class="description">Adds a link to visit an IRC chat room</div>
 <div class="pattern">Pattern: ^irc://(.)+$</div>
-<div class="x-example">Example: <code>irc://chat.freenode.net:6665/quay</code></div>
+<div class="x-example">Example: <code>irc://irc.libera.chat:6667/quay</code></div>
 </div>
 </li>
 <li class="schema item">
@@ -348,16 +327,6 @@ Schema for Red Hat Quay<ul class="level0">
 </div>
 </li>
 <li class="schema item">
-<div class="name">FEATURE_ACI_CONVERSION</div>
-<div class="type">[boolean]</div>
-<div class="required"></div>
-<div class="docs">
-<div class="title"></div>
-<div class="description">Whether to enable conversion to ACIs. Defaults to False</div>
-<div class="x-example">Example: <code>False</code></div>
-</div>
-</li>
-<li class="schema item">
 <div class="name">FEATURE_ACTION_LOG_ROTATION</div>
 <div class="type">[boolean]</div>
 <div class="required"></div>
@@ -423,17 +392,6 @@ Schema for Red Hat Quay<ul class="level0">
 <div class="docs">
 <div class="title"></div>
 <div class="description">Whether to support Bitbucket build triggers. Defaults to False</div>
-<div class="x-example">Example: <code>False</code></div>
-</div>
-</li>
-<li class="schema item">
-<div class="name">FEATURE_BITTORRENT</div>
-<div class="type">[boolean]</div>
-<div class="required"></div>
-<div class="docs">
-<div class="title"></div>
-<div class="description">Whether to allow using Bittorrent-based pulls. Defaults to False</div>
-<div class="x-reference"><a href="https://coreos.com/quay-enterprise/docs/latest/bittorrent.html">Reference: https://coreos.com/quay-enterprise/docs/latest/bittorrent.html</a></div>
 <div class="x-example">Example: <code>False</code></div>
 </div>
 </li>
@@ -896,7 +854,7 @@ Schema for Red Hat Quay<ul class="level0">
 <div class="required"></div>
 <div class="docs">
 <div class="title"></div>
-<div class="description">If specified, the e-mail address used as the `from` when Quay sends e-mails. If none, defaults to `support@quay.io`.</div>
+<div class="description">If specified, the e-mail address used as the `from` when Quay sends e-mails. If none, defaults to `admin@example.com`.</div>
 <div class="x-example">Example: <code>support@myco.com</code></div>
 </div>
 </li>

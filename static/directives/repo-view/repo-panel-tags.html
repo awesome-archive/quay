@@ -10,15 +10,16 @@
         Expanded
       </button>
     </div>
+
+    <div class="btn-group btn-group-sm">
+      <button class="btn" ng-class="!showCosignSignatures ? 'btn-default' : 'btn-primary active'"
+          ng-click="toggleCosignSignatureDisplay()">
+        {{ !showCosignSignatures ? 'Show Signatures' : 'Hide Signatures' }}
+      </button>
+    </div>
   </div>
 
  <h3 class="tab-header"><span class="hidden-xs">Repository </span>Tags</h3>
- <div class="co-alert co-alert-danger" ng-if="hasDefcon1">
-   One or more of your tags has an <strong>extremely critical</strong> vulnerability which should be addressed immediately:
-   <a href="{{ vuln.Link }}" ng-repeat="(key, vuln) in defcon1" style="margin-left: 10px;" ng-safenewtab>
-     {{ vuln.Name }}
-   </a>
- </div>
 
  <div class="co-check-bar">
    <span class="cor-checkable-menu" controller="checkedTags" filter="tags">
@@ -28,13 +29,22 @@
      <div class="cor-checkable-menu-item" item-filter="noTagFilter(item)">
       <i class="fa fa-square-o"></i>No Tags
      </div>
+     <div class="cor-checkable-menu-item" item-filter="signedTagFilter(item)">
+      <i class="fa fa-shield"></i>Signed Tags
+     </div>
+     <div class="cor-checkable-menu-item" item-filter="unsignedTagFilter(item)">
+      <i class="fa ci-shield-invalid-outline"></i>Unsigned Tags
+     </div>
      <div class="cor-checkable-menu-item" item-filter="commitTagFilter(item)">
       <i class="fa fa-git"></i>Commit SHAs
      </div>
+     <div class="cor-checkable-menu-item" item-filter="cosignTagFilter(item)">
+      <i class="fa fa-pencil-square"></i>Cosign Signatures
+     </div>
 
-     <div class="cor-checkable-menu-item" item-filter="imageIDFilter(it.image_id, item)"
-          ng-repeat="it in imageTrackEntries" ng-if="::it.visible">
-      <i class="fa fa-circle-o" ng-style="::{'color': it.color}"></i> {{ ::it.image_id.substr(0, 12) }}
+     <div class="cor-checkable-menu-item" item-filter="manifestDigestFilter(mt.manifest_digest, item)"
+          ng-repeat="mt in manifestTrackEntries" ng-if="::it.visible">
+      <i class="fa fa-circle-o" ng-style="::{'color': ,t.color}"></i>
      </div>
    </span>
 
@@ -116,16 +126,16 @@
         style="width: 140px;">
       <a ng-click="orderBy('expiration_date')" data-title="When the tag expires" data-container="body" bs-tooltip>Expires</a>
     </td>
-    <td class="hidden-xs hidden-sm" ng-if="imageTracks.length > maxTrackCount"
+    <td class="hidden-xs hidden-sm" ng-if="manifestTracks.length > maxTrackCount"
         style="width: 20px; position: relative;">
     </td>
     <td class="hidden-xs hidden-sm"
-        ng-class="tablePredicateClass('image_id', options.predicate, options.reverse)"
+        ng-class="tablePredicateClass('manifest_digest', options.predicate, options.reverse)"
         style="width: 140px;">
-      <a ng-click="orderBy('image_id')">Manifest</a>
+      <a ng-click="orderBy('manifest_digest')">Manifest</a>
     </td>
-    <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="it in imageTracks"
-        ng-if="imageTracks.length <= maxTrackCount"></td>
+    <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
+        ng-if="manifestTracks.length <= maxTrackCount"></td>
     <td class="options-col"></td>
     <td class="options-col"></td>
     <td class="hidden-xs hidden-sm" style="width: 4px"></td>
@@ -138,7 +148,12 @@
     <tr ng-class="expandedView ? 'expanded-view': ''">
       <td><span class="cor-checkable-item" controller="checkedTags" item="tag"></span></td>
       <td class="co-flowing-col">
-        <span class="tag-span"><span bo-text="tag.name"></span></span>
+        <span class="tag-span">
+          <span bo-text="tag.name"></span>
+          <span class="signing-valid" ng-if="::tag.cosign_signature_tag">
+            <i class="fa shield-icon ci-shield-check-full" data-title="This tag has been signed via cosign." bs-tooltip></i>
+          </span>
+        </span>
         <span class="manifest-list-icons" bo-if="tag.is_manifest_list">
           <i class="manifest-list-manifest-icon fa fa-{{ manifest.os }}"
              ng-repeat="manifest in manifestsOf(tag)"
@@ -167,14 +182,6 @@
           See Child Manifests
         </span>
 
-        <!-- No Digest -->
-        <span class="nodigest" ng-if="::!tag.manifest_digest"
-              data-title="The tag does not have a V2 digest and so is unsupported for scan"
-              bs-tooltip>
-          <span class="donut-chart" width="22" data="[{'index': 0, 'value': 1, 'color': '#eee'}]"></span>
-          Unsupported
-        </span>
-
         <!-- Manifest security view -->
         <manifest-security-view repository="::repository" manifest-digest="::tag.manifest_digest"
                                 ng-if="::(tag.manifest_digest && !tag.is_manifest_list)">
@@ -198,11 +205,11 @@
 
       <!-- Manifest link -->
       <td class="hidden-xs hidden-sm hidden-md image-track"
-          ng-if="imageTracks.length > maxTrackCount">
+          ng-if="manifestTracks.length > maxTrackCount">
         <span class="image-track-filled-dot"
-              ng-if="::trackEntryForImage[tag.image_id]"
-              ng-style="::{'backgroundColor': trackEntryForImage[tag.image_id].color}"
-              ng-click="::selectTrack(trackEntryForImage[tag.image_id])"
+              ng-if="::trackEntryForManifest[tag.manifest_digest]"
+              ng-style="::{'backgroundColor': trackEntryForManifest[tag.manifest_digest].color}"
+              ng-click="::selectTrack(trackEntryForManifest[tag.manifest_digest])"
               data-template-url="/static/directives/repo-view/image-tag-tooltip.html"
               data-placement="left"
               data-trigger="hover"
@@ -213,22 +220,22 @@
       <td class="hidden-xs hidden-sm image-id-col">
         <manifest-link repository="repository" image-id="tag.image_id" manifest-digest="tag.manifest_digest"></manifest-link>
       </td>
-      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="it in imageTracks"
-          ng-if="imageTracks.length <= maxTrackCount">
+      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
+          ng-if="manifestTracks.length <= maxTrackCount">
         <span class="image-track-dot"
-              ng-if="::it.entryByImageId[tag.image_id]"
-              ng-style="::{'borderColor': trackEntryForImage[tag.image_id].color}"
-              ng-click="::selectTrack(trackEntryForImage[tag.image_id])"
-              data-template-url="/static/directives/repo-view/image-tag-tooltip.html"
+              ng-if="::mt.entryByManifestDigest[tag.manifest_digest]"
+              ng-style="::{'borderColor': trackEntryForManifest[tag.manifest_digest].color}"
+              ng-click="::selectTrack(trackEntryForManifest[tag.manifest_digest])"
+              data-template-url="/static/directives/repo-view/manifest-tag-tooltip.html"
               data-placement="left"
               data-trigger="hover"
               data-animation="am-flip-x"
               data-auto-close="1"
               bs-popover></span>
         <span class="image-track-line"
-              ng-if="::getTrackEntryForIndex(it, $parent.$parent.$index)"
-              ng-class="::trackLineClass(it, $parent.$parent.$parent.$index)"
-              ng-style="::{'borderColor': getTrackEntryForIndex(it, $parent.$parent.$parent.$index).color}"></span>
+              ng-if="::getTrackEntryForIndex(mt, $parent.$parent.$index)"
+              ng-class="::trackLineClass(mt, $parent.$parent.$parent.$index)"
+              ng-style="::{'borderColor': getTrackEntryForIndex(mt, $parent.$parent.$parent.$index).color}"></span>
       </td>
       <td class="options-col">
         <i class="fa fa-download" data-title="Fetch Tag" bs-tooltip
@@ -281,19 +288,23 @@
         </manifest-security-view>
       </td>
 
-      <td colspan="1" class="hidden-xs"></td>
+      <!-- Size -->
+      <td class="hidden-xs">
+        <span bo-text="manifest.layers_compressed_size | bytes"></span>
+      </td>
+
       <td colspan="1" class="hidden-xs hidden-sm hidden-md"></td>
 
       <td class="hidden-xs hidden-sm image-id-col">
           <manifest-link repository="repository" manifest-digest="manifest.digest"></manifest-link>
       </td>
 
-      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="it in imageTracks"
-          ng-if="imageTracks.length <= maxTrackCount" bindonce>
+      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
+          ng-if="manifestTracks.length <= maxTrackCount" bindonce>
         <span class="image-track-line"
-          ng-if="::getTrackEntryForIndex(it, $parent.$parent.$parent.$parent.$index)"
-          ng-class="::trackLineExpandedClass(it, $parent.$parent.$parent.$parent.$parent.$index)"
-          ng-style="::{'borderColor': getTrackEntryForIndex(it, $parent.$parent.$parent.$parent.$parent.$index).color}"></span>
+          ng-if="::getTrackEntryForIndex(mt, $parent.$parent.$parent.$parent.$index)"
+          ng-class="::trackLineExpandedClass(mt, $parent.$parent.$parent.$parent.$parent.$index)"
+          ng-style="::{'borderColor': getTrackEntryForIndex(mt, $parent.$parent.$parent.$parent.$parent.$index).color}"></span>
       </td>
 
       <td class="options-col"></td>
@@ -309,10 +320,15 @@
         <div class="image-id-row">
           <manifest-link repository="repository" image-id="tag.image_id" manifest-digest="tag.manifest_digest"></manifest-link>
         </div>
-        
+
         <!-- Labels -->
         <div class="manifest-label-list" repository="repository"
              manifest-digest="tag.manifest_digest" cache="labelCache"></div>
+
+        <!-- Cosign Signatures -->
+        <div class="cosign-signature-row" ng-if="tag.cosign_signature_tag">
+          <cosign-link repository="repository" image-id="tag.image_id" manifest-digest="tag.cosign_signature_manifest_digest" tag-name="tag.cosign_signature_tag" tag-name="tag.cosign_signature_tag" signed-image-id="tag.image_id" signed-manifest-digest="tag.manifest_digest"></cosign-link>
+        </div>
 
         <!-- Delegations -->
         <div class="signing-delegations-list" ng-if="repository.trust_enabled">
@@ -320,12 +336,12 @@
         </div>
       </td>
 
-      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="it in imageTracks"
-          ng-if="imageTracks.length <= maxTrackCount" bindonce>
+      <td class="hidden-xs hidden-sm hidden-md image-track" ng-repeat="mt in manifestTracks"
+          ng-if="manifestTracks.length <= maxTrackCount" bindonce>
         <span class="image-track-line"
-          ng-if="::getTrackEntryForIndex(it, $parent.$parent.$index)"
-          ng-class="::trackLineExpandedClass(it, $parent.$parent.$parent.$index)"
-          ng-style="::{'borderColor': getTrackEntryForIndex(it, $parent.$parent.$parent.$index).color}"></span>
+          ng-if="::getTrackEntryForIndex(mt, $parent.$parent.$index)"
+          ng-class="::trackLineExpandedClass(mt, $parent.$parent.$parent.$index)"
+          ng-style="::{'borderColor': getTrackEntryForIndex(mt, $parent.$parent.$parent.$index).color}"></span>
       </td>
       <td></td>
       <td class="options-col hidden-xs hidden-sm"><!-- Whitespace col --></td>
@@ -346,7 +362,6 @@
 </div>
 
 <div class="tag-operations-dialog" repository="repository" repository-tags="repositoryTags"
-     image-loader="imageLoader"
      action-handler="tagActionHandler"
      labels-changed="handleLabelsChanged(manifest_digest)"></div>
 

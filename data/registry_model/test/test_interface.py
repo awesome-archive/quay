@@ -2,1094 +2,1698 @@
 
 import hashlib
 import json
+import os
 import uuid
-
 from datetime import datetime, timedelta
 from io import BytesIO
 
 import pytest
-
-from mock import patch
+from mock import MagicMock, patch
 from playhouse.test_utils import assert_query_count
 
-from app import docker_v2_signing_key, storage
+from app import docker_v2_signing_key, model_cache, repository_gc_queue, storage
 from data import model
-from data.database import (TagManifestLabelMap, TagManifestToManifest, Manifest, ManifestBlob,
-                           ManifestLegacyImage, ManifestLabel,
-                           TagManifest, TagManifestLabel, DerivedStorageForImage,
-                           TorrentInfo, Tag, TagToRepositoryTag, ImageStorageLocation)
+from data.cache import cache_key
 from data.cache.impl import InMemoryDataModelCache
-from data.registry_model.registry_pre_oci_model import PreOCIModel
-from data.registry_model.registry_oci_model import OCIModel
-from data.registry_model.datatypes import RepositoryReference
-from data.registry_model.blobuploader import upload_blob, BlobUploadSettings
-from data.registry_model.modelsplitter import SplitModel
+from data.cache.test.test_cache import TEST_CACHE_CONFIG
+from data.database import (
+    ImageStorageLocation,
+    Manifest,
+    ManifestBlob,
+    ManifestLabel,
+    Repository,
+    Tag,
+    User,
+    get_epoch_timestamp_ms,
+)
+from data.model import QuotaExceededException, namespacequota
 from data.model.blob import store_blob_record_and_temp_link
-from image.docker.types import ManifestImageLayer
-from image.docker.schema1 import (DockerSchema1ManifestBuilder, DOCKER_SCHEMA1_CONTENT_TYPES,
-                                  DockerSchema1Manifest)
-from image.docker.schema2.manifest import DockerSchema2ManifestBuilder
+from data.model.oci.retriever import RepositoryContentRetriever
+from data.model.storage import get_layer_path
+from data.registry_model.blobuploader import BlobUploadSettings, upload_blob
+from data.registry_model.datatypes import RepositoryReference
+from data.registry_model.registry_oci_model import OCIModel
+from digest.digest_tools import sha256_digest
+from image.docker.schema1 import (
+    DOCKER_SCHEMA1_CONTENT_TYPES,
+    DockerSchema1Manifest,
+    DockerSchema1ManifestBuilder,
+)
 from image.docker.schema2.list import DockerSchema2ManifestListBuilder
+from image.docker.schema2.manifest import DockerSchema2ManifestBuilder
+from image.oci.index import OCIIndexBuilder
+from image.oci.manifest import OCIManifest, OCIManifestBuilder
+from image.shared.types import ManifestImageLayer
+from test.fixtures import *
 from util.bytes import Bytes
 
-from test.fixtures import *
 
-
-@pytest.fixture(params=[PreOCIModel(), OCIModel(), OCIModel(oci_model_only=False),
-                        SplitModel(0, {'devtable'}, {'buynlarge'}, False),
-                        SplitModel(1.0, {'devtable'}, {'buynlarge'}, False),
-                        SplitModel(1.0, {'devtable'}, {'buynlarge'}, True)])
+@pytest.fixture(
+    params=[
+        OCIModel(),
+    ]
+)
 def registry_model(request, initialized_db):
-  return request.param
+    return request.param
 
-@pytest.fixture()
-def pre_oci_model(initialized_db):
-  return PreOCIModel()
 
 @pytest.fixture()
 def oci_model(initialized_db):
-  return OCIModel()
+    return OCIModel()
 
 
-@pytest.mark.parametrize('names, expected', [
-  (['unknown'], None),
-  (['latest'], {'latest'}),
-  (['latest', 'prod'], {'latest', 'prod'}),
-  (['latest', 'prod', 'another'], {'latest', 'prod'}),
-  (['foo', 'prod'], {'prod'}),
-])
+@pytest.mark.parametrize(
+    "names, expected",
+    [
+        (["unknown"], None),
+        (["latest"], {"latest"}),
+        (["latest", "prod"], {"latest", "prod"}),
+        (["latest", "prod", "another"], {"latest", "prod"}),
+        (["foo", "prod"], {"prod"}),
+    ],
+)
 def test_find_matching_tag(names, expected, registry_model):
-  repo = model.repository.get_repository('devtable', 'simple')
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found = registry_model.find_matching_tag(repository_ref, names)
-  if expected is None:
-    assert found is None
-  else:
-    assert found.name in expected
-    assert found.repository.namespace_name == 'devtable'
-    assert found.repository.name == 'simple'
+    repo = model.repository.get_repository("devtable", "simple")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found = registry_model.find_matching_tag(repository_ref, names)
+    if expected is None:
+        assert found is None
+    else:
+        assert found.name in expected
+        assert found.repository.name == "simple"
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name, expected', [
-  ('devtable', 'simple', {'latest', 'prod'}),
-  ('buynlarge', 'orgrepo', {'latest', 'prod'}),
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name, expected",
+    [
+        ("devtable", "simple", {"latest", "prod"}),
+        ("buynlarge", "orgrepo", {"latest", "prod"}),
+    ],
+)
 def test_get_most_recent_tag(repo_namespace, repo_name, expected, registry_model):
-  repo = model.repository.get_repository(repo_namespace, repo_name)
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found = registry_model.get_most_recent_tag(repository_ref)
-  if expected is None:
-    assert found is None
-  else:
-    assert found.name in expected
+    repo = model.repository.get_repository(repo_namespace, repo_name)
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found = registry_model.get_most_recent_tag(repository_ref)
+    if expected is None:
+        assert found is None
+    else:
+        assert found.name in expected
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name, expected', [
-  ('devtable', 'simple', True),
-  ('buynlarge', 'orgrepo', True),
-  ('buynlarge', 'unknownrepo', False),
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name, expected",
+    [
+        ("devtable", "simple", True),
+        ("buynlarge", "orgrepo", True),
+        ("buynlarge", "unknownrepo", False),
+    ],
+)
 def test_lookup_repository(repo_namespace, repo_name, expected, registry_model):
-  repo_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  if expected:
-    assert repo_ref
-  else:
-    assert repo_ref is None
+    repo_ref = registry_model.lookup_repository(repo_namespace, repo_name)
+    if expected:
+        assert repo_ref
+    else:
+        assert repo_ref is None
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('buynlarge', 'orgrepo'),
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name, expected",
+    [
+        ("devtable", "simple", True),
+        ("buynlarge", "orgrepo", True),
+        ("buynlarge", "unknownrepo", False),
+    ],
+)
+def test_lookup_repository_with_cache(repo_namespace, repo_name, expected, registry_model):
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    model_cache.empty_for_testing()
+
+    cache_key_for_repository_lookup = cache_key.for_repository_lookup(
+        repo_namespace, repo_name, None, None, {}
+    )
+    repo_ref = registry_model.lookup_repository(repo_namespace, repo_name, model_cache=model_cache)
+    cached_result = model_cache.cache.get(cache_key_for_repository_lookup.key)
+
+    if expected:
+        res_obj = OCIModel.get_repository_response_to_object(json.loads(cached_result))
+        assert repo_ref._db_id is res_obj.id
+        assert repo_ref.state == res_obj.state
+        assert repo_ref.namespace_name == repo_namespace
+    else:
+        assert repo_ref is None
+
+
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name",
+    [
+        ("devtable", "simple"),
+        ("buynlarge", "orgrepo"),
+    ],
+)
 def test_lookup_manifests(repo_namespace, repo_name, registry_model):
-  repo = model.repository.get_repository(repo_namespace, repo_name)
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found_tag = registry_model.find_matching_tag(repository_ref, ['latest'])
-  found_manifest = registry_model.get_manifest_for_tag(found_tag)
-  found = registry_model.lookup_manifest_by_digest(repository_ref, found_manifest.digest,
-                                                   include_legacy_image=True)
-  assert found._db_id == found_manifest._db_id
-  assert found.digest == found_manifest.digest
-  assert found.legacy_image
-  assert found.legacy_image.parents
+    repo = model.repository.get_repository(repo_namespace, repo_name)
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found_tag = registry_model.find_matching_tag(repository_ref, ["latest"])
+    found_manifest = registry_model.get_manifest_for_tag(found_tag)
+    found = registry_model.lookup_manifest_by_digest(repository_ref, found_manifest.digest)
+    assert found._db_id == found_manifest._db_id
+    assert found.digest == found_manifest.digest
 
-  schema1_parsed = registry_model.get_schema1_parsed_manifest(found, 'foo', 'bar', 'baz', storage)
-  assert schema1_parsed is not None
+    schema1_parsed = registry_model.get_schema1_parsed_manifest(found, "foo", "bar", "baz", storage)
+    assert schema1_parsed is not None
 
 
 def test_lookup_unknown_manifest(registry_model):
-  repo = model.repository.get_repository('devtable', 'simple')
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found = registry_model.lookup_manifest_by_digest(repository_ref, 'sha256:deadbeef')
-  assert found is None
-
-
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
-def test_legacy_images(repo_namespace, repo_name, registry_model):
-  repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  legacy_images = registry_model.get_legacy_images(repository_ref)
-  assert len(legacy_images)
-
-  found_tags = set()
-  for image in legacy_images:
-    found_image = registry_model.get_legacy_image(repository_ref, image.docker_image_id,
-                                                  include_parents=True)
-
-    with assert_query_count(5 if found_image.parents else 4):
-      found_image = registry_model.get_legacy_image(repository_ref, image.docker_image_id,
-                                                    include_parents=True, include_blob=True)
-      assert found_image.docker_image_id == image.docker_image_id
-      assert found_image.parents == image.parents
-      assert found_image.blob
-      assert found_image.blob.placements
-
-    # Check that the tags list can be retrieved.
-    assert image.tags is not None
-    found_tags.update({tag.name for tag in image.tags})
-
-    # Check against the actual DB row.
-    model_image = model.image.get_image(repository_ref._db_id, found_image.docker_image_id)
-    assert model_image.id == found_image._db_id
-    assert ([pid for pid in reversed(model_image.ancestor_id_list())] ==
-            [p._db_id for p in found_image.parents])
-
-    # Try without parents and ensure it raises an exception.
-    found_image = registry_model.get_legacy_image(repository_ref, image.docker_image_id,
-                                                  include_parents=False)
-    with pytest.raises(Exception):
-      assert not found_image.parents
-
-  assert found_tags
-
-  unknown = registry_model.get_legacy_image(repository_ref, 'unknown', include_parents=True)
-  assert unknown is None
+    repo = model.repository.get_repository("devtable", "simple")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found = registry_model.lookup_manifest_by_digest(repository_ref, "sha256:deadbeef")
+    assert found is None
 
 
 def test_manifest_labels(registry_model):
-  repo = model.repository.get_repository('devtable', 'simple')
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found_tag = registry_model.find_matching_tag(repository_ref, ['latest'])
-  found_manifest = registry_model.get_manifest_for_tag(found_tag)
+    repo = model.repository.get_repository("devtable", "simple")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found_tag = registry_model.find_matching_tag(repository_ref, ["latest"])
+    found_manifest = registry_model.get_manifest_for_tag(found_tag)
 
-  # Create a new label.
-  created = registry_model.create_manifest_label(found_manifest, 'foo', 'bar', 'api')
-  assert created.key == 'foo'
-  assert created.value == 'bar'
-  assert created.source_type_name == 'api'
-  assert created.media_type_name == 'text/plain'
+    # Create a new label.
+    created = registry_model.create_manifest_label(found_manifest, "foo", "bar", "api")
+    assert created.key == "foo"
+    assert created.value == "bar"
+    assert created.source_type_name == "api"
+    assert created.media_type_name == "text/plain"
 
-  # Ensure we can look it up.
-  assert registry_model.get_manifest_label(found_manifest, created.uuid) == created
+    # Ensure we can look it up.
+    assert registry_model.get_manifest_label(found_manifest, created.uuid) == created
 
-  # Ensure it is in our list of labels.
-  assert created in registry_model.list_manifest_labels(found_manifest)
-  assert created in registry_model.list_manifest_labels(found_manifest, key_prefix='fo')
+    # Ensure it is in our list of labels.
+    assert created in registry_model.list_manifest_labels(found_manifest)
+    assert created in registry_model.list_manifest_labels(found_manifest, key_prefix="fo")
 
-  # Ensure it is *not* in our filtered list.
-  assert created not in registry_model.list_manifest_labels(found_manifest, key_prefix='ba')
+    # Ensure it is *not* in our filtered list.
+    assert created not in registry_model.list_manifest_labels(found_manifest, key_prefix="ba")
 
-  # Delete the label and ensure it is gone.
-  assert registry_model.delete_manifest_label(found_manifest, created.uuid)
-  assert registry_model.get_manifest_label(found_manifest, created.uuid) is None
-  assert created not in registry_model.list_manifest_labels(found_manifest)
+    # Delete the label and ensure it is gone.
+    assert registry_model.delete_manifest_label(found_manifest, created.uuid)
+    assert registry_model.get_manifest_label(found_manifest, created.uuid) is None
+    assert created not in registry_model.list_manifest_labels(found_manifest)
 
 
 def test_manifest_label_handlers(registry_model):
-  repo = model.repository.get_repository('devtable', 'simple')
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found_tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  found_manifest = registry_model.get_manifest_for_tag(found_tag)
+    repo = model.repository.get_repository("devtable", "simple")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    found_manifest = registry_model.get_manifest_for_tag(found_tag)
 
-  # Ensure the tag has no expiration.
-  assert found_tag.lifetime_end_ts is None
+    # Ensure the tag has no expiration.
+    assert found_tag.lifetime_end_ts is None
 
-  # Create a new label with an expires-after.
-  registry_model.create_manifest_label(found_manifest, 'quay.expires-after', '2h', 'api')
+    # Create a new label with an expires-after.
+    registry_model.create_manifest_label(found_manifest, "quay.expires-after", "2h", "api")
 
-  # Ensure the tag now has an expiration.
-  updated_tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  assert updated_tag.lifetime_end_ts == (updated_tag.lifetime_start_ts + (60 * 60 * 2))
+    # Ensure the tag now has an expiration.
+    updated_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    assert updated_tag.lifetime_end_ts == (updated_tag.lifetime_start_ts + (60 * 60 * 2))
+
+
+def test_immutable_label_handler(registry_model):
+    """Test that quay.immutable=true label sets tag as immutable."""
+    with patch("data.registry_model.label_handlers.features", MagicMock(IMMUTABLE_TAGS=True)):
+        repo = model.repository.get_repository("devtable", "simple")
+        repository_ref = RepositoryReference.for_repo_obj(repo)
+        found_tag = registry_model.get_repo_tag(repository_ref, "latest")
+        found_manifest = registry_model.get_manifest_for_tag(found_tag)
+
+        # Ensure tag is not immutable
+        assert not found_tag.immutable
+
+        # Create label with quay.immutable=true
+        registry_model.create_manifest_label(found_manifest, "quay.immutable", "true", "api")
+
+        # Ensure tag is now immutable
+        updated_tag = registry_model.get_repo_tag(repository_ref, "latest")
+        assert updated_tag.immutable
+
+
+@pytest.mark.parametrize(
+    "label_value",
+    ["True", "TRUE", " true ", " TRUE "],
+)
+def test_immutable_label_case_insensitive(registry_model, label_value):
+    """Test quay.immutable label works with various case formats."""
+    with patch("data.registry_model.label_handlers.features", MagicMock(IMMUTABLE_TAGS=True)):
+        repo = model.repository.get_repository("devtable", "simple")
+        repository_ref = RepositoryReference.for_repo_obj(repo)
+        found_tag = registry_model.get_repo_tag(repository_ref, "latest")
+        found_manifest = registry_model.get_manifest_for_tag(found_tag)
+
+        # Ensure tag is not immutable initially
+        assert not found_tag.immutable
+
+        # Create label with various case/whitespace formats
+        registry_model.create_manifest_label(found_manifest, "quay.immutable", label_value, "api")
+
+        # Ensure tag is now immutable
+        updated_tag = registry_model.get_repo_tag(repository_ref, "latest")
+        assert updated_tag.immutable
+
+
+@pytest.mark.parametrize(
+    "label_value",
+    ["false", "False", "FALSE", "0", "no", "", "anything", "yes"],
+)
+def test_immutable_label_false_does_not_set(registry_model, label_value):
+    """Test quay.immutable with non-true values does NOT set immutability."""
+    repo = model.repository.get_repository("devtable", "simple")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    found_manifest = registry_model.get_manifest_for_tag(found_tag)
+
+    # Ensure tag is not immutable initially
+    assert not found_tag.immutable
+
+    # Create label with non-true value
+    registry_model.create_manifest_label(found_manifest, "quay.immutable", label_value, "api")
+
+    # Ensure tag is still NOT immutable
+    updated_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    assert not updated_tag.immutable
 
 
 def test_batch_labels(registry_model):
-  repo = model.repository.get_repository('devtable', 'history')
-  repository_ref = RepositoryReference.for_repo_obj(repo)
-  found_tag = registry_model.find_matching_tag(repository_ref, ['latest'])
-  found_manifest = registry_model.get_manifest_for_tag(found_tag)
+    repo = model.repository.get_repository("devtable", "history")
+    repository_ref = RepositoryReference.for_repo_obj(repo)
+    found_tag = registry_model.find_matching_tag(repository_ref, ["latest"])
+    found_manifest = registry_model.get_manifest_for_tag(found_tag)
 
-  with registry_model.batch_create_manifest_labels(found_manifest) as add_label:
-    add_label('foo', '1', 'api')
-    add_label('bar', '2', 'api')
-    add_label('baz', '3', 'api')
+    with registry_model.batch_create_manifest_labels(found_manifest) as add_label:
+        add_label("foo", "1", "api")
+        add_label("bar", "2", "api")
+        add_label("baz", "3", "api")
 
-  # Ensure we can look them up.
-  assert len(registry_model.list_manifest_labels(found_manifest)) == 3
+    # Ensure we can look them up.
+    assert len(registry_model.list_manifest_labels(found_manifest)) == 3
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name",
+    [
+        ("devtable", "simple"),
+        ("devtable", "complex"),
+        ("devtable", "history"),
+        ("buynlarge", "orgrepo"),
+    ],
+)
 def test_repository_tags(repo_namespace, repo_name, registry_model):
-  repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  tags = registry_model.list_all_active_repository_tags(repository_ref, include_legacy_images=True)
-  assert len(tags)
+    repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
+    tags = registry_model.list_all_active_repository_tags(repository_ref)
+    assert len(tags)
 
-  tags_map = registry_model.get_legacy_tags_map(repository_ref, storage)
+    tags_map = registry_model.get_legacy_tags_map(repository_ref, storage)
 
-  for tag in tags:
-    found_tag = registry_model.get_repo_tag(repository_ref, tag.name, include_legacy_image=True)
-    assert found_tag == tag
+    for tag in tags:
+        found_tag = registry_model.get_repo_tag(repository_ref, tag.name)
+        assert found_tag == tag
 
-    if found_tag.legacy_image is None:
-      continue
+        retriever = RepositoryContentRetriever(repository_ref.id, storage)
+        legacy_image = tag.manifest.lookup_legacy_image(0, retriever)
+        found_image = registry_model.get_legacy_image(
+            repository_ref, found_tag.manifest.legacy_image_root_id, storage
+        )
 
-    found_image = registry_model.get_legacy_image(repository_ref,
-                                                  found_tag.legacy_image.docker_image_id)
-    assert found_image == found_tag.legacy_image
-    assert tag.name in tags_map
-    assert tags_map[tag.name] == found_image.docker_image_id
+        if found_image is not None:
+            assert found_image.docker_image_id == legacy_image.docker_image_id
+            assert tags_map[tag.name] == found_image.docker_image_id
 
 
-@pytest.mark.parametrize('namespace, name, expected_tag_count, has_expired', [
-  ('devtable', 'simple', 2, False),
-  ('devtable', 'history', 2, True),
-  ('devtable', 'gargantuan', 8, False),
-  ('public', 'publicrepo', 1, False),
-])
-def test_repository_tag_history(namespace, name, expected_tag_count, has_expired, registry_model):
-  # Pre-cache media type loads to ensure consistent query count.
-  Manifest.media_type.get_name(1)
+@pytest.mark.parametrize(
+    "namespace, name, expected_tag_count, has_expired",
+    [
+        ("devtable", "simple", 2, False),
+        ("devtable", "history", 2, True),
+        ("devtable", "gargantuan", 8, False),
+        ("public", "publicrepo", 1, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "with_size_fallback",
+    [
+        False,
+        True,
+    ],
+)
+def test_repository_tag_history(
+    namespace, name, expected_tag_count, has_expired, registry_model, with_size_fallback
+):
+    # Pre-cache media type loads to ensure consistent query count.
+    Manifest.media_type.get_name(1)
 
-  repository_ref = registry_model.lookup_repository(namespace, name)
-  with assert_query_count(2):
+    repository_ref = registry_model.lookup_repository(namespace, name)
+    with assert_query_count(2 if with_size_fallback else 1):
+        # If size fallback is requested, delete the sizes on the manifest rows.
+        if with_size_fallback:
+            Manifest.update(layers_compressed_size=None).execute()
+
+        history, has_more = registry_model.list_repository_tag_history(repository_ref)
+        assert not has_more
+        assert len(history) == expected_tag_count
+
+        for tag in history:
+            # Retrieve the manifest to ensure it doesn't issue extra queries.
+            tag.manifest
+
+            # Verify that looking up the size doesn't issue extra queries.
+            tag.manifest_layers_size
+
+    if has_expired:
+        # Ensure the latest tag is marked expired, since there is an expired one.
+        with assert_query_count(1):
+            assert registry_model.has_expired_tag(repository_ref, "latest")
+
+
+def test_repository_tag_history_future_expires(registry_model):
+    # Set the expiration of a tag to the future.
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    tag = registry_model.get_repo_tag(repository_ref, "latest")
+    registry_model.change_repository_tag_expiration(tag, datetime.utcnow() + timedelta(days=7))
+
+    # List the tag history and ensure the tag is returned with the correct expiration.
     history, has_more = registry_model.list_repository_tag_history(repository_ref)
     assert not has_more
-    assert len(history) == expected_tag_count
+    assert history
 
     for tag in history:
-      # Retrieve the manifest to ensure it doesn't issue extra queries.
-      tag.manifest
-
-  if has_expired:
-    # Ensure the latest tag is marked expired, since there is an expired one.
-    with assert_query_count(1):
-      assert registry_model.has_expired_tag(repository_ref, 'latest')
+        if tag.name == "latest":
+            assert tag.lifetime_end_ms is not None
 
 
-@pytest.mark.parametrize('repositories, expected_tag_count', [
-  ([], 0),
-  ([('devtable', 'simple'), ('devtable', 'building')], 1),
-])
+@pytest.mark.parametrize(
+    "repositories, expected_tag_count",
+    [
+        ([], 0),
+        ([("devtable", "simple"), ("devtable", "building")], 1),
+    ],
+)
 def test_get_most_recent_tag_lifetime_start(repositories, expected_tag_count, registry_model):
-  last_modified_map = registry_model.get_most_recent_tag_lifetime_start(
-    [registry_model.lookup_repository(name, namespace) for name, namespace in repositories]
-  )
+    last_modified_map = registry_model.get_most_recent_tag_lifetime_start(
+        [registry_model.lookup_repository(name, namespace) for name, namespace in repositories]
+    )
 
-  assert len(last_modified_map) == expected_tag_count
-  for repo_id, last_modified in last_modified_map.items():
-    tag = registry_model.get_most_recent_tag(RepositoryReference.for_id(repo_id))
-    assert last_modified == tag.lifetime_start_ms / 1000
+    assert len(last_modified_map) == expected_tag_count
+    for repo_id, last_modified in list(last_modified_map.items()):
+        tag = registry_model.get_most_recent_tag(RepositoryReference.for_id(repo_id))
+        assert last_modified == tag.lifetime_start_ms // 1000
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
-@pytest.mark.parametrize('via_manifest', [
-  False,
-  True,
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name",
+    [
+        ("devtable", "simple"),
+        ("devtable", "complex"),
+        ("devtable", "history"),
+        ("buynlarge", "orgrepo"),
+    ],
+)
+@pytest.mark.parametrize(
+    "via_manifest",
+    [
+        False,
+        True,
+    ],
+)
 def test_delete_tags(repo_namespace, repo_name, via_manifest, registry_model):
-  repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  tags = registry_model.list_all_active_repository_tags(repository_ref)
-  assert len(tags)
+    repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
+    tags = registry_model.list_all_active_repository_tags(repository_ref)
+    assert len(tags)
 
-  # Save history before the deletions.
-  previous_history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
-  assert len(previous_history) >= len(tags)
+    # Save history before the deletions.
+    previous_history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
+    assert len(previous_history) >= len(tags)
 
-  # Delete every tag in the repository.
-  for tag in tags:
-    if via_manifest:
-      assert registry_model.delete_tag(repository_ref, tag.name)
-    else:
-      manifest = registry_model.get_manifest_for_tag(tag)
-      if manifest is not None:
-        assert registry_model.delete_tags_for_manifest(manifest)
+    # Delete every tag in the repository.
+    for tag in tags:
+        if via_manifest:
+            assert registry_model.delete_tag(model_cache, repository_ref, tag.name)
+        else:
+            manifest = registry_model.get_manifest_for_tag(tag)
+            if manifest is not None:
+                registry_model.delete_tags_for_manifest(model_cache, manifest)
 
-    # Make sure the tag is no longer found.
-    # TODO: Uncomment once we're done with the SplitModel.
-    #with assert_query_count(1):
-    found_tag = registry_model.get_repo_tag(repository_ref, tag.name, include_legacy_image=True)
-    assert found_tag is None
+        # Make sure the tag is no longer found.
+        with assert_query_count(1):
+            found_tag = registry_model.get_repo_tag(repository_ref, tag.name)
+            assert found_tag is None
 
-  # Ensure all tags have been deleted.
-  tags = registry_model.list_all_active_repository_tags(repository_ref)
-  assert not len(tags)
+    # Ensure all tags have been deleted.
+    tags = registry_model.list_all_active_repository_tags(repository_ref)
+    assert not len(tags)
 
-  # Ensure that the tags all live in history.
-  history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
-  assert len(history) == len(previous_history)
+    # Ensure that the tags all live in history.
+    history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
+    assert len(history) == len(previous_history)
 
 
-@pytest.mark.parametrize('use_manifest', [
-  True,
-  False,
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name",
+    [
+        ("devtable", "simple"),
+        ("devtable", "complex"),
+        ("devtable", "history"),
+        ("buynlarge", "orgrepo"),
+    ],
+)
+@pytest.mark.parametrize(
+    "via_manifest",
+    [
+        False,
+        True,
+    ],
+)
+def test_deleting_tags_properly_invalidates_cache(
+    repo_namespace, repo_name, via_manifest, registry_model
+):
+    """
+    Ensures that after tag deletion we rebuild cache for a specific repository instead of
+    returning stale results from cache back.
+    """
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    tags = []
+
+    repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
+
+    # read all tags and populate cache
+    tags, _ = registry_model.lookup_cached_active_repository_tags(
+        model_cache, repository_ref, None, limit=100
+    )
+    assert len(tags)
+
+    # Save history before the deletions.
+    previous_history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
+    assert len(previous_history) >= len(tags)
+
+    # Delete every tag in the repository.
+    for tag in tags:
+        if via_manifest:
+            assert registry_model.delete_tag(model_cache, repository_ref, tag.name)
+        else:
+            full_tag = registry_model.get_repo_tag(repository_ref, tag.name)
+            manifest = registry_model.get_manifest_for_tag(full_tag)
+            if manifest is not None:
+                registry_model.delete_tags_for_manifest(model_cache, manifest)
+
+        # Make sure the tag is no longer found.
+        with assert_query_count(1):
+            found_tag = registry_model.get_repo_tag(repository_ref, tag.name)
+            assert found_tag is None
+
+    # Ensure all tags have been deleted and we don't return any stale results
+    tags, _ = registry_model.lookup_cached_active_repository_tags(
+        model_cache, repository_ref, None, limit=100
+    )
+    assert not len(tags)
+
+    # Ensure that the tags all live in history.
+    history, _ = registry_model.list_repository_tag_history(repository_ref, size=1000)
+    assert len(history) == len(previous_history)
+
+
+@pytest.mark.parametrize(
+    "use_manifest",
+    [
+        True,
+        False,
+    ],
+)
 def test_retarget_tag_history(use_manifest, registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'history')
-  history, _ = registry_model.list_repository_tag_history(repository_ref)
+    repository_ref = registry_model.lookup_repository("devtable", "history")
+    history, _ = registry_model.list_repository_tag_history(repository_ref)
 
-  if use_manifest:
-    manifest_or_legacy_image = registry_model.lookup_manifest_by_digest(repository_ref,
-                                                                        history[0].manifest_digest,
-                                                                        allow_dead=True)
-  else:
-    manifest_or_legacy_image = history[0].legacy_image
+    if use_manifest:
+        manifest_or_legacy_image = registry_model.lookup_manifest_by_digest(
+            repository_ref, history[0].manifest_digest, allow_dead=True
+        )
+    else:
+        manifest_or_legacy_image = registry_model.get_legacy_image(
+            repository_ref, history[0].manifest.legacy_image_root_id, storage
+        )
 
-  # Retarget the tag.
-  assert manifest_or_legacy_image
-  updated_tag = registry_model.retarget_tag(repository_ref, 'latest', manifest_or_legacy_image,
-                                            storage, docker_v2_signing_key, is_reversion=True)
+    # Retarget the tag.
+    assert manifest_or_legacy_image
+    updated_tag = registry_model.retarget_tag(
+        repository_ref,
+        "latest",
+        manifest_or_legacy_image,
+        storage,
+        docker_v2_signing_key,
+        is_reversion=True,
+    )
 
-  # Ensure the tag has changed targets.
-  if use_manifest:
-    assert updated_tag.manifest_digest == manifest_or_legacy_image.digest
-  else:
-    assert updated_tag.legacy_image == manifest_or_legacy_image
+    # Ensure the tag has changed targets.
+    if use_manifest:
+        assert updated_tag.manifest_digest == manifest_or_legacy_image.digest
+    else:
+        assert updated_tag.manifest.legacy_image_root_id == manifest_or_legacy_image.docker_image_id
 
-  # Ensure history has been updated.
-  new_history, _ = registry_model.list_repository_tag_history(repository_ref)
-  assert len(new_history) == len(history) + 1
-
-
-def test_retarget_tag_schema1(oci_model):
-  repository_ref = oci_model.lookup_repository('devtable', 'simple')
-  latest_tag = oci_model.get_repo_tag(repository_ref, 'latest')
-  manifest = oci_model.get_manifest_for_tag(latest_tag)
-
-  existing_parsed = manifest.get_parsed_manifest()
-
-  # Retarget a new tag to the manifest.
-  updated_tag = oci_model.retarget_tag(repository_ref, 'somenewtag', manifest, storage,
-                                       docker_v2_signing_key)
-  assert updated_tag
-  assert updated_tag.name == 'somenewtag'
-
-  updated_manifest = oci_model.get_manifest_for_tag(updated_tag)
-  parsed = updated_manifest.get_parsed_manifest()
-  assert parsed.namespace == 'devtable'
-  assert parsed.repo_name == 'simple'
-  assert parsed.tag == 'somenewtag'
-
-  assert parsed.layers == existing_parsed.layers
-
-  # Ensure the tag has changed targets.
-  assert oci_model.get_repo_tag(repository_ref, 'somenewtag') == updated_tag
+    # Ensure history has been updated.
+    new_history, _ = registry_model.list_repository_tag_history(repository_ref)
+    assert len(new_history) == len(history) + 1
 
 
 def test_change_repository_tag_expiration(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  assert tag.lifetime_end_ts is None
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    tag = registry_model.get_repo_tag(repository_ref, "latest")
+    assert tag.lifetime_end_ts is None
 
-  new_datetime = datetime.utcnow() + timedelta(days=2)
-  previous, okay = registry_model.change_repository_tag_expiration(tag, new_datetime)
+    new_datetime = datetime.utcnow() + timedelta(days=2)
+    previous, okay = registry_model.change_repository_tag_expiration(tag, new_datetime)
 
-  assert okay
-  assert previous is None
+    assert okay
+    assert previous is None
 
-  tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  assert tag.lifetime_end_ts is not None
-
-
-@pytest.mark.parametrize('repo_namespace, repo_name, expected_non_empty', [
-  ('devtable', 'simple', []),
-  ('devtable', 'complex', ['prod', 'v2.0']),
-  ('devtable', 'history', ['latest']),
-  ('buynlarge', 'orgrepo', []),
-  ('devtable', 'gargantuan', ['v2.0', 'v3.0', 'v4.0', 'v5.0', 'v6.0']),
-])
-def test_get_legacy_images_owned_by_tag(repo_namespace, repo_name, expected_non_empty,
-                                        registry_model):
-  repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  tags = registry_model.list_all_active_repository_tags(repository_ref)
-  assert len(tags)
-
-  non_empty = set()
-  for tag in tags:
-    if registry_model.get_legacy_images_owned_by_tag(tag):
-      non_empty.add(tag.name)
-
-  assert non_empty == set(expected_non_empty)
-
-
-def test_get_security_status(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tags = registry_model.list_all_active_repository_tags(repository_ref, include_legacy_images=True)
-  assert len(tags)
-
-  for tag in tags:
-    assert registry_model.get_security_status(tag.legacy_image)
-    registry_model.reset_security_status(tag.legacy_image)
-    assert registry_model.get_security_status(tag.legacy_image)
+    tag = registry_model.get_repo_tag(repository_ref, "latest")
+    assert tag.lifetime_end_ts is not None
 
 
 @pytest.fixture()
 def clear_rows(initialized_db):
-  # Remove all new-style rows so we can backfill.
-  TagToRepositoryTag.delete().execute()
-  Tag.delete().execute()
-  TagManifestLabelMap.delete().execute()
-  ManifestLabel.delete().execute()
-  ManifestBlob.delete().execute()
-  ManifestLegacyImage.delete().execute()
-  TagManifestToManifest.delete().execute()
-  Manifest.delete().execute()
-  TagManifestLabel.delete().execute()
-  TagManifest.delete().execute()
+    # Remove all new-style rows so we can backfill.
+    Tag.delete().execute()
+    ManifestLabel.delete().execute()
+    ManifestBlob.delete().execute()
+    Manifest.delete().execute()
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
-def test_backfill_manifest_for_tag(repo_namespace, repo_name, clear_rows, pre_oci_model):
-  repository_ref = pre_oci_model.lookup_repository(repo_namespace, repo_name)
-  tags, has_more = pre_oci_model.list_repository_tag_history(repository_ref, size=2500)
-  assert tags
-  assert not has_more
-
-  for tag in tags:
-    assert not tag.manifest_digest
-    assert pre_oci_model.backfill_manifest_for_tag(tag)
-
-  tags, _ = pre_oci_model.list_repository_tag_history(repository_ref)
-  assert tags
-  for tag in tags:
-    assert tag.manifest_digest
-
-    manifest = pre_oci_model.get_manifest_for_tag(tag)
-    assert manifest
-
-    legacy_image = pre_oci_model.get_legacy_image(repository_ref, tag.legacy_image.docker_image_id,
-                                                  include_parents=True)
-
-    parsed_manifest = manifest.get_parsed_manifest()
-    assert parsed_manifest.leaf_layer_v1_image_id == legacy_image.docker_image_id
-    assert parsed_manifest.parent_image_ids == {p.docker_image_id for p in legacy_image.parents}
-
-
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
-def test_backfill_manifest_on_lookup(repo_namespace, repo_name, clear_rows, pre_oci_model):
-  repository_ref = pre_oci_model.lookup_repository(repo_namespace, repo_name)
-  tags = pre_oci_model.list_all_active_repository_tags(repository_ref)
-  assert tags
-
-  for tag in tags:
-    assert not tag.manifest_digest
-    assert not pre_oci_model.get_manifest_for_tag(tag)
-
-    manifest = pre_oci_model.get_manifest_for_tag(tag, backfill_if_necessary=True)
-    assert manifest
-
-    updated_tag = pre_oci_model.get_repo_tag(repository_ref, tag.name)
-    assert updated_tag.manifest_digest == manifest.digest
-
-
-@pytest.mark.parametrize('namespace, expect_enabled', [
-  ('devtable', True),
-  ('buynlarge', True),
-
-  ('disabled', False),
-])
+@pytest.mark.parametrize(
+    "namespace, expect_enabled",
+    [
+        ("devtable", True),
+        ("buynlarge", True),
+        ("disabled", False),
+    ],
+)
 def test_is_namespace_enabled(namespace, expect_enabled, registry_model):
-  assert registry_model.is_namespace_enabled(namespace) == expect_enabled
+    assert registry_model.is_namespace_enabled(namespace) == expect_enabled
 
 
-@pytest.mark.parametrize('repo_namespace, repo_name', [
-  ('devtable', 'simple'),
-  ('devtable', 'complex'),
-  ('devtable', 'history'),
-  ('buynlarge', 'orgrepo'),
-])
+@pytest.mark.parametrize(
+    "repo_namespace, repo_name",
+    [
+        ("devtable", "simple"),
+        ("devtable", "complex"),
+        ("devtable", "history"),
+        ("buynlarge", "orgrepo"),
+    ],
+)
 def test_layers_and_blobs(repo_namespace, repo_name, registry_model):
-  repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
-  tags = registry_model.list_all_active_repository_tags(repository_ref)
-  assert tags
+    repository_ref = registry_model.lookup_repository(repo_namespace, repo_name)
+    tags = registry_model.list_all_active_repository_tags(repository_ref)
+    assert tags
 
-  for tag in tags:
-    manifest = registry_model.get_manifest_for_tag(tag)
-    assert manifest
+    for tag in tags:
+        manifest = registry_model.get_manifest_for_tag(tag)
+        assert manifest
 
-    parsed = manifest.get_parsed_manifest()
-    assert parsed
+        parsed = manifest.get_parsed_manifest()
+        assert parsed
 
-    layers = registry_model.list_parsed_manifest_layers(repository_ref, parsed, storage)
-    assert layers
+        layers = registry_model.list_parsed_manifest_layers(repository_ref, parsed, storage)
+        assert layers
 
-    layers = registry_model.list_parsed_manifest_layers(repository_ref, parsed, storage,
-                                                        include_placements=True)
-    assert layers
+        layers = registry_model.list_parsed_manifest_layers(
+            repository_ref, parsed, storage, include_placements=True
+        )
+        assert layers
 
-    for index, manifest_layer in enumerate(layers):
-      assert manifest_layer.blob.storage_path
-      assert manifest_layer.blob.placements
+        for index, manifest_layer in enumerate(layers):
+            assert manifest_layer.blob.storage_path
+            assert manifest_layer.blob.placements
 
-      repo_blob = registry_model.get_repo_blob_by_digest(repository_ref, manifest_layer.blob.digest)
-      assert repo_blob.digest == manifest_layer.blob.digest
+            repo_blob = registry_model.get_repo_blob_by_digest(
+                repository_ref, manifest_layer.blob.digest
+            )
+            assert repo_blob.digest == manifest_layer.blob.digest
 
-      assert manifest_layer.estimated_size(1) is not None
-      assert isinstance(manifest_layer.layer_info, ManifestImageLayer)
+            assert manifest_layer.estimated_size(1) is not None
+            assert isinstance(manifest_layer.layer_info, ManifestImageLayer)
 
-    blobs = registry_model.get_manifest_local_blobs(manifest, include_placements=True)
-    assert {b.digest for b in blobs} == set(parsed.local_blob_digests)
+        blobs = registry_model.get_manifest_local_blobs(manifest, storage, include_placements=True)
+        assert {b.digest for b in blobs} == set(parsed.local_blob_digests)
 
 
 def test_manifest_remote_layers(oci_model):
-  # Create a config blob for testing.
-  config_json = json.dumps({
-    'config': {},
-    "rootfs": {
-      "type": "layers",
-      "diff_ids": []
-    },
-    "history": [
-      {
-        "created": "2018-04-03T18:37:09.284840891Z",
-        "created_by": "do something",
-      },
-    ],
-  })
+    # Create a config blob for testing.
+    config_json = json.dumps(
+        {
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [
+                {
+                    "created": "2018-04-03T18:37:09.284840891Z",
+                    "created_by": "do something",
+                },
+            ],
+        }
+    )
 
-  app_config = {'TESTING': True}
-  repository_ref = oci_model.lookup_repository('devtable', 'simple')
-  with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500, 500)) as upload:
-    upload.upload_chunk(app_config, BytesIO(config_json))
-    blob = upload.commit_to_blob(app_config)
+    app_config = {"TESTING": True}
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500)) as upload:
+        upload.upload_chunk(app_config, BytesIO(config_json.encode("utf-8")))
+        blob = upload.commit_to_blob(app_config)
 
-  # Create the manifest in the repo.
-  builder = DockerSchema2ManifestBuilder()
-  builder.set_config_digest(blob.digest, blob.compressed_size)
-  builder.add_layer('sha256:abcd', 1234, urls=['http://hello/world'])
-  manifest = builder.build()
+    # Create the manifest in the repo.
+    builder = DockerSchema2ManifestBuilder()
+    builder.set_config_digest(blob.digest, blob.compressed_size)
+    builder.add_layer("sha256:abcd", 1234, urls=["http://hello/world"])
+    manifest = builder.build()
 
-  created_manifest, _ = oci_model.create_manifest_and_retarget_tag(repository_ref, manifest,
-                                                                   'sometag', storage)
-  assert created_manifest
+    created_manifest, _ = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "sometag", storage
+    )
+    assert created_manifest
 
-  layers = oci_model.list_parsed_manifest_layers(repository_ref,
-                                                 created_manifest.get_parsed_manifest(),
-                                                 storage)
-  assert len(layers) == 1
-  assert layers[0].layer_info.is_remote
-  assert layers[0].layer_info.urls == ['http://hello/world']
-  assert layers[0].blob is None
-
-
-def test_derived_image(registry_model):
-  # Clear all existing derived storage.
-  DerivedStorageForImage.delete().execute()
-
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  manifest = registry_model.get_manifest_for_tag(tag)
-
-  # Ensure the squashed image doesn't exist.
-  assert registry_model.lookup_derived_image(manifest, 'squash', storage, {}) is None
-
-  # Create a new one.
-  squashed = registry_model.lookup_or_create_derived_image(manifest, 'squash',
-                                                           'local_us', storage, {})
-  assert registry_model.lookup_or_create_derived_image(manifest, 'squash',
-                                                       'local_us', storage, {}) == squashed
-  assert squashed.unique_id
-
-  # Check and set the size.
-  assert squashed.blob.compressed_size is None
-  registry_model.set_derived_image_size(squashed, 1234)
-
-  found = registry_model.lookup_derived_image(manifest, 'squash', storage, {})
-  assert found.blob.compressed_size == 1234
-  assert found.unique_id == squashed.unique_id
-
-  # Ensure its returned now.
-  assert found == squashed
-
-  # Ensure different metadata results in a different derived image.
-  found = registry_model.lookup_derived_image(manifest, 'squash', storage, {'foo': 'bar'})
-  assert found is None
-
-  squashed_foo = registry_model.lookup_or_create_derived_image(manifest, 'squash', 'local_us',
-                                                               storage, {'foo': 'bar'})
-  assert squashed_foo != squashed
-
-  found = registry_model.lookup_derived_image(manifest, 'squash', storage, {'foo': 'bar'})
-  assert found == squashed_foo
-
-  assert squashed.unique_id != squashed_foo.unique_id
-
-  # Lookup with placements.
-  squashed = registry_model.lookup_or_create_derived_image(manifest, 'squash', 'local_us',
-                                                           storage, {}, include_placements=True)
-  assert squashed.blob.placements
-
-  # Delete the derived image.
-  registry_model.delete_derived_image(squashed)
-  assert registry_model.lookup_derived_image(manifest, 'squash', storage, {}) is None
-
-
-def test_derived_image_signatures(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  manifest = registry_model.get_manifest_for_tag(tag)
-
-  derived = registry_model.lookup_derived_image(manifest, 'squash', storage, {})
-  assert derived
-
-  signature = registry_model.get_derived_image_signature(derived, 'gpg2')
-  assert signature is None
-
-  registry_model.set_derived_image_signature(derived, 'gpg2', 'foo')
-  assert registry_model.get_derived_image_signature(derived, 'gpg2') == 'foo'
-
-
-def test_derived_image_for_manifest_list(oci_model):
-  # Clear all existing derived storage.
-  DerivedStorageForImage.delete().execute()
-
-  # Create a config blob for testing.
-  config_json = json.dumps({
-    'config': {},
-    "rootfs": {
-      "type": "layers",
-      "diff_ids": []
-    },
-    "history": [
-      {
-        "created": "2018-04-03T18:37:09.284840891Z",
-        "created_by": "do something",
-      },
-    ],
-  })
-
-  app_config = {'TESTING': True}
-  repository_ref = oci_model.lookup_repository('devtable', 'simple')
-  with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500, 500)) as upload:
-    upload.upload_chunk(app_config, BytesIO(config_json))
-    blob = upload.commit_to_blob(app_config)
-
-  # Create the manifest in the repo.
-  builder = DockerSchema2ManifestBuilder()
-  builder.set_config_digest(blob.digest, blob.compressed_size)
-  builder.add_layer(blob.digest, blob.compressed_size)
-  amd64_manifest = builder.build()
-
-  oci_model.create_manifest_and_retarget_tag(repository_ref, amd64_manifest, 'submanifest', storage)
-
-  # Create a manifest list, pointing to at least one amd64+linux manifest.
-  builder = DockerSchema2ManifestListBuilder()
-  builder.add_manifest(amd64_manifest, 'amd64', 'linux')
-  manifestlist = builder.build()
-
-  oci_model.create_manifest_and_retarget_tag(repository_ref, manifestlist, 'listtag', storage)
-  manifest = oci_model.get_manifest_for_tag(oci_model.get_repo_tag(repository_ref, 'listtag'))
-  assert manifest
-  assert manifest.get_parsed_manifest().is_manifest_list
-
-  # Ensure the squashed image doesn't exist.
-  assert oci_model.lookup_derived_image(manifest, 'squash', storage, {}) is None
-
-  # Create a new one.
-  squashed = oci_model.lookup_or_create_derived_image(manifest, 'squash', 'local_us', storage, {})
-  assert squashed.unique_id
-  assert oci_model.lookup_or_create_derived_image(manifest, 'squash',
-                                                  'local_us', storage, {}) == squashed
-
-  # Perform lookup.
-  assert oci_model.lookup_derived_image(manifest, 'squash', storage, {}) == squashed
-
-
-def test_torrent_info(registry_model):
-  # Remove all existing info.
-  TorrentInfo.delete().execute()
-
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  manifest = registry_model.get_manifest_for_tag(tag)
-
-  blobs = registry_model.get_manifest_local_blobs(manifest)
-  assert blobs
-
-  assert registry_model.get_torrent_info(blobs[0]) is None
-  registry_model.set_torrent_info(blobs[0], 2, 'foo')
-
-  # Set it again exactly, which should be a no-op.
-  registry_model.set_torrent_info(blobs[0], 2, 'foo')
-
-  # Check the information we've set.
-  torrent_info = registry_model.get_torrent_info(blobs[0])
-  assert torrent_info is not None
-  assert torrent_info.piece_length == 2
-  assert torrent_info.pieces == 'foo'
-
-  # Try setting it again. Nothing should happen.
-  registry_model.set_torrent_info(blobs[0], 3, 'bar')
-
-  torrent_info = registry_model.get_torrent_info(blobs[0])
-  assert torrent_info is not None
-  assert torrent_info.piece_length == 2
-  assert torrent_info.pieces == 'foo'
+    layers = oci_model.list_parsed_manifest_layers(
+        repository_ref, created_manifest.get_parsed_manifest(), storage
+    )
+    assert len(layers) == 1
+    assert layers[0].layer_info.is_remote
+    assert layers[0].layer_info.urls == ["http://hello/world"]
+    assert layers[0].blob is None
 
 
 def test_blob_uploads(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
 
-  blob_upload = registry_model.create_blob_upload(repository_ref, str(uuid.uuid4()),
-                                                 'local_us', {'some': 'metadata'})
-  assert blob_upload
-  assert blob_upload.storage_metadata == {'some': 'metadata'}
-  assert blob_upload.location_name == 'local_us'
+    blob_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {"some": "metadata"}
+    )
+    assert blob_upload
+    assert blob_upload.storage_metadata == {"some": "metadata"}
+    assert blob_upload.location_name == "local_us"
 
-  # Ensure we can find the blob upload.
-  assert registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id) == blob_upload
+    # Ensure we can find the blob upload.
+    assert registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id) == blob_upload
 
-  # Update and ensure the changes are saved.
-  assert registry_model.update_blob_upload(blob_upload, 1, 'the-pieces_hash',
-                                          blob_upload.piece_sha_state,
-                                          {'new': 'metadata'}, 2, 3,
-                                          blob_upload.sha_state)
+    # Update and ensure the changes are saved.
+    assert registry_model.update_blob_upload(
+        blob_upload,
+        1,
+        {"new": "metadata"},
+        2,
+        3,
+        blob_upload.sha_state,
+    )
 
-  updated = registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
-  assert updated
-  assert updated.uncompressed_byte_count == 1
-  assert updated.piece_hashes == 'the-pieces_hash'
-  assert updated.storage_metadata == {'new': 'metadata'}
-  assert updated.byte_count == 2
-  assert updated.chunk_count == 3
+    updated = registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
+    assert updated
+    assert updated.uncompressed_byte_count == 1
+    assert updated.storage_metadata == {"new": "metadata"}
+    assert updated.byte_count == 2
+    assert updated.chunk_count == 3
 
-  # Delete the upload.
-  registry_model.delete_blob_upload(blob_upload)
+    # Delete the upload.
+    registry_model.delete_blob_upload(blob_upload)
 
-  # Ensure it can no longer be found.
-  assert not registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
+    # Ensure it can no longer be found.
+    assert not registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
 
 
 def test_commit_blob_upload(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  blob_upload = registry_model.create_blob_upload(repository_ref, str(uuid.uuid4()),
-                                                 'local_us', {'some': 'metadata'})
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    blob_upload = registry_model.create_blob_upload(
+        repository_ref, str(uuid.uuid4()), "local_us", {"some": "metadata"}
+    )
 
-  # Commit the blob upload and make sure it is written as a blob.
-  digest = 'sha256:' + hashlib.sha256('hello').hexdigest()
-  blob = registry_model.commit_blob_upload(blob_upload, digest, 60)
-  assert blob.digest == digest
+    # Commit the blob upload and make sure it is written as a blob.
+    digest = "sha256:" + hashlib.sha256(b"hello").hexdigest()
+    blob = registry_model.commit_blob_upload(blob_upload, digest, 60)
+    assert blob.digest == digest
 
-  # Ensure the upload can no longer be found.
-  assert not registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
+    # Ensure the upload can no longer be found.
+    assert not registry_model.lookup_blob_upload(repository_ref, blob_upload.upload_id)
 
 
-# TODO: Re-enable for OCI model once we have a new table for temporary blobs.
-def test_mount_blob_into_repository(pre_oci_model):
-  repository_ref = pre_oci_model.lookup_repository('devtable', 'simple')
-  latest_tag = pre_oci_model.get_repo_tag(repository_ref, 'latest')
-  manifest = pre_oci_model.get_manifest_for_tag(latest_tag)
+def test_mount_blob_into_repository(registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
 
-  target_repository_ref = pre_oci_model.lookup_repository('devtable', 'complex')
+    target_repository_ref = registry_model.lookup_repository("devtable", "complex")
 
-  blobs = pre_oci_model.get_manifest_local_blobs(manifest, include_placements=True)
-  assert blobs
+    blobs = registry_model.get_manifest_local_blobs(manifest, storage, include_placements=True)
+    assert blobs
 
-  for blob in blobs:
-    # Ensure the blob doesn't exist under the repository.
-    assert not pre_oci_model.get_repo_blob_by_digest(target_repository_ref, blob.digest)
+    for blob in blobs:
+        # Ensure the blob doesn't exist under the repository.
+        assert not registry_model.get_repo_blob_by_digest(target_repository_ref, blob.digest)
 
-    # Mount the blob into the repository.
-    assert pre_oci_model.mount_blob_into_repository(blob, target_repository_ref, 60)
+        # Mount the blob into the repository.
+        assert registry_model.mount_blob_into_repository(blob, target_repository_ref, 60)
 
-    # Ensure it now exists.
-    found = pre_oci_model.get_repo_blob_by_digest(target_repository_ref, blob.digest)
-    assert found == blob
+        # Ensure it now exists.
+        found = registry_model.get_repo_blob_by_digest(target_repository_ref, blob.digest)
+        assert found == blob
 
 
 class SomeException(Exception):
-  pass
+    pass
 
 
 def test_get_cached_repo_blob(registry_model):
-  model_cache = InMemoryDataModelCache()
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
 
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  latest_tag = registry_model.get_repo_tag(repository_ref, 'latest')
-  manifest = registry_model.get_manifest_for_tag(latest_tag)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
 
-  blobs = registry_model.get_manifest_local_blobs(manifest, include_placements=True)
-  assert blobs
+    blobs = registry_model.get_manifest_local_blobs(manifest, storage, include_placements=True)
+    assert blobs
 
-  blob = blobs[0]
+    blob = blobs[0]
 
-  # Load a blob to add it to the cache.
-  found = registry_model.get_cached_repo_blob(model_cache, 'devtable', 'simple', blob.digest)
-  assert found.digest == blob.digest
-  assert found.uuid == blob.uuid
-  assert found.compressed_size == blob.compressed_size
-  assert found.uncompressed_size == blob.uncompressed_size
-  assert found.uploading == blob.uploading
-  assert found.placements == blob.placements
+    # Load a blob to add it to the cache.
+    found = registry_model.get_cached_repo_blob(model_cache, "devtable", "simple", blob.digest)
+    assert found.digest == blob.digest
+    assert found.uuid == blob.uuid
+    assert found.compressed_size == blob.compressed_size
+    assert found.uncompressed_size == blob.uncompressed_size
+    assert found.placements == blob.placements
 
-  # Disconnect from the database by overwriting the connection.
-  def fail(x, y):
-    raise SomeException('Not connected!')
+    # Disconnect from the database by overwriting the connection.
+    def fail(x, y):
+        raise SomeException("Not connected!")
 
-  with patch('data.registry_model.registry_pre_oci_model.model.blob.get_repository_blob_by_digest',
-             fail):
-    with patch('data.registry_model.registry_oci_model.model.oci.blob.get_repository_blob_by_digest',
-              fail):
-      # Make sure we can load again, which should hit the cache.
-      cached = registry_model.get_cached_repo_blob(model_cache, 'devtable', 'simple', blob.digest)
-      assert cached.digest == blob.digest
-      assert cached.uuid == blob.uuid
-      assert cached.compressed_size == blob.compressed_size
-      assert cached.uncompressed_size == blob.uncompressed_size
-      assert cached.uploading == blob.uploading
-      assert cached.placements == blob.placements
+    with patch(
+        "data.registry_model.registry_oci_model.model.oci.blob.get_repository_blob_by_digest",
+        fail,
+    ):
+        # Make sure we can load again, which should hit the cache.
+        cached = registry_model.get_cached_repo_blob(model_cache, "devtable", "simple", blob.digest)
+        assert cached.digest == blob.digest
+        assert cached.uuid == blob.uuid
+        assert cached.compressed_size == blob.compressed_size
+        assert cached.uncompressed_size == blob.uncompressed_size
+        assert cached.placements == blob.placements
 
-      # Try another blob, which should fail since the DB is not connected and the cache
-      # does not contain the blob.
-      with pytest.raises(SomeException):
-        registry_model.get_cached_repo_blob(model_cache, 'devtable', 'simple', 'some other digest')
+        # Try another blob, which should fail since the DB is not connected and the cache
+        # does not contain the blob.
+        with pytest.raises(SomeException):
+            registry_model.get_cached_repo_blob(
+                model_cache, "devtable", "simple", "some other digest"
+            )
 
 
 def test_create_manifest_and_retarget_tag(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  latest_tag = registry_model.get_repo_tag(repository_ref, 'latest', include_legacy_image=True)
-  manifest = registry_model.get_manifest_for_tag(latest_tag).get_parsed_manifest()
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag).get_parsed_manifest()
 
-  builder = DockerSchema1ManifestBuilder('devtable', 'simple', 'anothertag')
-  builder.add_layer(manifest.blob_digests[0],
-                    '{"id": "%s"}' % latest_tag.legacy_image.docker_image_id)
-  sample_manifest = builder.build(docker_v2_signing_key)
-  assert sample_manifest is not None
+    builder = DockerSchema1ManifestBuilder("devtable", "simple", "anothertag")
+    builder.add_layer(manifest.blob_digests[0], '{"id": "%s"}' % "someid")
+    sample_manifest = builder.build(docker_v2_signing_key)
+    assert sample_manifest is not None
 
-  another_manifest, tag = registry_model.create_manifest_and_retarget_tag(repository_ref,
-                                                                          sample_manifest,
-                                                                          'anothertag',
-                                                                          storage)
-  assert another_manifest is not None
-  assert tag is not None
+    another_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, sample_manifest, "anothertag", storage, verify_quota=True
+    )
+    assert another_manifest is not None
+    assert tag is not None
 
-  assert tag.name == 'anothertag'
-  assert another_manifest.get_parsed_manifest().manifest_dict == sample_manifest.manifest_dict
+    assert tag.name == "anothertag"
+    assert another_manifest.get_parsed_manifest().manifest_dict == sample_manifest.manifest_dict
+
+
+def test_create_manifest_and_retarget_tag_with_quota(registry_model):
+    CONFIG_LAYER_JSON = json.dumps(
+        {
+            "config": {},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [],
+        }
+    )
+
+    # Create the blobs and manifest object
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    builder = DockerSchema2ManifestBuilder()
+    _, config_digest = _populate_blob_with_content(
+        CONFIG_LAYER_JSON, "devtable", repository_ref.name
+    )
+    builder.set_config_digest(config_digest, len(CONFIG_LAYER_JSON.encode("utf-8")))
+    blob_content = "blobcontent"
+    _, blob_digest = _populate_blob_with_content(blob_content, "devtable", repository_ref.name)
+    builder.add_layer(blob_digest, len(blob_content))
+    manifest = builder.build()
+    assert manifest is not None
+
+    # Create quota and limit
+    user = User.select().where(User.username == "devtable").get()
+    new_quota = namespacequota.create_namespace_quota(user, 1)
+    namespacequota.create_namespace_quota_limit(new_quota, "reject", 100)
+
+    rejected = False
+    try:
+        registry_model.create_manifest_and_retarget_tag(
+            repository_ref,
+            manifest,
+            "newtag",
+            storage,
+            verify_quota=True,
+        )
+    except QuotaExceededException:
+        rejected = True
+    assert rejected
+
+    # Assert that a temporary tag outside the time machine window was created since the manifest was rejected
+    # Get the tag that has beeen created in the last second
+    tag = (
+        Tag.select()
+        .where(
+            Tag.lifetime_start_ms > get_epoch_timestamp_ms() - 1000,
+            Tag.repository == repository_ref._db_id,
+        )
+        .get()
+    )
+    assert tag.name.startswith("$temp-")
+    assert tag.lifetime_end_ms is not None
+    assert tag.lifetime_end_ms < get_epoch_timestamp_ms() - user.removed_tag_expiration_s * 1000
+    assert tag.hidden
+    assert not tag.reversion
 
 
 def test_get_schema1_parsed_manifest(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  latest_tag = registry_model.get_repo_tag(repository_ref, 'latest', include_legacy_image=True)
-  manifest = registry_model.get_manifest_for_tag(latest_tag)
-  assert registry_model.get_schema1_parsed_manifest(manifest, '', '', '', storage)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
+    assert registry_model.get_schema1_parsed_manifest(manifest, "", "", "", storage)
 
 
 def test_convert_manifest(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  latest_tag = registry_model.get_repo_tag(repository_ref, 'latest', include_legacy_image=True)
-  manifest = registry_model.get_manifest_for_tag(latest_tag)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag)
 
-  mediatypes = DOCKER_SCHEMA1_CONTENT_TYPES
-  assert registry_model.convert_manifest(manifest, '', '', '', mediatypes, storage)
+    mediatypes = DOCKER_SCHEMA1_CONTENT_TYPES
+    assert registry_model.convert_manifest(manifest, "", "", "", mediatypes, storage)
 
-  mediatypes = []
-  assert registry_model.convert_manifest(manifest, '', '', '', mediatypes, storage) is None
+    mediatypes = []
+    assert registry_model.convert_manifest(manifest, "", "", "", mediatypes, storage) is None
 
 
 def test_create_manifest_and_retarget_tag_with_labels(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  latest_tag = registry_model.get_repo_tag(repository_ref, 'latest', include_legacy_image=True)
-  manifest = registry_model.get_manifest_for_tag(latest_tag).get_parsed_manifest()
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    latest_tag = registry_model.get_repo_tag(repository_ref, "latest")
+    manifest = registry_model.get_manifest_for_tag(latest_tag).get_parsed_manifest()
 
-  json_metadata = {
-    'id': latest_tag.legacy_image.docker_image_id,
-    'config': {
-      'Labels': {
-        'quay.expires-after': '2w',
-      },
-    },
-  }
+    json_metadata = {
+        "id": "someid",
+        "config": {
+            "Labels": {
+                "quay.expires-after": "2w",
+            },
+        },
+    }
 
-  builder = DockerSchema1ManifestBuilder('devtable', 'simple', 'anothertag')
-  builder.add_layer(manifest.blob_digests[0], json.dumps(json_metadata))
-  sample_manifest = builder.build(docker_v2_signing_key)
-  assert sample_manifest is not None
+    builder = DockerSchema1ManifestBuilder("devtable", "simple", "anothertag")
+    builder.add_layer(manifest.blob_digests[0], json.dumps(json_metadata))
+    sample_manifest = builder.build(docker_v2_signing_key)
+    assert sample_manifest is not None
 
-  another_manifest, tag = registry_model.create_manifest_and_retarget_tag(repository_ref,
-                                                                          sample_manifest,
-                                                                          'anothertag',
-                                                                          storage)
-  assert another_manifest is not None
-  assert tag is not None
+    another_manifest, tag = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, sample_manifest, "anothertag", storage
+    )
+    assert another_manifest is not None
+    assert tag is not None
 
-  assert tag.name == 'anothertag'
-  assert another_manifest.get_parsed_manifest().manifest_dict == sample_manifest.manifest_dict
+    assert tag.name == "anothertag"
+    assert another_manifest.get_parsed_manifest().manifest_dict == sample_manifest.manifest_dict
 
-  # Ensure the labels were applied.
-  assert tag.lifetime_end_ms is not None
+    # Ensure the labels were applied.
+    assert tag.lifetime_end_ms is not None
 
+    # Create another tag and retarget it to an existing manifest; it should have an end date.
+    # This is from a Quay's tag api, so it will not attempt to create a manifest first.
+    yet_another_tag = registry_model.retarget_tag(
+        repository_ref, "yet_another_tag", another_manifest, storage, docker_v2_signing_key
+    )
+    assert yet_another_tag.lifetime_end_ms is not None
+
+
+def test_create_manifest_and_retarget_tag_with_labels_with_existing_manifest(oci_model):
+    # Create a config blob for testing.
+    config_json = json.dumps(
+        {
+            "config": {
+                "Labels": {
+                    "quay.expires-after": "2w",
+                },
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [
+                {
+                    "created": "2018-04-03T18:37:09.284840891Z",
+                    "created_by": "do something",
+                },
+            ],
+        }
+    )
+
+    app_config = {"TESTING": True}
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500)) as upload:
+        upload.upload_chunk(app_config, BytesIO(config_json.encode("utf-8")))
+        blob = upload.commit_to_blob(app_config)
+
+    # Create the manifest in the repo.
+    builder = DockerSchema2ManifestBuilder()
+    builder.set_config_digest(blob.digest, blob.compressed_size)
+    builder.add_layer("sha256:abcd", 1234, urls=["http://hello/world"])
+    manifest = builder.build()
+
+    some_manifest, some_tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "some_tag", storage
+    )
+    assert some_manifest is not None
+    assert some_tag is not None
+    assert some_tag.lifetime_end_ms is not None
+
+    # Create tag and retarget it to an existing manifest; it should have an end date.
+    # This is from a push, so it will attempt to create a manifest first.
+    some_other_manifest, some_other_tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "some_other_tag", storage
+    )
+    assert some_other_manifest is not None
+    assert some_other_manifest == some_manifest
+    assert some_other_tag is not None
+    assert some_other_tag.lifetime_end_ms is not None
+
+    # Create another tag and retarget it to an existing manifest; it should have an end date.
+    # This is from a Quay's tag api, so it will not attempt to create a manifest first.
+    yet_another_tag = oci_model.retarget_tag(
+        repository_ref, "yet_another_tag", some_other_manifest, storage, docker_v2_signing_key
+    )
+    assert yet_another_tag.lifetime_end_ms is not None
+
+
+@pytest.fixture
+def _enable_immutable_tags():
+    import features
+
+    original = getattr(features, "IMMUTABLE_TAGS", False)
+    features.IMMUTABLE_TAGS = True
+    yield
+    features.IMMUTABLE_TAGS = original
+
+
+def _create_schema2_manifest_with_labels(repository_ref, labels):
+    """Helper to create a Schema2 manifest with the given config labels."""
+    config_json = json.dumps(
+        {
+            "config": {"Labels": labels},
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [
+                {
+                    "created": "2018-04-03T18:37:09.284840891Z",
+                    "created_by": "do something",
+                },
+            ],
+        }
+    )
+
+    app_config = {"TESTING": True}
+    with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500)) as upload:
+        upload.upload_chunk(app_config, BytesIO(config_json.encode("utf-8")))
+        blob = upload.commit_to_blob(app_config)
+
+    builder = DockerSchema2ManifestBuilder()
+    builder.set_config_digest(blob.digest, blob.compressed_size)
+    builder.add_layer("sha256:abcd", 1234, urls=["http://hello/world"])
+    return builder.build()
+
+
+def test_create_manifest_and_retarget_tag_with_immutable_label(oci_model, _enable_immutable_tags):
+    """Test that pushing a manifest with quay.immutable=true makes the tag immutable."""
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    manifest = _create_schema2_manifest_with_labels(repository_ref, {"quay.immutable": "true"})
+
+    created_manifest, tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "immutable_tag", storage
+    )
+    assert created_manifest is not None
+    assert tag is not None
+    assert tag.immutable is True
+
+
+def test_create_manifest_and_retarget_tag_with_immutable_label_existing_manifest(
+    oci_model, _enable_immutable_tags
+):
+    """Test that retargeting an existing manifest with quay.immutable=true to a new tag
+    also makes the new tag immutable."""
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    manifest = _create_schema2_manifest_with_labels(repository_ref, {"quay.immutable": "true"})
+
+    # First push creates the manifest
+    first_manifest, first_tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "first_immutable", storage
+    )
+    assert first_manifest is not None
+    assert first_tag.immutable is True
+
+    # Second push reuses the existing manifest with a different tag
+    second_manifest, second_tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "second_immutable", storage
+    )
+    assert second_manifest is not None
+    assert second_manifest == first_manifest
+    assert second_tag.immutable is True
+
+
+def test_create_manifest_and_retarget_tag_with_immutable_label_api_retarget(
+    oci_model, _enable_immutable_tags
+):
+    """Test that API-driven retarget also picks up immutability from manifest labels."""
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    manifest = _create_schema2_manifest_with_labels(repository_ref, {"quay.immutable": "true"})
+
+    created_manifest, _ = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "api_immutable_src", storage
+    )
+    assert created_manifest is not None
+
+    # Retarget via the API path
+    api_tag = oci_model.retarget_tag(
+        repository_ref, "api_immutable_dst", created_manifest, storage, docker_v2_signing_key
+    )
+    assert api_tag is not None
+    assert api_tag.immutable is True
+
+
+def test_create_manifest_and_retarget_tag_with_immutable_label_false(
+    oci_model, _enable_immutable_tags
+):
+    """Test that quay.immutable=false does NOT make the tag immutable."""
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    manifest = _create_schema2_manifest_with_labels(repository_ref, {"quay.immutable": "false"})
+
+    created_manifest, tag = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "mutable_tag", storage
+    )
+    assert created_manifest is not None
+    assert tag is not None
+    assert tag.immutable is False
+
+
+def test_create_manifest_and_retarget_tag_with_immutable_label_feature_disabled(oci_model):
+    """Test that quay.immutable=true has no effect when IMMUTABLE_TAGS feature is disabled."""
+    import features
+
+    original = getattr(features, "IMMUTABLE_TAGS", False)
+    features.IMMUTABLE_TAGS = False
+    try:
+        repository_ref = oci_model.lookup_repository("devtable", "simple")
+        manifest = _create_schema2_manifest_with_labels(repository_ref, {"quay.immutable": "true"})
+
+        created_manifest, tag = oci_model.create_manifest_and_retarget_tag(
+            repository_ref, manifest, "disabled_immutable", storage
+        )
+        assert created_manifest is not None
+        assert tag is not None
+        assert tag.immutable is False
+    finally:
+        features.IMMUTABLE_TAGS = original
+
+
+def test_manifest_list_expiration_multiple_tags(oci_model):
+    """
+    Test that when a manifest list is pushed with multiple tags,
+    all tags get the expiration from child manifest labels.
+
+    This verifies the fix for PROJQUAY-7245.
+    """
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+
+    # Create a config blob with expiry label for child manifest
+    config_json = json.dumps(
+        {
+            "config": {
+                "Labels": {
+                    "quay.expires-after": "1w",
+                },
+            },
+            "rootfs": {"type": "layers", "diff_ids": []},
+            "history": [
+                {
+                    "created": "2018-04-03T18:37:09.284840891Z",
+                    "created_by": "do something",
+                },
+            ],
+        }
+    )
+
+    app_config = {"TESTING": True}
+    with upload_blob(repository_ref, storage, BlobUploadSettings(500, 500)) as upload:
+        upload.upload_chunk(app_config, BytesIO(config_json.encode("utf-8")))
+        config_blob = upload.commit_to_blob(app_config)
+
+    # Create a child manifest with the expiry label
+    child_builder = DockerSchema2ManifestBuilder()
+    child_builder.set_config_digest(config_blob.digest, config_blob.compressed_size)
+    # Use a valid SHA256 digest (64 hex chars)
+    layer_digest = "sha256:" + hashlib.sha256(b"child_layer_content").hexdigest()
+    child_builder.add_layer(layer_digest, 1234, urls=["http://example/layer"])
+    child_manifest = child_builder.build()
+
+    # Create the child manifest in the registry (hidden, no tag)
+    child_created, _ = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, child_manifest, "temp_child_tag", storage
+    )
+    assert child_created is not None
+
+    # Build a manifest list referencing the child manifest
+    list_builder = DockerSchema2ManifestListBuilder()
+    list_builder.add_manifest(child_manifest, "amd64", "linux")
+    manifest_list = list_builder.build()
+
+    # Push the manifest list with the first tag
+    manifest1, tag1 = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest_list, "multi-arch-v1", storage
+    )
+    assert manifest1 is not None
+    assert tag1 is not None
+    assert tag1.lifetime_end_ms is not None, "First tag should have expiration set"
+
+    # Push the same manifest list with a second tag
+    manifest2, tag2 = oci_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest_list, "multi-arch-v2", storage
+    )
+    assert manifest2 is not None
+    assert manifest2.digest == manifest1.digest, "Should be the same manifest"
+    assert tag2 is not None
+    assert tag2.lifetime_end_ms is not None, "Second tag should also have expiration set"
+
+    # Also test retarget_tag (used by Quay's tag API)
+    tag3 = oci_model.retarget_tag(
+        repository_ref, "multi-arch-v3", manifest1, storage, docker_v2_signing_key
+    )
+    assert tag3 is not None
+    assert tag3.lifetime_end_ms is not None, "Third tag via retarget_tag should have expiration"
 
 
 def _populate_blob(digest):
-  location = ImageStorageLocation.get(name='local_us')
-  store_blob_record_and_temp_link('devtable', 'simple', digest, location, 1, 120)
+    location = ImageStorageLocation.get(name="local_us")
+    store_blob_record_and_temp_link("devtable", "simple", digest, location, 1, 120)
+
+
+def _populate_blob_with_content(content, org_name, repository_name):
+    content = Bytes.for_string_or_unicode(content).as_encoded_str()
+    digest = str(sha256_digest(content))
+    location = ImageStorageLocation.get(name="local_us")
+    blob = store_blob_record_and_temp_link(
+        org_name, repository_name, digest, location, len(content), 120
+    )
+    storage.put_content(["local_us"], get_layer_path(blob), content)
+    return blob, digest
 
 
 def test_known_issue_schema1(registry_model):
-  test_dir = os.path.dirname(os.path.abspath(__file__))
-  path = os.path.join(test_dir, '../../../image/docker/test/validate_manifest_known_issue.json')
-  with open(path, 'r') as f:
-    manifest_bytes = f.read()
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(test_dir, "../../../image/docker/test/validate_manifest_known_issue.json")
+    with open(path, "r") as f:
+        manifest_bytes = f.read()
 
-  manifest = DockerSchema1Manifest(Bytes.for_string_or_unicode(manifest_bytes))
+    manifest = DockerSchema1Manifest(Bytes.for_string_or_unicode(manifest_bytes))
 
-  for blob_digest in manifest.local_blob_digests:
-    _populate_blob(blob_digest)
+    for blob_digest in manifest.local_blob_digests:
+        _populate_blob(blob_digest)
 
-  digest = manifest.digest
-  assert digest == 'sha256:44518f5a4d1cb5b7a6347763116fb6e10f6a8563b6c40bb389a0a982f0a9f47a'
+    digest = manifest.digest
+    assert digest == "sha256:44518f5a4d1cb5b7a6347763116fb6e10f6a8563b6c40bb389a0a982f0a9f47a"
 
-  # Create the manifest in the database.
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  created_manifest, _ = registry_model.create_manifest_and_retarget_tag(repository_ref, manifest,
-                                                                        'latest', storage)
-  assert created_manifest
-  assert created_manifest.digest == manifest.digest
-  assert (created_manifest.internal_manifest_bytes.as_encoded_str() ==
-          manifest.bytes.as_encoded_str())
+    # Create the manifest in the database.
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    created_manifest, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "latest", storage
+    )
+    assert created_manifest
+    assert created_manifest.digest == manifest.digest
+    assert (
+        created_manifest.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
+    )
 
-  # Look it up again and validate.
-  found = registry_model.lookup_manifest_by_digest(repository_ref, manifest.digest, allow_dead=True)
-  assert found
-  assert found.digest == digest
-  assert found.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
-  assert found.get_parsed_manifest().digest == digest
+    # Look it up again and validate.
+    found = registry_model.lookup_manifest_by_digest(
+        repository_ref, manifest.digest, allow_dead=True
+    )
+    assert found
+    assert found.digest == digest
+    assert found.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
+    assert found.get_parsed_manifest().digest == digest
 
 
 def test_unicode_emoji(registry_model):
-  builder = DockerSchema1ManifestBuilder('devtable', 'simple', 'latest')
-  builder.add_layer('sha256:abcde', json.dumps({
-    'id': 'someid',
-    'author': u'😱',
-  }, ensure_ascii=False))
+    builder = DockerSchema1ManifestBuilder("devtable", "simple", "latest")
+    builder.add_layer(
+        "sha256:abcde",
+        json.dumps(
+            {
+                "id": "someid",
+                "author": "😱",
+            },
+            ensure_ascii=False,
+        ),
+    )
 
-  manifest = builder.build(ensure_ascii=False)
-  manifest._validate()
+    manifest = builder.build(ensure_ascii=False)
+    manifest._validate()
 
-  for blob_digest in manifest.local_blob_digests:
-    _populate_blob(blob_digest)
+    for blob_digest in manifest.local_blob_digests:
+        _populate_blob(blob_digest)
 
-  # Create the manifest in the database.
-  repository_ref = registry_model.lookup_repository('devtable', 'simple')
-  created_manifest, _ = registry_model.create_manifest_and_retarget_tag(repository_ref, manifest,
-                                                                        'latest', storage)
-  assert created_manifest
-  assert created_manifest.digest == manifest.digest
-  assert (created_manifest.internal_manifest_bytes.as_encoded_str() ==
-          manifest.bytes.as_encoded_str())
+    # Create the manifest in the database.
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    created_manifest, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest, "latest", storage
+    )
+    assert created_manifest
+    assert created_manifest.digest == manifest.digest
+    assert (
+        created_manifest.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
+    )
 
-  # Look it up again and validate.
-  found = registry_model.lookup_manifest_by_digest(repository_ref, manifest.digest, allow_dead=True)
-  assert found
-  assert found.digest == manifest.digest
-  assert found.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
-  assert found.get_parsed_manifest().digest == manifest.digest
-
-
-def test_lookup_active_repository_tags(oci_model):
-  repository_ref = oci_model.lookup_repository('devtable', 'simple')
-  latest_tag = oci_model.get_repo_tag(repository_ref, 'latest')
-  manifest = oci_model.get_manifest_for_tag(latest_tag)
-
-  tag_count = 500
-
-  # Create a bunch of tags.
-  tags_expected = set()
-  for index in range(0, tag_count):
-    tags_expected.add('somenewtag%s' % index)
-    oci_model.retarget_tag(repository_ref, 'somenewtag%s' % index, manifest, storage,
-                           docker_v2_signing_key)
-
-  assert tags_expected
-
-  # List the tags.
-  tags_found = set()
-  tag_id = None
-  while True:
-    tags = oci_model.lookup_active_repository_tags(repository_ref, tag_id, 11)
-    assert len(tags) <= 11
-    for tag in tags[0:10]:
-      assert tag.name not in tags_found
-      if tag.name in tags_expected:
-        tags_found.add(tag.name)
-        tags_expected.remove(tag.name)
-
-    if len(tags) < 11:
-      break
-
-    tag_id = tags[10].id
-
-  # Make sure we've found all the tags.
-  assert tags_found
-  assert not tags_expected
+    # Look it up again and validate.
+    found = registry_model.lookup_manifest_by_digest(
+        repository_ref, manifest.digest, allow_dead=True
+    )
+    assert found
+    assert found.digest == manifest.digest
+    assert found.internal_manifest_bytes.as_encoded_str() == manifest.bytes.as_encoded_str()
+    assert found.get_parsed_manifest().digest == manifest.digest
 
 
-def test_yield_tags_for_vulnerability_notification(registry_model):
-  repository_ref = registry_model.lookup_repository('devtable', 'complex')
+@pytest.mark.parametrize(
+    "test_cached",
+    [
+        False,
+        True,
+    ],
+)
+def test_lookup_active_repository_tags(test_cached, oci_model):
+    repository_ref = oci_model.lookup_repository("devtable", "simple")
+    latest_tag = oci_model.get_repo_tag(repository_ref, "latest")
+    manifest = oci_model.get_manifest_for_tag(latest_tag)
 
-  # Check for all legacy images under the tags and ensure not raised because
-  # no notification is yet registered.
-  for tag in registry_model.list_all_active_repository_tags(repository_ref,
-                                                            include_legacy_images=True):
-    image = registry_model.get_legacy_image(repository_ref, tag.legacy_image.docker_image_id,
-                                            include_blob=True)
-    pairs = [(image.docker_image_id, image.blob.uuid)]
-    results = list(registry_model.yield_tags_for_vulnerability_notification(pairs))
-    assert not len(results)
+    existing_tags = oci_model.list_all_active_repository_tags(repository_ref)
 
-  # Register a notification.
-  model.notification.create_repo_notification(repository_ref.id, 'vulnerability_found', 'email',
-                                              {}, {})
+    tag_count = 500
 
-  # Check again.
-  for tag in registry_model.list_all_active_repository_tags(repository_ref,
-                                                            include_legacy_images=True):
-    image = registry_model.get_legacy_image(repository_ref, tag.legacy_image.docker_image_id,
-                                            include_blob=True, include_parents=True)
+    # Create a bunch of tags.
+    tags_expected = set()
+    for index in range(0, tag_count):
+        tags_expected.add("somenewtag%s" % index)
+        oci_model.retarget_tag(
+            repository_ref, "somenewtag%s" % index, manifest, storage, docker_v2_signing_key
+        )
 
-    # Check for every parent of the image.
-    for current in image.parents:
-      img = registry_model.get_legacy_image(repository_ref, current.docker_image_id,
-                                            include_blob=True)
-      pairs = [(img.docker_image_id, img.blob.uuid)]
-      results = list(registry_model.yield_tags_for_vulnerability_notification(pairs))
-      assert len(results) > 0
-      assert tag.name in {t.name for t in results}
+    for tag in existing_tags:
+        tags_expected.add(tag.name)
 
-    # Check for the image itself.
-    pairs = [(image.docker_image_id, image.blob.uuid)]
-    results = list(registry_model.yield_tags_for_vulnerability_notification(pairs))
-    assert len(results) > 0
-    assert tag.name in {t.name for t in results}
+    tags_expected = sorted(tags_expected)
+    assert tags_expected
+
+    tags_to_process = tags_expected.copy()
+
+    # List the tags.
+    tag_limit = 11
+    tags_found = set()
+    tag_name = None
+    while True:
+        if test_cached:
+            model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+            tags, has_more = oci_model.lookup_cached_active_repository_tags(
+                model_cache, repository_ref, tag_name, tag_limit
+            )
+        else:
+            tags, has_more = oci_model.lookup_active_repository_tags(
+                repository_ref, tag_name, tag_limit
+            )
+
+        assert len(tags) <= tag_limit
+        for tag in tags:
+            # ensure last tag name is not part of result set
+            if tag_name is not None:
+                assert tag_name is not tag.name
+
+            # make sure we don't have duplicates between result pages
+            assert tag.name not in tags_found
+
+            # make sure the tags are in lexical order
+            assert tag.name == tags_to_process.pop(0)
+
+            tags_found.add(tag.name)
+
+        if not has_more:
+            break
+
+        tag_name = tags[-1].name
+
+    # Make sure we've found all the tags.
+    assert set(tags_found) == set(tags_expected)
+    assert not tags_to_process
+
+
+def test_create_manifest_with_temp_tag(initialized_db, registry_model):
+    builder = DockerSchema1ManifestBuilder("devtable", "simple", "latest")
+    builder.add_layer(
+        "sha256:abcde",
+        json.dumps(
+            {
+                "id": "someid",
+                "author": "some user",
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    manifest = builder.build(ensure_ascii=False)
+
+    for blob_digest in manifest.local_blob_digests:
+        _populate_blob(blob_digest)
+
+    # Create the manifest in the database.
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    created = registry_model.create_manifest_with_temp_tag(repository_ref, manifest, 300, storage)
+    assert created.digest == manifest.digest
+
+    # Ensure it cannot be found normally, since it is simply temp-tagged.
+    assert registry_model.lookup_manifest_by_digest(repository_ref, manifest.digest) is None
+
+    # Ensure it can be found, which means it is temp-tagged.
+    found = registry_model.lookup_manifest_by_digest(
+        repository_ref, manifest.digest, allow_dead=True
+    )
+    assert found is not None
+
+
+def test_find_manifests_for_sec_notification(initialized_db, registry_model):
+    # First try for manifests inside a repository without any events, which should not
+    # return any results.
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    found_manifest = False
+    for tag in registry_model.list_all_active_repository_tags(repository_ref):
+        manifest = registry_model.get_manifest_for_tag(tag)
+        found_manifest = True
+        assert len(list(registry_model.find_manifests_for_sec_notification(manifest.digest))) == 0
+
+    assert found_manifest
+
+    # Add a security notification to the repository.
+    model.notification.create_repo_notification(
+        repository_ref.id,
+        "vulnerability_found",
+        "webhook",
+        {},
+        {
+            "vulnerability": {
+                "priority": "Critical",
+            },
+        },
+    )
+
+    # Now ensure the manifests are found.
+    for tag in registry_model.list_all_active_repository_tags(repository_ref):
+        manifest = registry_model.get_manifest_for_tag(tag)
+        assert len(list(registry_model.find_manifests_for_sec_notification(manifest.digest))) > 0
+
+
+def test_lookup_secscan_notification_severities(initialized_db, registry_model):
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+    assert len(list(registry_model.lookup_secscan_notification_severities(repository_ref))) == 0
+
+    # Add some vuln events.
+    model.notification.create_repo_notification(
+        repository_ref.id,
+        "vulnerability_found",
+        "webhook",
+        {},
+        {
+            "vulnerability": {
+                "priority": "Critical",
+            },
+        },
+    )
+
+    model.notification.create_repo_notification(
+        repository_ref.id,
+        "vulnerability_found",
+        "webhook",
+        {},
+        {
+            "vulnerability": {
+                "priority": "Low",
+            },
+        },
+    )
+
+    assert set(registry_model.lookup_secscan_notification_severities(repository_ref)) == {
+        "Low",
+        "Critical",
+    }
+
+
+def test_tag_names_for_manifest(initialized_db, registry_model):
+    verified_tag = False
+    for repository in Repository.select():
+        repo_ref = RepositoryReference.for_repo_obj(repository)
+        for tag in registry_model.list_all_active_repository_tags(repo_ref):
+            manifest = registry_model.get_manifest_for_tag(tag)
+            tag_names = set(registry_model.tag_names_for_manifest(manifest, 1000))
+            assert tag.name in tag_names
+            verified_tag = True
+
+            for found_name in tag_names:
+                found_tag = registry_model.get_repo_tag(repo_ref, found_name)
+                assert registry_model.get_manifest_for_tag(found_tag) == manifest
+    assert verified_tag
+
+
+def test_lookup_repository_cache_invalidated_on_delete(initialized_db, registry_model):
+    """
+    Verifies that the repository cache key has been invalidated after deletion.
+
+    Regression: If a repo is deleted and then content is immediately pushed to the new repo of the same name,
+    push might fail because of the stale cached repo ID.
+    """
+    namespace = "devtable"
+    repo = "simple"
+
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    model_cache.empty_for_testing()
+
+    repo_ref = registry_model.lookup_repository(namespace, repo, model_cache=model_cache)
+
+    # Check that repo reference exists and cache response
+    assert repo_ref is not None
+    old_repo_id = repo_ref._db_id
+    cache_key_for_lookup = cache_key.for_repository_lookup(namespace, repo, None, None, {})
+    cached_result = model_cache.cache.get(cache_key_for_lookup.key)
+
+    # Verify cache
+    assert cached_result is not None
+    assert json.loads(cached_result)["id"] == old_repo_id
+
+    # Delete repository
+    model.repository.mark_repository_for_deletion(namespace, repo, repository_gc_queue)
+
+    # Invalidate cache
+    model_cache.invalidate(cache_key_for_lookup)
+
+    # Create repo with the same name
+    new_repo = model.repository.create_repository(namespace, repo, None, repo_kind="image")
+    assert new_repo.id != old_repo_id
+
+    # New lookup should give us a new repo, not the deleted one
+    repo_ref_after = registry_model.lookup_repository(namespace, repo, model_cache=model_cache)
+    assert repo_ref_after is not None
+    assert repo_ref_after._db_id == new_repo.id
+    assert repo_ref_after._db_id != old_repo_id
+
+
+def test_lookup_repository_cache_stale_after_delete_without_invalidation(
+    registry_model, initialized_db
+):
+    """
+    Demo for the regression bug: without invalidation, the cache returns
+    the deleted repo's ID after delete + recreate.
+    """
+    namespace = "devtable"
+    repo = "simple"
+
+    model_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    model_cache.empty_for_testing()
+
+    repo_ref = registry_model.lookup_repository(namespace, repo, model_cache=model_cache)
+    old_repo_id = repo_ref._db_id
+
+    model.repository.mark_repository_for_deletion(namespace, repo, repository_gc_queue)
+    new_repo = model.repository.create_repository(namespace, repo, None, repo_kind="image")
+
+    repo_ref_stale = registry_model.lookup_repository(namespace, repo, model_cache=model_cache)
+
+    assert repo_ref_stale._db_id == old_repo_id  # Points to a deleted repo
+    assert repo_ref_stale._db_id != new_repo.id
+
+
+def _create_oci_manifest_with_blobs(org_name, repo_name, config_content=None):
+    """Helper to create an OCI manifest with populated blobs."""
+    if config_content is None:
+        config_content = json.dumps({"config": {}, "rootfs": {"type": "layers", "diff_ids": []}})
+    config = json.loads(config_content)
+    config.setdefault("architecture", "amd64")
+    config.setdefault("os", "linux")
+    config_content = json.dumps(config)
+    _, config_digest = _populate_blob_with_content(config_content, org_name, repo_name)
+    blob_content = "layer-" + sha256_digest(config_content.encode())[:8]
+    _, blob_digest = _populate_blob_with_content(blob_content, org_name, repo_name)
+
+    builder = OCIManifestBuilder()
+    builder.set_config_digest(config_digest, len(config_content.encode("utf-8")))
+    builder.add_layer(blob_digest, len(blob_content.encode("utf-8")))
+    return builder
+
+
+def test_referrers_cache_invalidated_on_push(initialized_db, registry_model):
+    """
+    When a manifest with a subject is pushed, the referrers cache for the
+    subject digest must be invalidated so that the new referrer is visible
+    immediately without waiting for the TTL to expire.
+    """
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+
+    # Build the subject manifest (manifest A).
+    builder_a = _create_oci_manifest_with_blobs("devtable", "simple")
+    manifest_a = builder_a.build()
+
+    created_a, tag_a = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest_a, "subject-tag", storage, raise_on_error=True
+    )
+    assert created_a is not None
+
+    # Prime the referrers cache with an empty list.
+    referrers_before = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a
+    )
+    assert referrers_before == []
+
+    # Build the referrer manifest (manifest B) pointing to A.
+    builder_b = _create_oci_manifest_with_blobs(
+        "devtable",
+        "simple",
+        config_content=json.dumps(
+            {
+                "config": {"extra": "referrer"},
+                "rootfs": {"type": "layers", "diff_ids": []},
+                "history": [],
+            }
+        ),
+    )
+    builder_b.set_subject(
+        manifest_a.digest,
+        len(manifest_a.bytes.as_encoded_str()),
+        manifest_a.media_type,
+    )
+    manifest_b = builder_b.build()
+
+    # Push the referrer by tag with model_cache so the cache is invalidated.
+    created_b, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref,
+        manifest_b,
+        "referrer-tag",
+        storage,
+        model_cache=test_cache,
+    )
+    assert created_b is not None
+
+    # Query referrers again — the new referrer must appear immediately.
+    referrers_after = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a
+    )
+    assert len(referrers_after) == 1
+    assert referrers_after[0].digest == manifest_b.digest
+
+
+def test_referrers_cache_artifact_type_isolation(initialized_db, registry_model):
+    """
+    Referrers queries filtered by artifactType must use separate cache
+    entries, so that a cached filtered result does not serve an unfiltered
+    request (or vice-versa).
+    """
+    test_cache = InMemoryDataModelCache(TEST_CACHE_CONFIG)
+    repository_ref = registry_model.lookup_repository("devtable", "simple")
+
+    # Build the subject manifest.
+    builder_a = _create_oci_manifest_with_blobs("devtable", "simple")
+    manifest_a = builder_a.build()
+
+    created_a, _ = registry_model.create_manifest_and_retarget_tag(
+        repository_ref, manifest_a, "artifact-subject", storage, raise_on_error=True
+    )
+    assert created_a is not None
+
+    # Push a referrer with a subject pointing to manifest A.
+    builder_b = _create_oci_manifest_with_blobs(
+        "devtable",
+        "simple",
+        config_content=json.dumps(
+            {
+                "config": {"kind": "sig"},
+                "rootfs": {"type": "layers", "diff_ids": []},
+                "history": [],
+            }
+        ),
+    )
+    builder_b.set_subject(
+        manifest_a.digest,
+        len(manifest_a.bytes.as_encoded_str()),
+        manifest_a.media_type,
+    )
+    manifest_b = builder_b.build()
+    artifact_type = "application/vnd.example.signature"
+    manifest_b_dict = json.loads(manifest_b.bytes.as_unicode())
+    manifest_b_dict["artifactType"] = artifact_type
+    manifest_b = OCIManifest(Bytes.for_string_or_unicode(json.dumps(manifest_b_dict)))
+
+    # Prime the matching filtered cache before the referrer is pushed.
+    filtered_before = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a, artifact_type=artifact_type
+    )
+    assert filtered_before == []
+
+    registry_model.create_manifest_with_temp_tag(
+        repository_ref, manifest_b, 300, storage, model_cache=test_cache
+    )
+
+    # Query referrers without a filter — should find the referrer.
+    unfiltered = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a
+    )
+    assert len(unfiltered) == 1
+
+    # Query with the matching artifactType — the filtered cache must have
+    # been invalidated along with the unfiltered entry.
+    filtered_match = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a, artifact_type=artifact_type
+    )
+    assert len(filtered_match) == 1
+
+    # Query with a non-matching artifactType — should return empty.
+    filtered_miss = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a, artifact_type="application/vnd.nonexistent"
+    )
+    assert filtered_miss == []
+
+    # The unfiltered cache must still return the referrer (not the
+    # empty filtered result).
+    unfiltered_again = registry_model.lookup_cached_referrers_for_manifest(
+        test_cache, repository_ref, created_a
+    )
+    assert len(unfiltered_again) == 1

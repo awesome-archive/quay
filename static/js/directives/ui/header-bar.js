@@ -145,6 +145,23 @@ angular.module('quay').directive('headerBar', function () {
           'namespace': namespace
         };
       };
+
+      $scope.checkElementByID = function(elementID) {
+        var result = false;
+        if (document.getElementById(elementID)) {
+          result = true;
+        }
+        return result;
+      }
+
+      $scope.shouldShowNewUiToggle = function (context) {
+        // we only show the toggle once the user has signed-in
+        if( !Features.UI_V2 || $scope.checkElementByID('signin-username')) {
+          return false;
+        }
+
+        return true;
+      }
     }
   };
   return directiveDefinitionObject;

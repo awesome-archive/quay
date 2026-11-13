@@ -1,27 +1,29 @@
-import sys
 import os
+import sys
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 
 import logging
 
-from Crypto import Random
 from util.log import logfile_path
-from util.workers import get_worker_count
-
+from util.workers import get_worker_connections_count, get_worker_count
 
 logconfig = logfile_path(debug=True)
-bind = '0.0.0.0:5000'
-workers = get_worker_count('local', 2, minimum=2, maximum=8)
-worker_class = 'gevent'
+bind = "0.0.0.0:5000"
+workers = get_worker_count("local", 2, minimum=2, maximum=8)
+worker_class = "gevent"
+worker_connections = get_worker_connections_count("local")
 daemon = False
-pythonpath = '.'
-preload_app = True
+pythonpath = "."
+if os.getenv("QUAY_HOTRELOAD", "false") == "true":
+    reload = True
+    reload_engine = "auto"
+else:
+    preload_app = True
 
-def post_fork(server, worker):
-  # Reset the Random library to ensure it won't raise the "PID check failed." error after
-  # gunicorn forks.
-  Random.atfork()
 
 def when_ready(server):
-  logger = logging.getLogger(__name__)
-  logger.debug('Starting local gunicorn with %s workers and %s worker class', workers, worker_class)
+    logger = logging.getLogger(__name__)
+    logger.debug(
+        "Starting local gunicorn with %s workers and %s worker class", workers, worker_class
+    )

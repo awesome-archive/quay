@@ -1,28 +1,46 @@
-import sys
+# NOTE: Must be before we import or call anything that may be synchronous.
+from gevent import monkey
+
+monkey.patch_all()
+
 import os
+import sys
+
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))
 
 import logging
 
-from Crypto import Random
 from util.log import logfile_path
-from util.workers import get_worker_count
-
+from util.workers import get_worker_connections_count, get_worker_count
 
 logconfig = logfile_path(debug=False)
 
-bind = 'unix:/tmp/gunicorn_web.sock'
-workers = get_worker_count('web', 2, minimum=2, maximum=32)
-worker_class = 'gevent'
-pythonpath = '.'
-preload_app = True
+bind = "unix:/tmp/gunicorn_web.sock"
+workers = get_worker_count("web", 2, minimum=2, maximum=32)
+worker_class = "gevent"
+worker_connections = get_worker_connections_count("web")
+pythonpath = "."
+if os.getenv("QUAY_HOTRELOAD", "false") == "true":
+    reload = True
+    reload_engine = "auto"
+else:
+    preload_app = True
 
-def post_fork(server, worker):
-  # Reset the Random library to ensure it won't raise the "PID check failed." error after
-  # gunicorn forks.
-  Random.atfork()
 
 def when_ready(server):
-  logger = logging.getLogger(__name__)
-  logger.debug('Starting web gunicorn with %s workers and %s worker class', workers,
-               worker_class)
+    logger = logging.getLogger(__name__)
+    logger.debug("Starting web gunicorn with %s workers and %s worker class", workers, worker_class)
+
+
+def post_fork(server, worker):
+    # Only relevant under preload_app — in reload mode each worker loads the
+    # app itself, so there's no pre-fork BatchSpanProcessor to reinitialize.
+    if os.getenv("QUAY_HOTRELOAD", "false") == "true":
+        return
+
+    import features
+
+    if features.OTEL_TRACING:
+        from util.metrics.otel import post_fork_init
+
+        post_fork_init()

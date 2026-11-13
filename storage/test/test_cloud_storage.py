@@ -1,258 +1,718 @@
+import datetime
 import os
+import time
+from datetime import timedelta
+from io import BytesIO
+from unittest.mock import patch
 
-from StringIO import StringIO
-
+import boto3
+import botocore.exceptions
 import pytest
-
-import moto
-import boto
-
-from moto import mock_s3_deprecated as mock_s3
+from botocore.client import BaseClient
+from freezegun import freeze_time
+from moto import mock_aws
 
 from storage import S3Storage, StorageContext
-from storage.cloud import _CloudStorage, _PartUploadMetadata
-from storage.cloud import _CHUNKS_KEY
+from storage.cloud import (
+    _CHUNKS_KEY,
+    GoogleCloudStorage,
+    _build_endpoint_url,
+    _CloudStorage,
+    _PartUploadMetadata,
+)
 
 _TEST_CONTENT = os.urandom(1024)
-_TEST_BUCKET = 'some_bucket'
-_TEST_USER = 'someuser'
-_TEST_PASSWORD = 'somepassword'
-_TEST_PATH = 'some/cool/path'
-_TEST_CONTEXT = StorageContext('nyc', None, None, None, None)
+_TEST_BUCKET = "somebucket"
+_TEST_USER = "someuser"
+_TEST_PASSWORD = "somepassword"
+_TEST_REGION = "us-bacon-1"
+_TEST_PATH = "some/cool/path"
+_TEST_UPLOADS_PATH = "uploads/ee160658-9444-4950-8ec6-30faab40529c"
+_TEST_CONTEXT = StorageContext("nyc", None, None, None)
 
 
-@pytest.fixture(scope='function')
+@pytest.fixture(scope="function")
 def storage_engine():
-  with mock_s3():
-    # Create a test bucket and put some test content.
-    boto.connect_s3().create_bucket(_TEST_BUCKET)
-    engine = S3Storage(_TEST_CONTEXT, 'some/path', _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD)
-    engine.put_content(_TEST_PATH, _TEST_CONTENT)
+    with mock_aws():
+        # Create a test bucket and put some test content.
+        boto3.client("s3").create_bucket(Bucket=_TEST_BUCKET)
+        engine = S3Storage(
+            _TEST_CONTEXT, "some/path", _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD, _TEST_REGION
+        )
+        assert engine._connect_kwargs["endpoint_url"] == "https://s3.{}.amazonaws.com".format(
+            _TEST_REGION
+        )
+        engine.put_content(_TEST_PATH, _TEST_CONTENT)
 
-    yield engine
+        yield engine
+
+
+@pytest.mark.parametrize(
+    "hostname, port, is_secure, expected",
+    [
+        pytest.param("somehost", None, False, "http://somehost"),
+        pytest.param("somehost", 8080, False, "http://somehost:8080"),
+        pytest.param("somehost", 8080, True, "https://somehost:8080"),
+        pytest.param("https://somehost.withscheme", None, False, "https://somehost.withscheme"),
+        pytest.param("http://somehost.withscheme", None, True, "http://somehost.withscheme"),
+        pytest.param("somehost.withport:8080", 9090, True, "https://somehost.withport:8080"),
+    ],
+)
+def test_build_endpoint_url(hostname, port, is_secure, expected):
+    assert _build_endpoint_url(hostname, port, is_secure) == expected
 
 
 def test_basicop(storage_engine):
-  # Ensure the content exists.
-  assert storage_engine.exists(_TEST_PATH)
+    # Ensure the content exists.
+    assert storage_engine.exists(_TEST_PATH)
 
-  # Verify it can be retrieved.
-  assert storage_engine.get_content(_TEST_PATH) == _TEST_CONTENT
+    # Verify it can be retrieved.
+    assert storage_engine.get_content(_TEST_PATH) == _TEST_CONTENT
 
-  # Retrieve a checksum for the content.
-  storage_engine.get_checksum(_TEST_PATH)
-
-  # Remove the file.
-  storage_engine.remove(_TEST_PATH)
-
-  # Ensure it no longer exists.
-  with pytest.raises(IOError):
-    storage_engine.get_content(_TEST_PATH)
-
-  with pytest.raises(IOError):
+    # Retrieve a checksum for the content.
     storage_engine.get_checksum(_TEST_PATH)
 
-  assert not storage_engine.exists(_TEST_PATH)
+    # Remove the file.
+    result = storage_engine.remove(_TEST_PATH)
+    assert result is None
+
+    # Ensure it no longer exists.
+    with pytest.raises(IOError):
+        storage_engine.get_content(_TEST_PATH)
+
+    with pytest.raises(IOError):
+        storage_engine.get_checksum(_TEST_PATH)
+
+    assert not storage_engine.exists(_TEST_PATH)
 
 
-@pytest.mark.parametrize('bucket, username, password', [
-  pytest.param(_TEST_BUCKET, _TEST_USER, _TEST_PASSWORD, id='same credentials'),
-  pytest.param('another_bucket', 'blech', 'password', id='different credentials'),
-])
+def test_remove_returns_version_id_on_versioned_bucket():
+    with mock_aws():
+        client = boto3.client("s3", region_name=_TEST_REGION)
+        client.create_bucket(
+            Bucket=_TEST_BUCKET,
+            CreateBucketConfiguration={"LocationConstraint": _TEST_REGION},
+        )
+        client.put_bucket_versioning(
+            Bucket=_TEST_BUCKET,
+            VersioningConfiguration={"Status": "Enabled"},
+        )
+
+        engine = S3Storage(
+            _TEST_CONTEXT, "some/path", _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD, _TEST_REGION
+        )
+        engine.put_content(_TEST_PATH, _TEST_CONTENT)
+
+        version_id = engine.remove(_TEST_PATH)
+        assert version_id is not None
+
+
+def test_remove_nonexistent_returns_none(storage_engine):
+    result = storage_engine.remove("does/not/exist")
+    assert result is None
+
+
+def test_storage_setup(storage_engine):
+    storage_engine.setup()
+
+
+def test_remove_dir(storage_engine):
+    # Ensure the content exists.
+    assert storage_engine.exists(_TEST_PATH)
+
+    # Verify it can be retrieved.
+    assert storage_engine.get_content(_TEST_PATH) == _TEST_CONTENT
+
+    # Retrieve a checksum for the content.
+    storage_engine.get_checksum(_TEST_PATH)
+
+    # Remove the "directory".
+    storage_engine.remove(_TEST_PATH.split("/")[0])
+
+    assert not storage_engine.exists(_TEST_PATH)
+
+
+@pytest.mark.parametrize(
+    "bucket, username, password",
+    [
+        pytest.param(_TEST_BUCKET, _TEST_USER, _TEST_PASSWORD, id="same credentials"),
+        pytest.param("another_bucket", "blech", "password", id="different credentials"),
+    ],
+)
 def test_copy(bucket, username, password, storage_engine):
-  # Copy the content to another engine.
-  another_engine = S3Storage(_TEST_CONTEXT, 'another/path', _TEST_BUCKET, _TEST_USER,
-                             _TEST_PASSWORD)
-  boto.connect_s3().create_bucket('another_bucket')
-  storage_engine.copy_to(another_engine, _TEST_PATH)
+    # Copy the content to another engine.
+    another_engine = S3Storage(
+        _TEST_CONTEXT, "another/path", _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD
+    )
+    boto3.client("s3").create_bucket(Bucket="another_bucket")
+    storage_engine.copy_to(another_engine, _TEST_PATH)
 
-  # Verify it can be retrieved.
-  assert another_engine.get_content(_TEST_PATH) == _TEST_CONTENT
+    # Verify it can be retrieved.
+    assert another_engine.get_content(_TEST_PATH) == _TEST_CONTENT
 
 
 def test_copy_with_error(storage_engine):
-  another_engine = S3Storage(_TEST_CONTEXT, 'another/path', 'anotherbucket', 'foo',
-                             'bar')
+    another_engine = S3Storage(_TEST_CONTEXT, "another/path", "anotherbucket", "foo", "bar")
 
-  with pytest.raises(IOError):
-    storage_engine.copy_to(another_engine, _TEST_PATH)
+    with pytest.raises(IOError):
+        storage_engine.copy_to(another_engine, _TEST_PATH)
 
 
 def test_stream_read(storage_engine):
-  # Read the streaming content.
-  data = ''.join(storage_engine.stream_read(_TEST_PATH))
-  assert data == _TEST_CONTENT
+    # Read the streaming content.
+    data = b"".join(storage_engine.stream_read(_TEST_PATH))
+    assert data == _TEST_CONTENT
 
 
 def test_stream_read_file(storage_engine):
-  with storage_engine.stream_read_file(_TEST_PATH) as f:
-    assert f.read() == _TEST_CONTENT
+    with storage_engine.stream_read_file(_TEST_PATH) as f:
+        assert f.read() == _TEST_CONTENT
 
 
 def test_stream_write(storage_engine):
-  new_data = os.urandom(4096)
-  storage_engine.stream_write(_TEST_PATH, StringIO(new_data), content_type='Cool/Type')
-  assert storage_engine.get_content(_TEST_PATH) == new_data
+    new_data = os.urandom(4096)
+    storage_engine.stream_write(_TEST_PATH, BytesIO(new_data), content_type="Cool/Type")
+    assert storage_engine.get_content(_TEST_PATH) == new_data
 
 
 def test_stream_write_error():
-  with mock_s3():
-    # Create an engine but not the bucket.
-    engine = S3Storage(_TEST_CONTEXT, 'some/path', _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD)
+    with mock_aws():
+        # Create an engine but not the bucket.
+        engine = S3Storage(_TEST_CONTEXT, "some/path", _TEST_BUCKET, _TEST_USER, _TEST_PASSWORD)
 
-    # Attempt to write to the uncreated bucket, which should raise an error.
-    with pytest.raises(IOError):
-      engine.stream_write(_TEST_PATH, StringIO('hello world'), content_type='Cool/Type')
+        # Attempt to write to the uncreated bucket, which should raise an error.
+        with pytest.raises(IOError):
+            engine.stream_write(_TEST_PATH, BytesIO(b"hello world"), content_type="Cool/Type")
 
-    assert not engine.exists(_TEST_PATH)
+        with pytest.raises(botocore.exceptions.ClientError) as excinfo:
+            engine.exists(_TEST_PATH)
+            assert s3r.value.response["Error"]["Code"] == "NoSuchBucket"
 
 
-@pytest.mark.parametrize('chunk_count', [
-  0,
-  1,
-  50,
-])
-@pytest.mark.parametrize('force_client_side', [
-  False,
-  True
-])
+@pytest.mark.parametrize(
+    "chunk_count",
+    [
+        0,
+        1,
+        2,
+        50,
+    ],
+)
+@pytest.mark.parametrize("force_client_side", [False, True])
 def test_chunk_upload(storage_engine, chunk_count, force_client_side):
-  if chunk_count == 0 and force_client_side:
-    return
+    if chunk_count == 0 and force_client_side:
+        return
 
-  upload_id, metadata = storage_engine.initiate_chunked_upload()
-  final_data = ''
+    upload_id, metadata = storage_engine.initiate_chunked_upload()
+    final_data = b""
 
-  for index in range(0, chunk_count):
-    chunk_data = os.urandom(1024)
-    final_data = final_data + chunk_data
-    bytes_written, new_metadata, error = storage_engine.stream_upload_chunk(upload_id, 0,
-                                                                            len(chunk_data),
-                                                                            StringIO(chunk_data),
-                                                                            metadata)
-    metadata = new_metadata
+    for index in range(0, chunk_count):
+        chunk_data = os.urandom(1024)
+        final_data = final_data + chunk_data
+        bytes_written, new_metadata, error = storage_engine.stream_upload_chunk(
+            upload_id, 0, len(chunk_data), BytesIO(chunk_data), metadata
+        )
+        metadata = new_metadata
 
-    assert bytes_written == len(chunk_data)
-    assert error is None
-    assert len(metadata[_CHUNKS_KEY]) == index + 1
+        assert bytes_written == len(chunk_data)
+        assert error is None
+        assert len(metadata[_CHUNKS_KEY]) == index + 1
 
-  # Complete the chunked upload.
-  storage_engine.complete_chunked_upload(upload_id, 'some/chunked/path', metadata,
-                                         force_client_side=force_client_side)
+    # Complete the chunked upload.
+    storage_engine.complete_chunked_upload(
+        upload_id, "some/chunked/path", metadata, force_client_side=force_client_side
+    )
 
-  # Ensure the file contents are valid.
-  assert storage_engine.get_content('some/chunked/path') == final_data
+    # Ensure the file contents are valid.
+    if chunk_count != 0:
+        assert storage_engine.get_content("some/chunked/path") == final_data
 
 
-@pytest.mark.parametrize('chunk_count', [
-  0,
-  1,
-  50,
-])
+@pytest.mark.parametrize(
+    "chunk_count",
+    [
+        0,
+        1,
+        50,
+    ],
+)
 def test_cancel_chunked_upload(storage_engine, chunk_count):
-  upload_id, metadata = storage_engine.initiate_chunked_upload()
+    upload_id, metadata = storage_engine.initiate_chunked_upload()
 
-  for _ in range(0, chunk_count):
-    chunk_data = os.urandom(1024)
-    _, new_metadata, _ = storage_engine.stream_upload_chunk(upload_id, 0,
-                                                            len(chunk_data),
-                                                            StringIO(chunk_data),
-                                                            metadata)
-    metadata = new_metadata
+    for _ in range(0, chunk_count):
+        chunk_data = os.urandom(1024)
+        _, new_metadata, _ = storage_engine.stream_upload_chunk(
+            upload_id, 0, len(chunk_data), BytesIO(chunk_data), metadata
+        )
+        metadata = new_metadata
 
-  # Cancel the upload.
-  storage_engine.cancel_chunked_upload(upload_id, metadata)
+    # Cancel the upload.
+    storage_engine.cancel_chunked_upload(upload_id, metadata)
 
-  # Ensure all chunks were deleted.
-  for chunk in metadata[_CHUNKS_KEY]:
-    assert not storage_engine.exists(chunk.path)
+    # Ensure all chunks were deleted.
+    for chunk in metadata[_CHUNKS_KEY]:
+        assert not storage_engine.exists(chunk.path)
 
 
 def test_large_chunks_upload(storage_engine):
-  # Make the max chunk size much smaller for testing.
-  storage_engine.maximum_chunk_size = storage_engine.minimum_chunk_size * 2
+    # Make the max chunk size much smaller for testing.
+    storage_engine.maximum_chunk_size = storage_engine.minimum_chunk_size * 2
 
-  upload_id, metadata = storage_engine.initiate_chunked_upload()
+    upload_id, metadata = storage_engine.initiate_chunked_upload()
 
-  # Write a "super large" chunk, to ensure that it is broken into smaller chunks.
-  chunk_data = os.urandom(int(storage_engine.maximum_chunk_size * 2.5))
-  bytes_written, new_metadata, _ = storage_engine.stream_upload_chunk(upload_id, 0,
-                                                                      -1,
-                                                                      StringIO(chunk_data),
-                                                                      metadata)
-  assert len(chunk_data) == bytes_written
+    # Write a "super large" chunk, to ensure that it is broken into smaller chunks.
+    chunk_data = os.urandom(int(storage_engine.maximum_chunk_size * 2.5))
+    bytes_written, new_metadata, _ = storage_engine.stream_upload_chunk(
+        upload_id, 0, -1, BytesIO(chunk_data), metadata
+    )
+    assert len(chunk_data) == bytes_written
 
-  # Complete the chunked upload.
-  storage_engine.complete_chunked_upload(upload_id, 'some/chunked/path', new_metadata)
+    # Complete the chunked upload.
+    storage_engine.complete_chunked_upload(upload_id, "some/chunked/path", new_metadata)
 
-  # Ensure the file contents are valid.
-  assert len(chunk_data) == len(storage_engine.get_content('some/chunked/path'))
-  assert storage_engine.get_content('some/chunked/path') == chunk_data
+    # Ensure the file contents are valid.
+    assert len(chunk_data) == len(storage_engine.get_content("some/chunked/path"))
+    assert storage_engine.get_content("some/chunked/path") == chunk_data
 
 
 def test_large_chunks_with_ragged_edge(storage_engine):
-  # Make the max chunk size much smaller for testing and force it to have a ragged edge.
-  storage_engine.maximum_chunk_size = storage_engine.minimum_chunk_size * 2 + 10
+    # Make the max chunk size much smaller for testing and force it to have a ragged edge.
+    storage_engine.maximum_chunk_size = storage_engine.minimum_chunk_size * 2 + 10
 
-  upload_id, metadata = storage_engine.initiate_chunked_upload()
+    upload_id, metadata = storage_engine.initiate_chunked_upload()
 
-  # Write a few "super large" chunks, to ensure that it is broken into smaller chunks.
-  all_data = ''
-  for _ in range(0, 2):
-    chunk_data = os.urandom(int(storage_engine.maximum_chunk_size) + 20)
-    bytes_written, new_metadata, _ = storage_engine.stream_upload_chunk(upload_id, 0,
-                                                                        -1,
-                                                                        StringIO(chunk_data),
-                                                                        metadata)
-    assert len(chunk_data) == bytes_written
-    all_data = all_data + chunk_data
-    metadata = new_metadata
+    # Write a few "super large" chunks, to ensure that it is broken into smaller chunks.
+    all_data = b""
+    for _ in range(0, 2):
+        chunk_data = os.urandom(int(storage_engine.maximum_chunk_size) + 20)
+        bytes_written, new_metadata, _ = storage_engine.stream_upload_chunk(
+            upload_id, 0, -1, BytesIO(chunk_data), metadata
+        )
+        assert len(chunk_data) == bytes_written
+        all_data = all_data + chunk_data
+        metadata = new_metadata
 
-  # Complete the chunked upload.
-  storage_engine.complete_chunked_upload(upload_id, 'some/chunked/path', new_metadata)
+    # Complete the chunked upload.
+    storage_engine.complete_chunked_upload(upload_id, "some/chunked/path", new_metadata)
 
-  # Ensure the file contents are valid.
-  assert len(all_data) == len(storage_engine.get_content('some/chunked/path'))
-  assert storage_engine.get_content('some/chunked/path') == all_data
+    # Ensure the file contents are valid.
+    assert len(all_data) == len(storage_engine.get_content("some/chunked/path"))
+    assert storage_engine.get_content("some/chunked/path") == all_data
 
 
-@pytest.mark.parametrize('max_size, parts', [
-  (50, [
-    _PartUploadMetadata('foo', 0, 50),
-    _PartUploadMetadata('foo', 50, 50),
-  ]),
-
-  (40, [
-    _PartUploadMetadata('foo', 0, 25),
-    _PartUploadMetadata('foo', 25, 25),
-    _PartUploadMetadata('foo', 50, 25),
-    _PartUploadMetadata('foo', 75, 25)
-  ]),
-
-  (51, [
-    _PartUploadMetadata('foo', 0, 50),
-    _PartUploadMetadata('foo', 50, 50),
-  ]),
-
-  (49, [
-    _PartUploadMetadata('foo', 0, 25),
-    _PartUploadMetadata('foo', 25, 25),
-    _PartUploadMetadata('foo', 50, 25),
-    _PartUploadMetadata('foo', 75, 25),
-  ]),
-
-  (99, [
-    _PartUploadMetadata('foo', 0, 50),
-    _PartUploadMetadata('foo', 50, 50),
-  ]),
-
-  (100, [
-    _PartUploadMetadata('foo', 0, 100),
-  ]),
-])
+@pytest.mark.parametrize(
+    "max_size, parts",
+    [
+        (
+            50,
+            [
+                _PartUploadMetadata("foo", 0, 50),
+                _PartUploadMetadata("foo", 50, 50),
+            ],
+        ),
+        (
+            40,
+            [
+                _PartUploadMetadata("foo", 0, 25),
+                _PartUploadMetadata("foo", 25, 25),
+                _PartUploadMetadata("foo", 50, 25),
+                _PartUploadMetadata("foo", 75, 25),
+            ],
+        ),
+        (
+            51,
+            [
+                _PartUploadMetadata("foo", 0, 50),
+                _PartUploadMetadata("foo", 50, 50),
+            ],
+        ),
+        (
+            49,
+            [
+                _PartUploadMetadata("foo", 0, 25),
+                _PartUploadMetadata("foo", 25, 25),
+                _PartUploadMetadata("foo", 50, 25),
+                _PartUploadMetadata("foo", 75, 25),
+            ],
+        ),
+        (
+            99,
+            [
+                _PartUploadMetadata("foo", 0, 50),
+                _PartUploadMetadata("foo", 50, 50),
+            ],
+        ),
+        (
+            100,
+            [
+                _PartUploadMetadata("foo", 0, 100),
+            ],
+        ),
+    ],
+)
 def test_rechunked(max_size, parts):
-  chunk = _PartUploadMetadata('foo', 0, 100)
-  rechunked = list(_CloudStorage._rechunk(chunk, max_size))
-  assert len(rechunked) == len(parts)
-  for index, chunk in enumerate(rechunked):
-    assert chunk == parts[index]
+    chunk = _PartUploadMetadata("foo", 0, 100)
+    rechunked = list(_CloudStorage._rechunk(chunk, max_size))
+    assert len(rechunked) == len(parts)
+    for index, chunk in enumerate(rechunked):
+        assert chunk == parts[index]
+
+
+@pytest.mark.parametrize("path", ["/", _TEST_PATH])
+def test_clean_partial_uploads(storage_engine, path):
+
+    # Setup root path and add come content to _root_path/uploads
+    storage_engine._root_path = path
+    storage_engine.put_content(_TEST_UPLOADS_PATH, _TEST_CONTENT)
+    assert storage_engine.exists(_TEST_UPLOADS_PATH)
+    assert storage_engine.get_content(_TEST_UPLOADS_PATH) == _TEST_CONTENT
+
+    # Test ensure fresh blobs are not deleted
+    storage_engine.clean_partial_uploads(timedelta(days=2))
+    assert storage_engine.exists(_TEST_UPLOADS_PATH)
+    assert storage_engine.get_content(_TEST_UPLOADS_PATH) == _TEST_CONTENT
+
+    # Test deletion of stale blobs
+    time.sleep(1)
+    storage_engine.clean_partial_uploads(timedelta(seconds=0))
+    assert not storage_engine.exists(_TEST_UPLOADS_PATH)
+
+    # Test if uploads folder does not exist
+    storage_engine.remove("uploads")
+    assert not storage_engine.exists("uploads")
+    storage_engine.clean_partial_uploads(timedelta(seconds=0))
+
+
+@pytest.fixture
+def mock_mpu_dates():
+    """
+    Fixture to allow freezegun control moto's multipart upload dates. Needed since Moto
+    hardcodes MPU creation date in its source code which goes back to 2010.
+    Clears state automatically between tests.
+    """
+    _UPLOAD_DATES = {}
+    original_make_api_call = BaseClient._make_api_call
+
+    def _mock_make_api_call(self, operation_name, api_params):
+        response = original_make_api_call(self, operation_name, api_params)
+
+        if operation_name == "CreateMultipartUpload":
+            _UPLOAD_DATES[response["UploadId"]] = datetime.datetime.now(datetime.timezone.utc)
+
+        elif operation_name == "ListMultipartUploads" and "Uploads" in response:
+            for upload in response["Uploads"]:
+                upload_id = upload["UploadId"]
+                if upload_id in _UPLOAD_DATES:
+                    upload["Initiated"] = _UPLOAD_DATES[upload_id]
+
+        return response
+
+    with patch.object(BaseClient, "_make_api_call", new=_mock_make_api_call):
+        yield
+
+
+def test_clean_orphaned_multipart_uploads(storage_engine, mock_mpu_dates):
+    """
+    Tests clean up of stale multipart uploads based on specific threshold.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # initialize an MPU
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/test/multipart/upload.txt"
+        )
+
+    # verify that the upload exists
+    assert mpu_response
+    print(mpu_response)
+    upload_id = mpu_response["UploadId"]
+    storage_engine._root_path = _TEST_PATH
+
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)
+
+    assert len(uploads.get("Uploads", [])) == 1
+    assert uploads["Uploads"][0]["UploadId"] == upload_id
+
+    # Check that the multipart upload is not cleaned for a very large threshold
+    with freeze_time(now):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(days=1))
+        assert deleted == 0
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)
+        assert len(uploads.get("Uploads", [])) == 1
+
+    # Check that the upload is deleted with a threshold of 0
+    with freeze_time(now + timedelta(seconds=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+        assert deleted == 1
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)
+        assert len(uploads.get("Uploads", [])) == 0
+
+
+def test_cleanup_multiple_orphaned_multipart_uploads(storage_engine, mock_mpu_dates):
+    """
+    Tests that all created multipart uploads are cleaned after a certain threshold.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    storage_engine._root_path = _TEST_PATH
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    file_list = ["apple", "ibm", "redhat", "github", "jira", "email"]
+
+    # create multiple MPUs
+    with freeze_time(now):
+        for keyname in file_list:
+            mpu_response = client.create_multipart_upload(
+                Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/test/multipart/%s" % keyname + ".txt"
+            )
+            assert mpu_response
+
+    # check that we can list all MPUs
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)["Uploads"]
+    assert len(uploads) == len(file_list)
+
+    # check that multipart uploads are not delte with a high enough threshold
+    with freeze_time(now):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(days=1))
+        assert deleted == 0
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)["Uploads"]
+        assert len(uploads) == len(file_list)
+
+    # assert that all multipart uploads are deleted with a threshold of 0
+    with freeze_time(now + timedelta(seconds=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+        assert deleted == 6
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)
+        assert len(uploads.get("Uploads", [])) == 0
+
+
+def test_partial_cleanup_of_multipart_uploads(storage_engine, mock_mpu_dates):
+    """
+    Tests that partial MPU deletion occurs after a provided threshold. Stale MPUs should
+    be deleted, active MPUs should not be touched.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    file_list = ["apple", "ibm", "redhat", "github", "jira", "email"]
+    storage_engine._root_path = _TEST_PATH
+
+    # create multiple MPUs with a timedelta of 1 hour between them
+    for i, keyname in enumerate(file_list):
+        with freeze_time(now + timedelta(hours=1 * i)):
+            mpu_response = client.create_multipart_upload(
+                Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/test/multipart/%s" % keyname + ".txt"
+            )
+            assert mpu_response
+
+    # check that we can list all MPUs
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)["Uploads"]
+    assert len(uploads) == len(file_list)
+
+    # check that multipart uploads are not deleted with a high enough threshold
+    with freeze_time(now + timedelta(hours=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(days=1))
+        assert deleted == 0
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)["Uploads"]
+        assert len(uploads) == len(file_list)
+
+    # assert that only some multipart uploads are deleted after a certain threshold
+    # fast forward time by 6 hours, set timedelta to 3.5 hours meaning that
+    # cutoff rate is at now + 2.5 hours. So 3 out of 6 MPUs should be deleted.
+    with freeze_time(now + timedelta(hours=6)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(hours=3.5))
+        assert deleted == 3
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)["Uploads"]
+        assert len(uploads) == 3
+        assert uploads[0]["Key"] == _TEST_PATH + "/test/multipart/github.txt"
+        assert uploads[1]["Key"] == _TEST_PATH + "/test/multipart/jira.txt"
+        assert uploads[2]["Key"] == _TEST_PATH + "/test/multipart/email.txt"
+
+
+def test_cleanup_does_not_impact_multipart_uploads_under_different_paths(
+    storage_engine, mock_mpu_dates
+):
+    """
+    Verifies that we only clean up multipart uploads under the root path and not under all paths in
+    the bucket.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    storage_engine._root_path = _TEST_PATH
+
+    # create an MPU under the default path
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/test/correct/deletion/path.txt"
+        )
+        assert mpu_response
+
+    # create an MPU under a completely different path
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key="/completely/different/deletion/path.txt"
+        )
+
+    # check that on the bucket we have two MPUs
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET)["Uploads"]
+    assert len(uploads) == 2
+
+    # clean up only MPUs under the proper path
+    with freeze_time(now + timedelta(seconds=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+        assert deleted == 1
+
+        # list MPUs on the bucket
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET)["Uploads"]
+        assert len(uploads) == 1
+
+        # explicitly verify that the key matches
+        assert uploads[0]["Key"] == "/completely/different/deletion/path.txt"
+
+
+def test_cleanup_triggers_on_non_normalized_root(storage_engine, mock_mpu_dates):
+    """
+    Asserts that deletion happens even if our root prefix contains a slash at the beginning.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # root path has a slash
+    storage_engine._root_path = "/" + _TEST_PATH
+
+    # create an MPU
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/test/root_prefix/starts/with/slash.txt"
+        )
+        assert mpu_response
+
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET)["Uploads"]
+    assert len(uploads) == 1
+
+    # clean up MPU
+    with freeze_time(now + timedelta(seconds=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+        assert deleted == 1
+
+        # list MPUs on the bucket
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH)
+        assert len(uploads.get("Uploads", [])) == 0
+
+
+def test_cleanup_does_not_trigger_on_sibling_suffix(storage_engine, mock_mpu_dates):
+    """
+    Asserts that deletion does not happen on sibling suffixes. Eg: cleanup should happen on
+    some/cool/path/testfile.txt but not on /some/cool/path-with-suffix/testfile.txt.
+    """
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    storage_engine._root_path = _TEST_PATH
+
+    # create MPU
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/testfile.txt"
+        )
+        assert mpu_response
+
+    # create MPU under different suffix
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "-with-suffix/testfile.txt"
+        )
+        assert mpu_response
+
+    # verify we have both MPUs present
+    uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET)["Uploads"]
+    assert len(uploads) == 2
+
+    # clean up only under default path
+    with freeze_time(now + timedelta(seconds=5)):
+        deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+        assert deleted == 1
+
+        # specifically verify that the key that's left is the 2nd MPU
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET, Prefix=_TEST_PATH + "/")
+        assert len(uploads.get("Uploads", [])) == 0
+
+        uploads = client.list_multipart_uploads(Bucket=_TEST_BUCKET)["Uploads"]
+        assert len(uploads) == 1
+        assert uploads[0]["Key"] == _TEST_PATH + "-with-suffix/testfile.txt"
+
+
+def test_cleanup_handles_already_aborted_mpu(storage_engine, mock_mpu_dates):
+    """
+    Asserts that the NoSuchUpload exception is caught by the code and not raised.
+    """
+
+    err = botocore.exceptions.ClientError(
+        {"Error": {"Code": "NoSuchUpload", "Message": "The specified upload does not exist."}},
+        "AbortMultipartUpload",
+    )
+
+    def abort_side_effects(Bucket, Key, UploadId):
+        """
+        Helper function to simulate NoSuchUpload exception raised
+        """
+        if Key.endswith("gone.txt"):
+            raise err
+        return {}
+
+    client = boto3.client("s3", region_name=_TEST_REGION)
+    storage_engine._root_path = _TEST_PATH
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    # create two multipart uploads
+    with freeze_time(now):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/keep.txt"
+        )
+        assert mpu_response
+
+    with freeze_time(now + timedelta(seconds=30)):
+        mpu_response = client.create_multipart_upload(
+            Bucket=_TEST_BUCKET, Key=_TEST_PATH + "/gone.txt"
+        )
+        assert mpu_response
+
+    # conduct deletion
+    with patch.object(
+        storage_engine.get_cloud_conn(), "abort_multipart_upload", side_effect=abort_side_effects
+    ):
+        with freeze_time(now + timedelta(hours=1)):
+            deleted = storage_engine.clean_orphaned_multipart_uploads(timedelta(seconds=0))
+            assert deleted == 1
+
+
+def test_gcs_disables_default_checksums():
+    engine = GoogleCloudStorage(
+        _TEST_CONTEXT, "some/path", _TEST_USER, _TEST_PASSWORD, _TEST_BUCKET
+    )
+    config = engine._connect_kwargs["config"]
+    assert config.request_checksum_calculation == "when_required"
+    assert config.response_checksum_validation == "when_required"
+
+
+def test_gcs_requests_carry_no_default_checksums():
+    sent = []
+
+    def record_headers(request, event_name, **kwargs):
+        sent.append((event_name, {k.lower() for k in request.headers}))
+
+    # moto only intercepts AWS endpoints; without this the requests would hit GCS.
+    with mock_aws(), patch.object(GoogleCloudStorage, "ENDPOINT_URL", "https://s3.amazonaws.com"):
+        boto3.client("s3").create_bucket(Bucket=_TEST_BUCKET)
+        engine = GoogleCloudStorage(
+            _TEST_CONTEXT, "some/path", _TEST_USER, _TEST_PASSWORD, _TEST_BUCKET
+        )
+        engine._session.events.register("before-send.s3", record_headers)
+
+        engine.put_content(_TEST_PATH, _TEST_CONTENT)
+        engine.stream_write(_TEST_PATH, BytesIO(_TEST_CONTENT))
+
+    assert {"before-send.s3.PutObject", "before-send.s3.UploadPart"} <= {e for e, _ in sent}
+    for event_name, headers in sent:
+        assert not [h for h in headers if h.startswith("x-amz-checksum-")], event_name
+        assert "x-amz-sdk-checksum-algorithm" not in headers, event_name

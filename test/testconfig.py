@@ -1,114 +1,145 @@
 import os
-
 from datetime import datetime, timedelta
 from tempfile import NamedTemporaryFile
+from typing import Any, Dict, List, Optional
 
 from config import DefaultConfig
 
 
 class FakeTransaction(object):
-  def __enter__(self):
-    return self
+    def __enter__(self):
+        return self
 
-  def __exit__(self, exc_type, value, traceback):
-    pass
+    def __exit__(self, exc_type, value, traceback):
+        pass
 
 
 TEST_DB_FILE = NamedTemporaryFile(delete=True)
 
 
 class TestConfig(DefaultConfig):
-  TESTING = True
-  SECRET_KEY = "superdupersecret!!!1"
-  DATABASE_SECRET_KEY = 'anothercrazykey!'
-  BILLING_TYPE = 'FakeStripe'
+    TESTING = True
+    SECRET_KEY = "superdupersecret!!!1"
+    DATABASE_SECRET_KEY = "QUAY_FIXTURE_ONLY-anothercrazykey!"
+    BILLING_TYPE = "FakeStripe"
 
-  TEST_DB_FILE = TEST_DB_FILE
-  DB_URI = os.environ.get('TEST_DATABASE_URI', 'sqlite:///{0}'.format(TEST_DB_FILE.name))
-  DB_CONNECTION_ARGS = {
-    'threadlocals': True,
-    'autorollback': True,
-  }
+    TEST_DB_FILE = TEST_DB_FILE
+    DB_URI = os.environ.get("TEST_DATABASE_URI", "sqlite:///{0}".format(TEST_DB_FILE.name))
+    DB_CONNECTION_ARGS = {
+        "threadlocals": True,
+        "autorollback": True,
+    }
 
-  @staticmethod
-  def create_transaction(db):
-    return FakeTransaction()
+    @staticmethod
+    def create_transaction(db):
+        return FakeTransaction()
 
-  DB_TRANSACTION_FACTORY = create_transaction
+    DB_TRANSACTION_FACTORY = create_transaction
 
-  DISTRIBUTED_STORAGE_CONFIG = {'local_us': ['FakeStorage', {}], 'local_eu': ['FakeStorage', {}]}
-  DISTRIBUTED_STORAGE_PREFERENCE = ['local_us']
+    DISTRIBUTED_STORAGE_CONFIG = {"local_us": ["FakeStorage", {}], "local_eu": ["FakeStorage", {}]}
+    DISTRIBUTED_STORAGE_PREFERENCE = ["local_us"]
 
-  BUILDLOGS_MODULE_AND_CLASS = ('test.testlogs', 'testlogs.TestBuildLogs')
-  BUILDLOGS_OPTIONS = ['devtable', 'building', 'deadbeef-dead-beef-dead-beefdeadbeef', False]
+    BUILDLOGS_MODULE_AND_CLASS = ("test.testlogs", "testlogs.TestBuildLogs")
+    BUILDLOGS_OPTIONS = ["devtable", "building", "deadbeef-dead-beef-dead-beefdeadbeef", False]
 
-  USERFILES_LOCATION = 'local_us'
-  USERFILES_PATH= "userfiles/"
+    USERFILES_LOCATION = "local_us"
+    USERFILES_PATH = "userfiles/"
 
-  FEATURE_SUPER_USERS = True
-  FEATURE_BILLING = True
-  FEATURE_MAILING = True
-  SUPER_USERS = ['devtable']
+    FEATURE_SUPER_USERS = True
+    FEATURE_SUPERUSERS_FULL_ACCESS = True
+    FEATURE_PROGRAMMATIC_BOOTSTRAP = True
+    FEATURE_ROBOT_API_TOKENS = True
+    FEATURE_ROBOT_API_TOKEN_EXCHANGE = True
+    BOOTSTRAP_TOKEN_OWNER = "devtable"
+    BOOTSTRAP_TOKEN_PATH = f"{TEST_DB_FILE.name}-bootstrap-token.json"
+    FEATURE_BILLING = True
+    FEATURE_MAILING = True
+    SUPER_USERS = ["devtable"]
+    GLOBAL_READONLY_SUPER_USERS = ["globalreadonlysuperuser"]
 
-  LICENSE_USER_LIMIT = 500
-  LICENSE_EXPIRATION = datetime.now() + timedelta(weeks=520)
-  LICENSE_EXPIRATION_WARNING = datetime.now() + timedelta(weeks=520)
+    LICENSE_USER_LIMIT = 500
+    LICENSE_EXPIRATION = datetime.now() + timedelta(weeks=520)
+    LICENSE_EXPIRATION_WARNING = datetime.now() + timedelta(weeks=520)
 
-  FEATURE_GITHUB_BUILD = True
-  FEATURE_BITTORRENT = True
-  FEATURE_ACI_CONVERSION = True
+    FEATURE_GITHUB_BUILD = True
+    FEATURE_BUILD_SUPPORT = True
 
-  CLOUDWATCH_NAMESPACE = None
+    CLOUDWATCH_NAMESPACE = None
 
-  FEATURE_SECURITY_SCANNER = True
-  FEATURE_SECURITY_NOTIFICATIONS = True
-  SECURITY_SCANNER_ENDPOINT = 'http://fakesecurityscanner/'
-  SECURITY_SCANNER_API_VERSION = 'v1'
-  SECURITY_SCANNER_ENGINE_VERSION_TARGET = 1
-  SECURITY_SCANNER_API_TIMEOUT_SECONDS = 1
+    FEATURE_SECURITY_SCANNER = True
+    FEATURE_SECURITY_NOTIFICATIONS = True
+    SECURITY_SCANNER_V4_ENDPOINT = "http://fakesecurityscanner/"
 
-  FEATURE_SIGNING = True
+    FEATURE_SIGNING = True
 
-  SIGNING_ENGINE = 'gpg2'
+    INSTANCE_SERVICE_KEY_KID_LOCATION = "test/data/test.kid"
+    INSTANCE_SERVICE_KEY_LOCATION = "test/data/test.pem"
 
-  GPG2_PRIVATE_KEY_NAME = 'EEB32221'
-  GPG2_PRIVATE_KEY_FILENAME = 'test/data/signing-private.gpg'
-  GPG2_PUBLIC_KEY_FILENAME = 'test/data/signing-public.gpg'
+    PROMETHEUS_PUSHGATEWAY_URL = None
 
-  INSTANCE_SERVICE_KEY_KID_LOCATION = 'test/data/test.kid'
-  INSTANCE_SERVICE_KEY_LOCATION = 'test/data/test.pem'
+    GITHUB_LOGIN_CONFIG: Optional[Dict[str, Any]] = {}
+    GOOGLE_LOGIN_CONFIG: Optional[Dict[str, Any]] = {}
 
-  PROMETHEUS_AGGREGATOR_URL = None
+    FEATURE_GITHUB_LOGIN = True
+    FEATURE_GOOGLE_LOGIN = True
 
-  GITHUB_LOGIN_CONFIG = {}
-  GOOGLE_LOGIN_CONFIG = {}
+    TESTOIDC_LOGIN_CONFIG = {
+        "CLIENT_ID": "foo",
+        "CLIENT_SECRET": "bar",
+        "OIDC_SERVER": "http://fakeoidc",
+        "DEBUGGING": True,
+        "LOGIN_BINDING_FIELD": "sub",
+    }
 
-  FEATURE_GITHUB_LOGIN = True
-  FEATURE_GOOGLE_LOGIN = True
+    RECAPTCHA_SITE_KEY = "somekey"
+    RECAPTCHA_SECRET_KEY = "somesecretkey"
+    RECAPTCHA_WHITELISTED_USERS: List[str] = []
 
-  TESTOIDC_LOGIN_CONFIG = {
-    'CLIENT_ID': 'foo',
-    'CLIENT_SECRET': 'bar',
-    'OIDC_SERVER': 'http://fakeoidc',
-    'DEBUGGING': True,
-    'LOGIN_BINDING_FIELD': 'sub',
-  }
+    FEATURE_TEAM_SYNCING = True
+    FEATURE_CHANGE_TAG_EXPIRATION = True
 
-  RECAPTCHA_SITE_KEY = 'somekey'
-  RECAPTCHA_SECRET_KEY = 'somesecretkey'
+    TAG_EXPIRATION_OPTIONS = ["0s", "1s", "1d", "1w", "2w", "4w"]
 
-  FEATURE_APP_REGISTRY = True
-  FEATURE_TEAM_SYNCING = True
-  FEATURE_CHANGE_TAG_EXPIRATION = True
+    DEFAULT_NAMESPACE_MAXIMUM_BUILD_COUNT = None
 
-  TAG_EXPIRATION_OPTIONS = ['0s', '1s', '1d', '1w', '2w', '4w']
+    DATA_MODEL_CACHE_CONFIG = {
+        "engine": "inmemory",
+    }
 
-  DEFAULT_NAMESPACE_MAXIMUM_BUILD_COUNT = None
+    FEATURE_REPO_MIRROR = True
+    FEATURE_ORG_MIRROR = True
+    FEATURE_IMMUTABLE_TAGS = True
+    FEATURE_GENERAL_OCI_SUPPORT = True
+    OCI_NAMESPACE_WHITELIST: List[str] = []
 
-  DATA_MODEL_CACHE_CONFIG = {
-    'engine': 'inmemory',
-  }
+    FEATURE_USER_INITIALIZE = True
 
-  FEATURE_REPO_MIRROR = True
+    FEATURE_QUOTA_MANAGEMENT = True
+    FEATURE_EDIT_QUOTA = True
+    FEATURE_VERIFY_QUOTA = True
+    FEATURE_QUOTA_SUPPRESS_FAILURES = False
+    FEATURE_QUOTA_NOTIFICATIONS = True
+    DEFAULT_SYSTEM_REJECT_QUOTA_BYTES = 0
+    FEATURE_PROXY_CACHE = True
+    PERMANENTLY_DELETE_TAGS = True
+    RESET_CHILD_MANIFEST_EXPIRATION = True
 
-  V3_UPGRADE_MODE = 'complete'
+    FEATURE_RH_MARKETPLACE = True
+
+    FEATURE_AUTO_PRUNE = True
+    ACTION_LOG_AUDIT_LOGINS = True
+    ACTION_LOG_AUDIT_LOGIN_FAILURES = True
+    ACTION_LOG_AUDIT_PULL_FAILURES = True
+    ACTION_LOG_AUDIT_PUSH_FAILURES = True
+    ACTION_LOG_AUDIT_DELETE_FAILURES = True
+    AUTOPRUNE_FETCH_TAGS_PAGE_LIMIT = 2
+    AUTOPRUNE_FETCH_REPOSITORIES_PAGE_LIMIT = 2
+    FEATURE_IMAGE_EXPIRY_TRIGGER = True
+    FEATURE_IMAGE_PULL_STATS = True
+    PULL_METRICS_REDIS = {"host": "localhost", "port": 6379, "db": 1}
+
+    CDN_SPECIFIC_NAMESPACES = ["redhat"]
+
+    DEFAULT_UI = "angular"
+
+    FEATURE_OTEL_TRACING = True

@@ -1,321 +1,744 @@
-import logging
+from __future__ import annotations
 
+import json
+import logging
+import os
 from collections import namedtuple
+from typing import Literal, Optional, overload
 
 from peewee import IntegrityError
 
-from data.database import (Tag, Manifest, ManifestBlob, ManifestLegacyImage, ManifestChild,
-                           db_transaction)
-from data.model import BlobDoesNotExist
+import features
+from data.database import (
+    ExternalNotificationEvent,
+    IndexerVersion,
+    IndexStatus,
+    Manifest,
+    ManifestBlob,
+    ManifestChild,
+    ManifestSecurityStatus,
+    Repository,
+    RepositoryNotification,
+    Tag,
+    db_transaction,
+    get_epoch_timestamp_ms,
+)
+from data.model import BlobDoesNotExist, config
 from data.model.blob import get_or_create_shared_blob, get_shared_blob
-from data.model.oci.tag import filter_to_alive_tags, create_temporary_tag_if_necessary
 from data.model.oci.label import create_manifest_label
 from data.model.oci.retriever import RepositoryContentRetriever
+from data.model.oci.tag import (
+    create_temporary_tag_if_necessary,
+    filter_to_alive_tags,
+    get_child_manifests,
+)
+from data.model.quota import QuotaOperation, update_quota
 from data.model.storage import lookup_repo_storages_by_content_checksum
-from data.model.image import lookup_repository_images, get_image, synthesize_v1_image
-from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema1 import ManifestException
+from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
+from image.shared.interfaces import ManifestInterface, ManifestListInterface
 from util.validation import is_json
 
-
-TEMP_TAG_EXPIRATION_SEC = 300 # 5 minutes
+TEMP_TAG_EXPIRATION_SEC = 300  # 5 minutes
 
 
 logger = logging.getLogger(__name__)
 
-CreatedManifest = namedtuple('CreatedManifest', ['manifest', 'newly_created', 'labels_to_apply'])
+
+def is_manifest_present(manifest) -> bool:
+    """
+    Check if manifest content is available (not sparse).
+
+    A manifest is considered "sparse" when it exists in the database but
+    has empty manifest_bytes. This typically happens with pull-through proxy
+    where child manifests of a manifest list may not be fetched until accessed.
+
+    Args:
+        manifest: A Manifest database row or object with manifest_bytes attribute.
+
+    Returns:
+        True if the manifest has content, False if it's sparse (empty/missing content).
+    """
+    manifest_bytes = manifest.manifest_bytes
+    return manifest_bytes is not None and manifest_bytes != ""
+
+
+CreatedManifest = namedtuple("CreatedManifest", ["manifest", "newly_created", "labels_to_apply"])
+
+# Cosign / Sigstore signature artifact types stored as OCI referrers (cosign v3+).
+COSIGN_SIGNATURE_ARTIFACT_TYPES = frozenset(
+    {
+        "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "application/vnd.dev.sigstore.bundle.v0.2+json",
+        "application/vnd.dev.sigstore.bundle.v0.1+json",
+        "application/vnd.dev.sigstore.bundle+json",
+        "application/vnd.dev.cosign.simplesigning.v1+json",
+    }
+)
+COSIGN_SIMPLESIGNING_ARTIFACT_TYPE = "application/vnd.dev.cosign.simplesigning.v1+json"
+SIGSTORE_BUNDLE_PREDICATE_TYPE_ANNOTATION = "dev.sigstore.bundle.predicateType"
+SIGSTORE_BUNDLE_CONTENT_ANNOTATION = "dev.sigstore.bundle.content"
+SIGSTORE_BUNDLE_CONTENT_DSSE_ENVELOPE = "dsse-envelope"
+SIGSTORE_BUNDLE_CONTENT_MESSAGE_SIGNATURE = "message-signature"
+# Cosign v3.0.x ``cosign sign --new-bundle-format`` writes a DSSE-wrapped
+# in-toto statement with this predicate, not content=message-signature.
+COSIGN_SIGN_PREDICATE_TYPE = "https://sigstore.dev/cosign/sign/v1"
+
+CosignSignature = namedtuple(
+    "CosignSignature",
+    ["manifest_digest", "artifact_type", "tag_name"],
+)
+
+
+def _is_cosign_signature_artifact_type(artifact_type):
+    if not artifact_type:
+        return False
+    if artifact_type in COSIGN_SIGNATURE_ARTIFACT_TYPES:
+        return True
+    # Forward-compatible with newer sigstore bundle media types.
+    return artifact_type.startswith("application/vnd.dev.sigstore.bundle")
+
+
+def _manifest_annotations(manifest_bytes):
+    if not manifest_bytes:
+        return {}
+    try:
+        parsed = json.loads(manifest_bytes)
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    annotations = parsed.get("annotations") or {}
+    if not isinstance(annotations, dict):
+        return {}
+    return annotations
+
+
+def _referrer_is_image_signature(artifact_type, manifest_bytes):
+    """
+    True when a Cosign/Sigstore referrer is an image signature, not an attestation.
+
+    Cosign v3 uses the same Sigstore bundle artifact type for ``cosign sign`` and
+    ``cosign attest``. Distinguish using bundle annotations:
+
+    - ``content=message-signature``: image signature (BUNDLE_SPEC)
+    - ``predicateType=https://sigstore.dev/cosign/sign/v1``: Cosign 3.0.x
+      ``cosign sign`` (DSSE-wrapped sign statement)
+    - other ``predicateType`` / ``content=dsse-envelope``: attestations
+    """
+    if artifact_type == COSIGN_SIMPLESIGNING_ARTIFACT_TYPE:
+        return True
+    if not _is_cosign_signature_artifact_type(artifact_type):
+        return False
+
+    annotations = _manifest_annotations(manifest_bytes)
+    predicate_type = annotations.get(SIGSTORE_BUNDLE_PREDICATE_TYPE_ANNOTATION)
+    content = annotations.get(SIGSTORE_BUNDLE_CONTENT_ANNOTATION)
+
+    if predicate_type == COSIGN_SIGN_PREDICATE_TYPE:
+        return True
+    if content == SIGSTORE_BUNDLE_CONTENT_MESSAGE_SIGNATURE:
+        return True
+    if predicate_type or content == SIGSTORE_BUNDLE_CONTENT_DSSE_ENVELOPE:
+        return False
+    return True
 
 
 class CreateManifestException(Exception):
-  """ Exception raised when creating a manifest fails and explicit exception
-      raising is requested. """
+    """
+    Exception raised when creating a manifest fails and explicit exception raising is requested.
+    """
 
 
-def lookup_manifest(repository_id, manifest_digest, allow_dead=False, require_available=False,
-                    temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC):
-  """ Returns the manifest with the specified digest under the specified repository
-      or None if none. If allow_dead is True, then manifests referenced by only
-      dead tags will also be returned. If require_available is True, the manifest
-      will be marked with a temporary tag to ensure it remains available.
-  """
-  if not require_available:
-    return _lookup_manifest(repository_id, manifest_digest, allow_dead=allow_dead)
+class _ManifestAlreadyExists(Exception):
+    """
+    Exception raised to break out of manifest creation due to the manifest already existing.
+    """
 
-  with db_transaction():
-    found = _lookup_manifest(repository_id, manifest_digest, allow_dead=allow_dead)
-    if found is None:
-      return None
-
-    create_temporary_tag_if_necessary(found, temp_tag_expiration_sec)
-    return found
+    def __init__(self, internal_exception):
+        self.internal_exception = internal_exception
 
 
-def _lookup_manifest(repository_id, manifest_digest, allow_dead=False):
-  query = (Manifest
-           .select()
-           .where(Manifest.repository == repository_id)
-           .where(Manifest.digest == manifest_digest))
+def find_manifests_for_sec_notification(manifest_digest):
+    """
+    Finds all manifests matching the given digest that live in a repository with a registered
+    notification event for security scan results.
+    """
 
-  if allow_dead:
-    try:
-      return query.get()
-    except Manifest.DoesNotExist:
-      return None
-
-  # Try first to filter to those manifests referenced by an alive tag,
-  try:
-    return filter_to_alive_tags(query.join(Tag)).get()
-  except Manifest.DoesNotExist:
-    pass
-
-  # Try referenced as the child of a manifest that has an alive tag.
-  query = (query
-           .join(ManifestChild, on=(ManifestChild.child_manifest == Manifest.id))
-           .join(Tag, on=(Tag.manifest == ManifestChild.manifest)))
-
-  query = filter_to_alive_tags(query)
-
-  try:
-    return query.get()
-  except Manifest.DoesNotExist:
-    return None
+    return (
+        Manifest.select(Manifest, Repository)
+        .join(Repository)
+        .join(RepositoryNotification)
+        .where(
+            Manifest.digest == manifest_digest,
+            RepositoryNotification.event
+            == ExternalNotificationEvent.get(name="vulnerability_found"),
+        )
+    )
 
 
-def get_or_create_manifest(repository_id, manifest_interface_instance, storage,
-                           temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC,
-                           for_tagging=False, raise_on_error=False):
-  """ Returns a CreatedManifest for the manifest in the specified repository with the matching
-      digest (if it already exists) or, if not yet created, creates and returns the manifest.
+def lookup_manifest(
+    repository_id,
+    manifest_digest,
+    allow_dead=False,
+    allow_hidden=False,
+    require_available=False,
+    temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC,
+):
+    """
+    Returns the manifest with the specified digest under the specified repository or None if none.
 
-      Returns None if there was an error creating the manifest, unless raise_on_error is specified,
-      in which case a CreateManifestException exception will be raised instead to provide more
-      context to the error.
-
-      Note that *all* blobs referenced by the manifest must exist already in the repository or this
-      method will fail with a None.
-  """
-  existing = lookup_manifest(repository_id, manifest_interface_instance.digest, allow_dead=True,
-                             require_available=True,
-                             temp_tag_expiration_sec=temp_tag_expiration_sec)
-  if existing is not None:
-    return CreatedManifest(manifest=existing, newly_created=False, labels_to_apply=None)
-
-  return _create_manifest(repository_id, manifest_interface_instance, storage,
-                          temp_tag_expiration_sec, for_tagging=for_tagging,
-                          raise_on_error=raise_on_error)
-
-
-def _create_manifest(repository_id, manifest_interface_instance, storage,
-                     temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC,
-                     for_tagging=False, raise_on_error=False):
-  # Validate the manifest.
-  retriever = RepositoryContentRetriever.for_repository(repository_id, storage)
-  try:
-    manifest_interface_instance.validate(retriever)
-  except (ManifestException, MalformedSchema2ManifestList, BlobDoesNotExist, IOError) as ex:
-    logger.exception('Could not validate manifest `%s`', manifest_interface_instance.digest)
-    if raise_on_error:
-      raise CreateManifestException(ex)
-
-    return None
-
-  # Load, parse and get/create the child manifests, if any.
-  child_manifest_refs = manifest_interface_instance.child_manifests(retriever)
-  child_manifest_rows = {}
-  child_manifest_label_dicts = []
-
-  if child_manifest_refs is not None:
-    for child_manifest_ref in child_manifest_refs:
-      # Load and parse the child manifest.
-      try:
-        child_manifest = child_manifest_ref.manifest_obj
-      except (ManifestException, MalformedSchema2ManifestList, BlobDoesNotExist, IOError) as ex:
-        logger.exception('Could not load manifest list for manifest `%s`',
-                         manifest_interface_instance.digest)
-        if raise_on_error:
-          raise CreateManifestException(ex)
-
-        return None
-
-      # Retrieve its labels.
-      labels = child_manifest.get_manifest_labels(retriever)
-      if labels is None:
-        logger.exception('Could not load manifest labels for child manifest')
-        return None
-
-      # Get/create the child manifest in the database.
-      child_manifest_info = get_or_create_manifest(repository_id, child_manifest, storage,
-                                                   raise_on_error=raise_on_error)
-      if child_manifest_info is None:
-        logger.error('Could not get/create child manifest')
-        return None
-
-      child_manifest_rows[child_manifest_info.manifest.digest] = child_manifest_info.manifest
-      child_manifest_label_dicts.append(labels)
-
-  # Ensure all the blobs in the manifest exist.
-  digests = set(manifest_interface_instance.local_blob_digests)
-  blob_map = {}
-
-  # If the special empty layer is required, simply load it directly. This is much faster
-  # than trying to load it on a per repository basis, and that is unnecessary anyway since
-  # this layer is predefined.
-  if EMPTY_LAYER_BLOB_DIGEST in digests:
-    digests.remove(EMPTY_LAYER_BLOB_DIGEST)
-    blob_map[EMPTY_LAYER_BLOB_DIGEST] = get_shared_blob(EMPTY_LAYER_BLOB_DIGEST)
-    if not blob_map[EMPTY_LAYER_BLOB_DIGEST]:
-      logger.warning('Could not find the special empty blob in storage')
-      return None
-
-  if digests:
-    query = lookup_repo_storages_by_content_checksum(repository_id, digests)
-    blob_map.update({s.content_checksum: s for s in query})
-    for digest_str in digests:
-      if digest_str not in blob_map:
-        logger.warning('Unknown blob `%s` under manifest `%s` for repository `%s`', digest_str,
-                       manifest_interface_instance.digest, repository_id)
-
-        if raise_on_error:
-          raise CreateManifestException('Unknown blob `%s`' % digest_str)
-
-        return None
-
-  # Special check: If the empty layer blob is needed for this manifest, add it to the
-  # blob map. This is necessary because Docker decided to elide sending of this special
-  # empty layer in schema version 2, but we need to have it referenced for GC and schema version 1.
-  if EMPTY_LAYER_BLOB_DIGEST not in blob_map:
-    if manifest_interface_instance.get_requires_empty_layer_blob(retriever):
-      shared_blob = get_or_create_shared_blob(EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES, storage)
-      assert not shared_blob.uploading
-      assert shared_blob.content_checksum == EMPTY_LAYER_BLOB_DIGEST
-      blob_map[EMPTY_LAYER_BLOB_DIGEST] = shared_blob
-
-  # Determine and populate the legacy image if necessary. Manifest lists will not have a legacy
-  # image.
-  legacy_image = None
-  if manifest_interface_instance.has_legacy_image:
-    legacy_image_id = _populate_legacy_image(repository_id, manifest_interface_instance, blob_map,
-                                             retriever)
-    if legacy_image_id is None:
-      return None
-
-    legacy_image = get_image(repository_id, legacy_image_id)
-    if legacy_image is None:
-      return None
-
-  # Create the manifest and its blobs.
-  media_type = Manifest.media_type.get_id(manifest_interface_instance.media_type)
-  storage_ids = {storage.id for storage in blob_map.values()}
-
-  with db_transaction():
-    # Check for the manifest. This is necessary because Postgres doesn't handle IntegrityErrors
-    # well under transactions.
-    try:
-      manifest = Manifest.get(repository=repository_id, digest=manifest_interface_instance.digest)
-      return CreatedManifest(manifest=manifest, newly_created=False, labels_to_apply=None)
-    except Manifest.DoesNotExist:
-      pass
-
-    # Create the manifest.
-    try:
-      manifest = Manifest.create(repository=repository_id,
-                                 digest=manifest_interface_instance.digest,
-                                 media_type=media_type,
-                                 manifest_bytes=manifest_interface_instance.bytes.as_encoded_str())
-    except IntegrityError:
-      manifest = Manifest.get(repository=repository_id, digest=manifest_interface_instance.digest)
-      return CreatedManifest(manifest=manifest, newly_created=False, labels_to_apply=None)
-
-    # Insert the blobs.
-    blobs_to_insert = [dict(manifest=manifest, repository=repository_id,
-                            blob=storage_id) for storage_id in storage_ids]
-    if blobs_to_insert:
-      ManifestBlob.insert_many(blobs_to_insert).execute()
-
-    # Set the legacy image (if applicable).
-    if legacy_image is not None:
-      ManifestLegacyImage.create(repository=repository_id, image=legacy_image, manifest=manifest)
-
-    # Insert the manifest child rows (if applicable).
-    if child_manifest_rows:
-      children_to_insert = [dict(manifest=manifest, child_manifest=child_manifest,
-                                 repository=repository_id)
-                            for child_manifest in child_manifest_rows.values()]
-      ManifestChild.insert_many(children_to_insert).execute()
-
-    # If this manifest is being created not for immediate tagging, add a temporary tag to the
-    # manifest to ensure it isn't being GCed. If the manifest *is* for tagging, then since we're
-    # creating a new one here, it cannot be GCed (since it isn't referenced by anything yet), so
-    # its safe to elide the temp tag operation. If we ever change GC code to collect *all* manifests
-    # in a repository for GC, then we will have to reevaluate this optimization at that time.
-    if not for_tagging:
-      create_temporary_tag_if_necessary(manifest, temp_tag_expiration_sec)
-
-  # Define the labels for the manifest (if any).
-  labels = manifest_interface_instance.get_manifest_labels(retriever)
-  if labels:
-    for key, value in labels.iteritems():
-      media_type = 'application/json' if is_json(value) else 'text/plain'
-      create_manifest_label(manifest, key, value, 'manifest', media_type)
-
-  # Return the dictionary of labels to apply (i.e. those labels that cause an action to be taken
-  # on the manifest or its resulting tags). We only return those labels either defined on
-  # the manifest or shared amongst all the child manifests. We intersect amongst all child manifests
-  # to ensure that any action performed is defined in all manifests.
-  labels_to_apply = labels or {}
-  if child_manifest_label_dicts:
-    labels_to_apply = child_manifest_label_dicts[0].viewitems()
-    for child_manifest_label_dict in child_manifest_label_dicts[1:]:
-      # Intersect the key+values of the labels to ensure we get the exact same result
-      # for all the child manifests.
-      labels_to_apply = labels_to_apply & child_manifest_label_dict.viewitems()
-
-    labels_to_apply = dict(labels_to_apply)
-
-  return CreatedManifest(manifest=manifest, newly_created=True, labels_to_apply=labels_to_apply)
-
-
-def _populate_legacy_image(repository_id, manifest_interface_instance, blob_map, retriever):
-  # Lookup all the images and their parent images (if any) inside the manifest.
-  # This will let us know which v1 images we need to synthesize and which ones are invalid.
-  docker_image_ids = list(manifest_interface_instance.get_legacy_image_ids(retriever))
-  images_query = lookup_repository_images(repository_id, docker_image_ids)
-  image_storage_map = {i.docker_image_id: i.storage for i in images_query}
-
-  # Rewrite any v1 image IDs that do not match the checksum in the database.
-  try:
-    rewritten_images = manifest_interface_instance.generate_legacy_layers(image_storage_map,
-                                                                          retriever)
-    rewritten_images = list(rewritten_images)
-    parent_image_map = {}
-
-    for rewritten_image in rewritten_images:
-      if not rewritten_image.image_id in image_storage_map:
-        parent_image = None
-        if rewritten_image.parent_image_id:
-          parent_image = parent_image_map.get(rewritten_image.parent_image_id)
-          if parent_image is None:
-            parent_image = get_image(repository_id, rewritten_image.parent_image_id)
-            if parent_image is None:
-              return None
-
-        storage_reference = blob_map[rewritten_image.content_checksum]
-        synthesized = synthesize_v1_image(
-          repository_id,
-          storage_reference.id,
-          storage_reference.image_size,
-          rewritten_image.image_id,
-          rewritten_image.created,
-          rewritten_image.comment,
-          rewritten_image.command,
-          rewritten_image.compat_json,
-          parent_image,
+    If allow_dead is True, then manifests referenced by only dead tags will also be returned. If
+    require_available is True, the manifest will be marked with a temporary tag to ensure it remains
+    available.
+    """
+    if not require_available:
+        return _lookup_manifest(
+            repository_id, manifest_digest, allow_dead=allow_dead, allow_hidden=allow_hidden
         )
 
-        parent_image_map[rewritten_image.image_id] = synthesized
-  except ManifestException:
-    logger.exception("exception when rewriting v1 metadata")
-    return None
+    with db_transaction():
+        found = _lookup_manifest(
+            repository_id, manifest_digest, allow_dead=allow_dead, allow_hidden=allow_hidden
+        )
+        if found is None:
+            return None
 
-  return rewritten_images[-1].image_id
+        create_temporary_tag_if_necessary(found, temp_tag_expiration_sec)
+        return found
+
+
+def _lookup_manifest(repository_id, manifest_digest, allow_dead=False, allow_hidden=False):
+    query = (
+        Manifest.select()
+        .where(Manifest.repository == repository_id)
+        .where(Manifest.digest == manifest_digest)
+    )
+
+    if allow_dead:
+        try:
+            return query.get()
+        except Manifest.DoesNotExist:
+            return None
+
+    # Try first to filter to those manifests referenced by an alive tag,
+    try:
+        return filter_to_alive_tags(query.join(Tag), allow_hidden=allow_hidden).get()
+    except Manifest.DoesNotExist:
+        pass
+
+    # Try referenced as the child of a manifest that has an alive tag.
+    query = query.join(ManifestChild, on=(ManifestChild.child_manifest == Manifest.id)).join(
+        Tag, on=(Tag.manifest == ManifestChild.manifest)
+    )
+
+    query = filter_to_alive_tags(query, allow_hidden=allow_hidden)
+
+    try:
+        return query.get()
+    except Manifest.DoesNotExist:
+        return None
+
+
+def lookup_manifest_referrers(repository_id, manifest_digest, artifact_type=None):
+    query = (
+        Manifest.select()
+        .where(Manifest.repository == repository_id)
+        .where(Manifest.subject == manifest_digest)
+    )
+    if artifact_type is not None:
+        query = query.where(Manifest.artifact_type == artifact_type)
+
+    return query
+
+
+def lookup_cosign_signatures_for_digests(repository_id, digests):
+    """
+    Batch-lookup Cosign signatures for the given image manifest digests.
+
+    Returns a dict mapping each signed image digest to a CosignSignature.
+
+    Covers:
+      - Cosign v3+: OCI referrers where Manifest.subject matches the digest and
+        artifact_type is a known Sigstore/Cosign signature type (no visible .sig tag).
+      - Cosign v2 tag schema: alive tags named ``sha256-<hex>.sig``.
+
+    Digests with no matching signature are omitted from the result. When multiple
+    signature artifacts exist for one digest, the first found is returned (referrers
+    take precedence over classic .sig tags).
+    """
+    if not digests:
+        return {}
+
+    digests = list({digest for digest in digests if digest})
+    if not digests:
+        return {}
+
+    result = {}
+
+    # Cosign v3+ / OCI 1.1 referrers (subject-based, typically hidden $temp-* tags).
+    referrers = Manifest.select(
+        Manifest.digest,
+        Manifest.subject,
+        Manifest.artifact_type,
+        Manifest.manifest_bytes,
+    ).where(
+        Manifest.repository == repository_id,
+        Manifest.subject << digests,
+    )
+
+    for referrer in referrers:
+        if not _referrer_is_image_signature(referrer.artifact_type, referrer.manifest_bytes):
+            continue
+        if referrer.subject in result:
+            continue
+        result[referrer.subject] = CosignSignature(
+            manifest_digest=referrer.digest,
+            artifact_type=referrer.artifact_type,
+            tag_name=None,
+        )
+
+    # Cosign v2 classic tag schema: sha256-<hex>.sig
+    missing = [digest for digest in digests if digest not in result]
+    if not missing:
+        return result
+
+    sig_tag_name_to_digest = {}
+    for digest in missing:
+        if not digest.startswith("sha256:"):
+            continue
+        hex_digest = digest.split(":", 1)[1]
+        sig_tag_name_to_digest["sha256-%s.sig" % hex_digest] = digest
+
+    if not sig_tag_name_to_digest:
+        return result
+
+    query = (
+        Tag.select(Tag, Manifest)
+        .join(Manifest)
+        .where(
+            Tag.repository == repository_id,
+            Tag.name << list(sig_tag_name_to_digest.keys()),
+        )
+    )
+    query = filter_to_alive_tags(query)
+
+    for tag in query:
+        subject_digest = sig_tag_name_to_digest.get(tag.name)
+        if subject_digest is None or subject_digest in result:
+            continue
+        result[subject_digest] = CosignSignature(
+            manifest_digest=tag.manifest.digest,
+            artifact_type=tag.manifest.artifact_type,
+            tag_name=tag.name,
+        )
+
+    return result
+
+
+@overload
+def create_manifest(
+    repository_id: int,
+    manifest: ManifestInterface | ManifestListInterface,
+    raise_on_error: Literal[True] = ...,
+) -> Manifest: ...
+
+
+@overload
+def create_manifest(
+    repository_id: int,
+    manifest: ManifestInterface | ManifestListInterface,
+    raise_on_error: Literal[False],
+) -> Optional[Manifest]: ...
+
+
+def create_manifest(
+    repository_id: int,
+    manifest: ManifestInterface | ManifestListInterface,
+    raise_on_error: bool = True,
+) -> Optional[Manifest]:
+    """
+    Creates a manifest in the database.
+    Does not handle sub manifests in a manifest list/index.
+    Raises a _ManifestAlreadyExists exception if the manifest has already been created.
+    """
+    media_type = Manifest.media_type.get_id(manifest.media_type)
+    created_manifest = None
+    try:
+        created_manifest = Manifest.create(
+            repository=repository_id,
+            digest=manifest.digest,
+            media_type=media_type,
+            manifest_bytes=manifest.bytes.as_encoded_str(),  # TODO(kleesc): Remove once fully on JSONB only
+            config_media_type=manifest.config_media_type,
+            layers_compressed_size=manifest.layers_compressed_size,
+            subject_backfilled=True,  # TODO(kleesc): Remove once backfill is done
+            subject=(
+                manifest.subject.digest if manifest.subject else None
+            ),  # TODO(kleesc): Remove once fully on JSONB only
+            artifact_type_backfilled=True,  # TODO(kleesc): Remove once backfill is done
+            artifact_type=(
+                manifest.artifact_type if manifest.artifact_type else None
+            ),  # TODO(kleesc): Remove once fully on JSONB only
+        )
+    except IntegrityError as e:
+        # NOTE: An IntegrityError means (barring a bug) that the manifest was created by
+        # another caller while we were attempting to create it. Since we need to return
+        # the manifest, we raise a specialized exception here to break out of the
+        # transaction so we can retrieve it.
+        if raise_on_error:
+            raise _ManifestAlreadyExists(e)
+
+    return created_manifest
+
+
+def connect_manifests(manifests: list[Manifest], parent: Manifest, repository_id: int):
+    """
+    Connects manifests to a manifest list.
+    Raises a _ManifestAlreadyExists if any of the manifest children already exist.
+    """
+
+    # proxy code will send us a raw list of children, if we have multiple identical entries in the list,
+    # the insert will fail with a unique constraint violation.
+    # we need to make sure that duplicates are removed from the list
+
+    children = []
+    deduped_list = set()
+    for manifest in manifests:
+        if manifest.id not in deduped_list:
+            deduped_list.add(manifest.id)
+            children.append(
+                dict(manifest=parent, child_manifest=manifest, repository=repository_id)
+            )
+    if not children:
+        return
+
+    try:
+        ManifestChild.insert_many(children).execute()
+    except IntegrityError as e:
+        raise _ManifestAlreadyExists(e)
+
+
+def is_child_manifest(manifest_id: int):
+    return ManifestChild.select().where(ManifestChild.child_manifest == manifest_id).exists()
+
+
+def connect_blobs(manifest: ManifestInterface, blob_ids: set[int], repository_id: int):
+    manifest_blobs = [
+        dict(manifest=manifest, repository=repository_id, blob=blob_id) for blob_id in blob_ids
+    ]
+    try:
+        ManifestBlob.insert_many(manifest_blobs).execute()
+    except IntegrityError as e:
+        raise _ManifestAlreadyExists(e)
+
+
+def get_or_create_manifest(
+    repository_id,
+    manifest_interface_instance,
+    storage,
+    temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC,
+    for_tagging=False,
+    raise_on_error=False,
+    retriever=None,
+):
+    """
+    Returns a CreatedManifest for the manifest in the specified repository with the matching digest
+    (if it already exists) or, if not yet created, creates and returns the manifest.
+
+    Returns None if there was an error creating the manifest, unless raise_on_error is specified,
+    in which case a CreateManifestException exception will be raised instead to provide more
+    context to the error.
+
+    Note that *all* blobs referenced by the manifest must exist already in the repository or this
+    method will fail with a None.
+    """
+    existing = lookup_manifest(
+        repository_id,
+        manifest_interface_instance.digest,
+        allow_dead=True,
+        require_available=True,
+        temp_tag_expiration_sec=temp_tag_expiration_sec,
+    )
+    if existing is not None:
+        return CreatedManifest(manifest=existing, newly_created=False, labels_to_apply=None)
+
+    return _create_manifest(
+        repository_id,
+        manifest_interface_instance,
+        storage,
+        temp_tag_expiration_sec,
+        for_tagging=for_tagging,
+        raise_on_error=raise_on_error,
+        retriever=retriever,
+    )
+
+
+def _create_manifest(
+    repository_id,
+    manifest_interface_instance,
+    storage,
+    temp_tag_expiration_sec=TEMP_TAG_EXPIRATION_SEC,
+    for_tagging=False,
+    raise_on_error=False,
+    retriever=None,
+):
+    # Validate the manifest.
+    retriever = retriever or RepositoryContentRetriever.for_repository(repository_id, storage)
+    try:
+        manifest_interface_instance.validate(retriever)
+    except (ManifestException, MalformedSchema2ManifestList, BlobDoesNotExist, IOError) as ex:
+        logger.exception("Could not validate manifest `%s`", manifest_interface_instance.digest)
+        if raise_on_error:
+            raise CreateManifestException(str(ex))
+
+        return None
+
+    # Load, parse and get/create the child manifests, if any.
+    child_manifest_refs = manifest_interface_instance.child_manifests(retriever)
+    child_manifest_rows = {}
+    child_manifest_label_dicts = []
+
+    if child_manifest_refs is not None:
+        for child_manifest_ref in child_manifest_refs:
+            # Load and parse the child manifest.
+            try:
+                child_manifest = child_manifest_ref.manifest_obj
+            except (
+                ManifestException,
+                MalformedSchema2ManifestList,
+                BlobDoesNotExist,
+                IOError,
+            ) as ex:
+                logger.exception(
+                    "Could not load manifest list for manifest `%s`",
+                    manifest_interface_instance.digest,
+                )
+                if raise_on_error:
+                    raise CreateManifestException(str(ex))
+
+                return None
+
+            # Skip manifests that were not loaded (e.g., due to sparse index configuration).
+            if child_manifest is None:
+                continue
+
+            # Retrieve its labels.
+            labels = child_manifest.get_manifest_labels(retriever)
+            if labels is None and not isinstance(child_manifest, ManifestListInterface):
+                if raise_on_error:
+                    raise CreateManifestException("Unable to retrieve manifest labels")
+
+                logger.exception("Could not load manifest labels for child manifest")
+                return None
+
+            # Get/create the child manifest in the database.
+            child_manifest_info = get_or_create_manifest(
+                repository_id, child_manifest, storage, raise_on_error=raise_on_error
+            )
+            if child_manifest_info is None:
+                if raise_on_error:
+                    raise CreateManifestException("Unable to retrieve child manifest")
+
+                logger.error("Could not get/create child manifest")
+                return None
+
+            child_manifest_rows[child_manifest_info.manifest.digest] = child_manifest_info.manifest
+            child_manifest_label_dicts.append(labels or {})
+
+    # Build the map from required blob digests to the blob objects.
+    blob_map = _build_blob_map(
+        repository_id,
+        manifest_interface_instance,
+        retriever,
+        storage,
+        raise_on_error,
+        require_empty_layer=False,
+    )
+    if blob_map is None:
+        return None
+
+    # Create the manifest and its blobs.
+    storage_ids = {storage.id for storage in list(blob_map.values())}
+
+    # Get the storage sizes
+    blob_sizes = {}
+    if features.QUOTA_MANAGEMENT:
+        for storage in list(blob_map.values()):
+            blob_sizes[storage.id] = storage.image_size
+
+    # Check for the manifest, in case it was created since we checked earlier.
+    try:
+        manifest = Manifest.get(repository=repository_id, digest=manifest_interface_instance.digest)
+        return CreatedManifest(manifest=manifest, newly_created=False, labels_to_apply=None)
+    except Manifest.DoesNotExist:
+        pass
+
+    try:
+        with db_transaction():
+            manifest = create_manifest(repository_id, manifest_interface_instance)
+
+            if storage_ids:
+                connect_blobs(manifest, storage_ids, repository_id)
+
+            # Add blob sizes if quota management is enabled
+            update_quota(repository_id, manifest.id, blob_sizes, QuotaOperation.ADD)
+
+            if child_manifest_rows:
+                connect_manifests(child_manifest_rows.values(), manifest, repository_id)
+
+            ManifestSecurityStatus.create(
+                manifest=manifest.id,
+                repository=repository_id,
+                index_status=IndexStatus.PENDING,
+                indexer_hash="",
+                indexer_version=IndexerVersion.V4,
+                error_json={},
+                metadata_json={},
+            )
+
+            # If this manifest is being created not for immediate tagging, add a temporary tag to the
+            # manifest to ensure it isn't being GCed. If the manifest *is* for tagging, then since we're
+            # creating a new one here, it cannot be GCed (since it isn't referenced by anything yet), so
+            # its safe to elide the temp tag operation. If we ever change GC code to collect *all* manifests
+            # in a repository for GC, then we will have to reevaluate this optimization at that time.
+            if not for_tagging:
+                create_temporary_tag_if_necessary(
+                    manifest,
+                    temp_tag_expiration_sec,
+                    skip_expiration=manifest_interface_instance.subject is not None,
+                )
+
+        # Define the labels for the manifest (if any).
+        # TODO: Once the old data model is gone, turn this into a batch operation and make the label
+        # application to the manifest occur under the transaction.
+        labels = manifest_interface_instance.get_manifest_labels(retriever)
+        if labels:
+            for key, value in labels.items():
+                # NOTE: There can technically be empty label keys via Dockerfile's. We ignore any
+                # such `labels`, as they don't really mean anything.
+                if not key:
+                    continue
+
+                media_type = "application/json" if is_json(value) else "text/plain"
+                create_manifest_label(manifest, key, value, "manifest", media_type)
+
+        # Return the dictionary of labels to apply (i.e. those labels that cause an action to be taken
+        # on the manifest or its resulting tags). We only return those labels either defined on
+        # the manifest or shared amongst all the child manifests. We intersect amongst all child manifests
+        # to ensure that any action performed is defined in all manifests.
+        labels_to_apply = labels or {}
+        if child_manifest_label_dicts:
+            labels_to_apply = child_manifest_label_dicts[0].items()
+            for child_manifest_label_dict in child_manifest_label_dicts[1:]:
+                # Intersect the key+values of the labels to ensure we get the exact same result
+                # for all the child manifests.
+                labels_to_apply = labels_to_apply & child_manifest_label_dict.items()
+
+            labels_to_apply = dict(labels_to_apply)
+
+        return CreatedManifest(
+            manifest=manifest, newly_created=True, labels_to_apply=labels_to_apply
+        )
+    except _ManifestAlreadyExists as mae:
+        try:
+            manifest = Manifest.get(
+                repository=repository_id, digest=manifest_interface_instance.digest
+            )
+        except Manifest.DoesNotExist:
+            # NOTE: If we've reached this point, then somehow we had an IntegrityError without it
+            # being due to a duplicate manifest. We therefore log the error.
+            logger.error(
+                "Got integrity error when trying to create manifest: %s", mae.internal_exception
+            )
+            if raise_on_error:
+                raise CreateManifestException(
+                    "Attempt to create an invalid manifest. Please report this issue."
+                )
+
+            return None
+
+        return CreatedManifest(manifest=manifest, newly_created=False, labels_to_apply=None)
+
+
+def _build_blob_map(
+    repository_id,
+    manifest_interface_instance,
+    retriever,
+    storage,
+    raise_on_error=False,
+    require_empty_layer=True,
+):
+    """Builds a map containing the digest of each blob referenced by the given manifest,
+    to its associated Blob row in the database. This method also verifies that the blob
+    is accessible under the given repository. Returns None on error (unless raise_on_error
+    is specified). If require_empty_layer is set to True, the method will check if the manifest
+    references the special shared empty layer blob and, if so, add it to the map. Otherwise,
+    the empty layer blob is only returned if it was *explicitly* referenced in the manifest.
+    This is necessary because Docker V2_2/OCI manifests can implicitly reference an empty blob
+    layer for image layers that only change metadata.
+    """
+
+    # Ensure all the blobs in the manifest exist.
+    digests = set(manifest_interface_instance.local_blob_digests)
+    blob_map = {}
+
+    # If the special empty layer is required, simply load it directly. This is much faster
+    # than trying to load it on a per repository basis, and that is unnecessary anyway since
+    # this layer is predefined.
+    if EMPTY_LAYER_BLOB_DIGEST in digests:
+        digests.remove(EMPTY_LAYER_BLOB_DIGEST)
+        blob_map[EMPTY_LAYER_BLOB_DIGEST] = get_shared_blob(EMPTY_LAYER_BLOB_DIGEST)
+        if not blob_map[EMPTY_LAYER_BLOB_DIGEST]:
+            if raise_on_error:
+                raise CreateManifestException("Unable to retrieve specialized empty blob")
+
+            logger.warning("Could not find the special empty blob in storage")
+            return None
+
+    if digests:
+        query = lookup_repo_storages_by_content_checksum(repository_id, digests, with_uploads=True)
+        blob_map.update({s.content_checksum: s for s in query})
+        for digest_str in digests:
+            if digest_str not in blob_map:
+                logger.warning(
+                    "Unknown blob `%s` under manifest `%s` for repository `%s`",
+                    digest_str,
+                    manifest_interface_instance.digest,
+                    repository_id,
+                )
+
+                if raise_on_error:
+                    raise CreateManifestException("Unknown blob `%s`" % digest_str)
+
+                return None
+
+    # Special check: If the empty layer blob is needed for this manifest, add it to the
+    # blob map. This is necessary because Docker decided to elide sending of this special
+    # empty layer in schema version 2, but we need to have it referenced for schema version 1.
+    if require_empty_layer and EMPTY_LAYER_BLOB_DIGEST not in blob_map:
+        try:
+            requires_empty_layer = manifest_interface_instance.get_requires_empty_layer_blob(
+                retriever
+            )
+        except ManifestException as ex:
+            if raise_on_error:
+                raise CreateManifestException(str(ex))
+
+            return None
+
+        if requires_empty_layer is None:
+            if raise_on_error:
+                raise CreateManifestException("Could not load configuration blob")
+
+            return None
+
+        if requires_empty_layer:
+            shared_blob = get_or_create_shared_blob(
+                EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES, storage
+            )
+            assert shared_blob.content_checksum == EMPTY_LAYER_BLOB_DIGEST
+            blob_map[EMPTY_LAYER_BLOB_DIGEST] = shared_blob
+
+    return blob_map

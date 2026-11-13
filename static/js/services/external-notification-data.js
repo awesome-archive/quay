@@ -2,9 +2,9 @@
  * Service which defines the various kinds of external notification and provides methods for
  * easily looking up information about those kinds.
  */
-angular.module('quay').factory('ExternalNotificationData', ['Config', 'Features','VulnerabilityService',
+angular.module('quay').factory('ExternalNotificationData', ['Config', 'Features','VulnerabilityService', 'DocumentationService',
 
-function(Config, Features, VulnerabilityService) {
+function(Config, Features, VulnerabilityService, DocumentationService) {
   var externalNotificationData = {};
 
   var events = [
@@ -12,6 +12,10 @@ function(Config, Features, VulnerabilityService) {
       'id': 'repo_push',
       'title': 'Push to Repository',
       'icon': 'fa-upload'
+    },
+    {
+      'id': 'repo_image_expiry',
+      'title': 'Image expiry trigger'
     }
   ];
 
@@ -139,9 +143,7 @@ function(Config, Features, VulnerabilityService) {
           'title': 'minimum severity level',
           'values': VulnerabilityService.LEVELS,
           'help_text': 'A vulnerability must have a severity of the chosen level (or higher) ' +
-                      'for this notification to fire. Defcon 1 is a special severity level ' +
-                      'manually tagged by the ' + Config.REGISTRY_TITLE_SHORT + ' team for ' +
-                      'above-critical issues',
+                      'for this notification to fire.',
         }
       ]
     });
@@ -182,7 +184,16 @@ function(Config, Features, VulnerabilityService) {
         {
           'name': 'url',
           'type': 'url',
-          'title': 'Webhook URL'
+          'title': 'Webhook URL',
+          'help_text': 'JSON metadata representing the event will be POSTed to this URL.',
+          'help_url': DocumentationService.getUrl('notifications')
+        },
+        {
+          'name': 'template',
+          'type': 'template',
+          'title': 'POST body template (optional)',
+          'help_text': 'If specified, a JSON template for formatting the body of the POST',
+          'help_url':  DocumentationService.getUrl('notifications.webhook')
         }
       ]
     },

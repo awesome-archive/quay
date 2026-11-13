@@ -1,582 +1,1895 @@
+import pprint
 import unittest
+from contextlib import contextmanager
+from io import StringIO
+from unittest.mock import MagicMock
 
 import ldap
+from ldap.filter import filter_format
+from mock import patch
+from mockldap import MockLdap
 
 from app import app
-from initdb import setup_database_for_testing, finished_database_for_testing
-from data.users import LDAPUsers
 from data import model
-from mockldap import MockLdap
-from mock import patch
-from contextlib import contextmanager
+from data.users import LDAPUsers
+from data.users.externalldap import _LDAPTraceRedactor
+from initdb import finished_database_for_testing, setup_database_for_testing
 
-def _create_ldap(requires_email=True):
-  base_dn = ['dc=quay', 'dc=io']
-  admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-  admin_passwd = 'password'
-  user_rdn = ['ou=employees']
-  uid_attr = 'uid'
-  email_attr = 'mail'
-  secondary_user_rdns = ['ou=otheremployees']
 
-  ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                   uid_attr, email_attr, secondary_user_rdns=secondary_user_rdns,
-                   requires_email=requires_email)
-  return ldap
+def _create_ldap(
+    requires_email=True,
+    user_filter=None,
+    superuser_filter=None,
+    restricted_user_filter=None,
+    global_readonly_superuser_filter=None,
+    enable_caching=False,
+    cache_ttl=60.0,
+    enable_pooling=True,
+):
+    base_dn = ["dc=quay", "dc=io"]
+    admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+    admin_passwd = "password"
+    user_rdn = ["ou=employees"]
+    uid_attr = "uid"
+    email_attr = "mail"
+    memberof_attr = "memberOf"
+    secondary_user_rdns = ["ou=otheremployees"]
+
+    ldap = LDAPUsers(
+        "ldap://localhost",
+        base_dn,
+        admin_dn,
+        admin_passwd,
+        user_rdn,
+        uid_attr,
+        email_attr,
+        memberof_attr,
+        secondary_user_rdns=secondary_user_rdns,
+        requires_email=requires_email,
+        ldap_user_filter=user_filter,
+        ldap_superuser_filter=superuser_filter,
+        ldap_restricted_user_filter=restricted_user_filter,
+        ldap_global_readonly_superuser_filter=global_readonly_superuser_filter,
+        enable_caching=enable_caching,
+        cache_ttl=cache_ttl,
+        connection_pooling=enable_pooling,
+    )
+    return ldap
+
 
 @contextmanager
-def mock_ldap(requires_email=True):
-  mock_data = {
-    'dc=quay,dc=io': {'dc': ['quay', 'io']},
-    'ou=employees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'employees'
-    },
-    'ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees'
-    },
-    'cn=AwesomeFolk,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'cn': 'AwesomeFolk'
-    },
-    'uid=testy,ou=employees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'employees',
-      'uid': ['testy'],
-      'userPassword': ['password'],
-      'mail': ['bar@baz.com'],
-      'memberOf': ['cn=AwesomeFolk,dc=quay,dc=io', 'cn=*Guys,dc=quay,dc=io'],
-    },
-    'uid=someuser,ou=employees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'employees',
-      'uid': ['someuser'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@bar.com'],
-      'memberOf': ['cn=AwesomeFolk,dc=quay,dc=io', 'cn=*Guys,dc=quay,dc=io'],
-    },
-    'uid=nomail,ou=employees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'employees',
-      'uid': ['nomail'],
-      'userPassword': ['somepass']
-    },
-    'uid=cool.user,ou=employees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'employees',
-      'uid': ['cool.user', 'referred'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@bar.com']
-    },
-    'uid=referred,ou=employees,dc=quay,dc=io': {
-      'uid': ['referred'],
-      '_referral': 'ldap:///uid=cool.user,ou=employees,dc=quay,dc=io'
-    },
-    'uid=invalidreferred,ou=employees,dc=quay,dc=io': {
-      'uid': ['invalidreferred'],
-      '_referral': 'ldap:///uid=someinvaliduser,ou=employees,dc=quay,dc=io'
-    },
-    'uid=multientry,ou=subgroup1,ou=employees,dc=quay,dc=io': {
-      'uid': ['multientry'],
-      'mail': ['foo@bar.com'],
-      'userPassword': ['somepass'],
-    },
-    'uid=multientry,ou=subgroup2,ou=employees,dc=quay,dc=io': {
-      'uid': ['multientry'],
-      'another': ['key']
-    },
-    'uid=secondaryuser,ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees',
-      'uid': ['secondaryuser'],
-      'userPassword': ['somepass'],
-      'mail': ['foosecondary@bar.com']
-    },
-
-    # Feature: Email Blacklisting
-    'uid=blacklistedcom,ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees',
-      'uid': ['blacklistedcom'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@blacklisted.com']
-    },
-    'uid=blacklistednet,ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees',
-      'uid': ['blacklistednet'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@blacklisted.net']
-    },
-    'uid=blacklistedorg,ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees',
-      'uid': ['blacklistedorg'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@blacklisted.org']
-    },
-    'uid=notblacklistedcom,ou=otheremployees,dc=quay,dc=io': {
-      'dc': ['quay', 'io'],
-      'ou': 'otheremployees',
-      'uid': ['notblacklistedcom'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@notblacklisted.com']
-    },
-  }
-
-  if not requires_email:
-    for path in mock_data:
-      mock_data[path].pop('mail', None)
-
-  mockldap = MockLdap(mock_data)
-
-  def initializer(uri, trace_level=0):
-    obj = mockldap[uri]
-
-    # Seed to "support" wildcard queries, which MockLDAP does not support natively.
-    cool_block = {
-      'dc': ['quay', 'io'],
-      'ou': 'employees',
-      'uid': ['cool.user', 'referred'],
-      'userPassword': ['somepass'],
-      'mail': ['foo@bar.com']
+def mock_ldap(
+    requires_email=True,
+    user_filter=None,
+    superuser_filter=None,
+    restricted_user_filter=None,
+    global_readonly_superuser_filter=None,
+    enable_caching=False,
+    cache_ttl=60.0,
+    enable_pooling=True,
+):
+    mock_data = {
+        "dc=quay,dc=io": {"dc": ["quay", "io"]},
+        "ou=employees,dc=quay,dc=io": {"dc": ["quay", "io"], "ou": "employees"},
+        "ou=otheremployees,dc=quay,dc=io": {"dc": ["quay", "io"], "ou": "otheremployees"},
+        "cn=AwesomeFolk,dc=quay,dc=io": {"dc": ["quay", "io"], "cn": "AwesomeFolk"},
+        "uid=testy,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["testy"],
+            "userPassword": ["password"],
+            "mail": ["bar@baz.com"],
+            "memberOf": ["cn=AwesomeFolk,dc=quay,dc=io", "cn=*Guys,dc=quay,dc=io"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=someuser,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["someuser"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@bar.com"],
+            "memberOf": ["cn=AwesomeFolk,dc=quay,dc=io", "cn=*Guys,dc=quay,dc=io"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=strange-memberof,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["strange-memberof"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@bar.com"],
+            "strangeMemberOf": ["cn=StrangeFolk,dc=quay,dc=io"],
+            "filterField": ["strangevalue"],
+            "objectClass": "user",
+        },
+        "uid=nomail,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["nomail"],
+            "userPassword": ["somepass"],
+            "filterField": ["somevalue"],
+        },
+        "uid=bytesuser,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["bytesuser"],
+            "userPassword": ["somepass"],
+            "mail": [b"bytes@bar.com"],
+            "filterField": ["somevalue"],
+        },
+        "uid=cool.user,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["cool.user", "referred"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@bar.com"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=referred,ou=employees,dc=quay,dc=io": {
+            "uid": ["referred"],
+            "_referral": "ldap:///uid=cool.user,ou=employees,dc=quay,dc=io",
+        },
+        "uid=invalidreferred,ou=employees,dc=quay,dc=io": {
+            "uid": ["invalidreferred"],
+            "_referral": "ldap:///uid=someinvaliduser,ou=employees,dc=quay,dc=io",
+        },
+        "uid=multientry,ou=subgroup1,ou=employees,dc=quay,dc=io": {
+            "uid": ["multientry"],
+            "mail": ["foo@bar.com"],
+            "userPassword": ["somepass"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=multientry,ou=subgroup2,ou=employees,dc=quay,dc=io": {
+            "uid": ["multientry"],
+            "another": ["key"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=secondaryuser,ou=otheremployees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "otheremployees",
+            "uid": ["secondaryuser"],
+            "userPassword": ["somepass"],
+            "mail": ["foosecondary@bar.com"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        # Feature: Email Blacklisting
+        "uid=blacklistedcom,ou=otheremployees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "otheremployees",
+            "uid": ["blacklistedcom"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@blacklisted.com"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=blacklistednet,ou=otheremployees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "otheremployees",
+            "uid": ["blacklistednet"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@blacklisted.net"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=blacklistedorg,ou=otheremployees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "otheremployees",
+            "uid": ["blacklistedorg"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@blacklisted.org"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=notblacklistedcom,ou=otheremployees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "otheremployees",
+            "uid": ["notblacklistedcom"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@notblacklisted.com"],
+            "filterField": ["somevalue"],
+            "objectClass": "user",
+        },
+        "uid=somesuperuser,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["somesuperuser"],
+            "userPassword": ["somesuperpass"],
+            "mail": ["superfoo@bar.com"],
+            "memberOf": ["cn=AwesomeFolk,dc=quay,dc=io", "cn=*Guys,dc=quay,dc=io"],
+            "filterField": ["somevalue", "superuser"],
+            "objectClass": "user",
+        },
+        "uid=somerestricteduser,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["somerestricteduser"],
+            "userPassword": ["somerestrictedpass"],
+            "mail": ["restrictedfoo@bar.com"],
+            "memberOf": ["cn=AwesomeFolk,dc=quay,dc=io", "cn=*Guys,dc=quay,dc=io"],
+            "filterField": ["somevalue", "restricted"],
+            "objectClass": "user",
+        },
+        "uid=someglobalreadonlysuperuser,ou=employees,dc=quay,dc=io": {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["someglobalreadonlysuperuser"],
+            "userPassword": ["someglobalreadonlypass"],
+            "mail": ["globalreadonlysuperuserfoo@bar.com"],
+            "memberOf": ["cn=AwesomeFolk,dc=quay,dc=io", "cn=*Guys,dc=quay,dc=io"],
+            "filterField": ["somevalue", "globalreadonlysuperuser"],
+            "objectClass": "user",
+        },
     }
 
     if not requires_email:
-      cool_block.pop('mail', None)
+        for path in mock_data:
+            mock_data[path].pop("mail", None)
 
-    obj.search_s.seed('ou=employees,dc=quay,dc=io', 2, '(|(uid=cool*)(mail=cool*))')([
-      ('uid=cool.user,ou=employees,dc=quay,dc=io', cool_block)
-    ])
+    mockldap = MockLdap(mock_data)
 
-    obj.search_s.seed('ou=otheremployees,dc=quay,dc=io', 2, '(|(uid=cool*)(mail=cool*))')([])
+    def initializer(uri, trace_level=0, bytes_mode=False):
+        obj = mockldap[uri]
 
-    obj.search_s.seed('ou=employees,dc=quay,dc=io', 2, '(|(uid=unknown*)(mail=unknown*))')([])
-    obj.search_s.seed('ou=otheremployees,dc=quay,dc=io', 2,
-                      '(|(uid=unknown*)(mail=unknown*))')([])
+        # Seed to "support" wildcard queries, which MockLDAP does not support natively.
+        cool_block = {
+            "dc": ["quay", "io"],
+            "ou": "employees",
+            "uid": ["cool.user", "referred"],
+            "userPassword": ["somepass"],
+            "mail": ["foo@bar.com"],
+        }
 
-    no_users_found_exception = Exception()
-    no_users_found_exception.message = { 'matched': 'dc=quay,dc=io', 'desc': 'No such object' }
+        if not requires_email:
+            cool_block.pop("mail", None)
 
-    obj.search_s.seed('ou=nonexistent,dc=quay,dc=io', 2)(no_users_found_exception)
-    obj.search_s.seed('ou=employees,dc=quay,dc=io', 2)([
-        ('uid=cool.user,ou=employees,dc=quay,dc=io', cool_block)
-    ])
-    obj.search.seed('ou=employees,dc=quay,dc=io', 2, '(objectClass=*)')([
-        ('uid=cool.user,ou=employees,dc=quay,dc=io', cool_block)
-    ])
-    obj.search.seed('ou=employees,dc=quay,dc=io', 2)([
-        ('uid=cool.user,ou=employees,dc=quay,dc=io', cool_block)
-    ])
+        obj.search_s.seed("ou=employees,dc=quay,dc=io", 2, "(|(uid=cool*)(mail=cool*))")(
+            [("uid=cool.user,ou=employees,dc=quay,dc=io", cool_block)]
+        )
 
-    obj._results = {}
-    original_result_fn = obj.result
+        obj.search_s.seed("ou=otheremployees,dc=quay,dc=io", 2, "(|(uid=cool*)(mail=cool*))")([])
 
-    def result(messageid):
-      if messageid is None:
-        return None, [], None, None
-      
-      # NOTE: Added because of weirdness with using mock-ldap.
-      if isinstance(messageid, list):
-        return None, messageid
+        obj.search_s.seed("ou=employees,dc=quay,dc=io", 2, "(|(uid=unknown*)(mail=unknown*))")([])
+        obj.search_s.seed("ou=otheremployees,dc=quay,dc=io", 2, "(|(uid=unknown*)(mail=unknown*))")(
+            []
+        )
 
-      if messageid in obj._results:
-        return obj._results[messageid]
+        no_users_found_exception = Exception()
+        no_users_found_exception.message = {"matched": "dc=quay,dc=io", "desc": "No such object"}
 
-      return original_result_fn(messageid)
+        obj.search_s.seed("ou=nonexistent,dc=quay,dc=io", 2)(no_users_found_exception)
+        obj.search_s.seed("ou=employees,dc=quay,dc=io", 2)(
+            [("uid=cool.user,ou=employees,dc=quay,dc=io", cool_block)]
+        )
+        obj.search.seed("ou=employees,dc=quay,dc=io", 2, "(objectClass=*)")(
+            [("uid=cool.user,ou=employees,dc=quay,dc=io", cool_block)]
+        )
+        obj.search.seed("ou=employees,dc=quay,dc=io", 2)(
+            [("uid=cool.user,ou=employees,dc=quay,dc=io", cool_block)]
+        )
 
-    def result3(messageid):
-      if messageid is None:
-        return None, [], None, None     
+        obj._results = {}
+        original_result_fn = obj.result
 
-      return obj._results[messageid]
+        def result(messageid):
+            if messageid is None:
+                return None, [], None, None
 
-    def search_ext(user_search_dn, scope, search_flt=None, serverctrls=None,
-                   sizelimit=None, attrlist=None):
-      if scope != ldap.SCOPE_SUBTREE:
-        return None
+            # NOTE: Added because of weirdness with using mock-ldap.
+            if isinstance(messageid, list):
+                return None, messageid
 
-      if not serverctrls:
-        if search_flt:
-          rdata = obj.search_s(user_search_dn, scope, search_flt, attrlist=attrlist)
-        else:
-          if attrlist:
-            rdata = obj.search_s(user_search_dn, scope, attrlist=attrlist)
-          else:
-            rdata = obj.search_s(user_search_dn, scope)
+            if messageid in obj._results:
+                return obj._results[messageid]
 
-        obj._results['messageid'] = (None, rdata)
-        return 'messageid'
+            return original_result_fn(messageid)
 
-      page_control = serverctrls[0]
-      if page_control.controlType != ldap.controls.SimplePagedResultsControl.controlType:
-        return None
+        def result3(messageid):
+            if messageid is None:
+                return None, [], None, None
 
-      if search_flt:
-        msgid = obj.search(user_search_dn, scope, search_flt, attrlist=attrlist)
-      else:
-        if attrlist:
-          msgid = obj.search(user_search_dn, scope, attrlist=attrlist)
-        else:
-          msgid = obj.search(user_search_dn, scope)
+            return obj._results[messageid]
 
-      _, rdata = obj.result(msgid)
-      msgid = 'messageid'
-      cookie = int(page_control.cookie) if page_control.cookie else 0
+        def search_ext(
+            user_search_dn, scope, search_flt=None, serverctrls=None, sizelimit=None, attrlist=None
+        ):
+            if scope != ldap.SCOPE_SUBTREE:
+                return None
 
-      results = rdata[cookie:cookie+page_control.size]
-      cookie = cookie + page_control.size
-      if cookie > len(results):
-        page_control.cookie = None
-      else:
-        page_control.cookie = cookie
+            if not serverctrls:
+                if search_flt:
+                    rdata = obj.search_s(user_search_dn, scope, search_flt, attrlist=attrlist)
+                else:
+                    if attrlist:
+                        rdata = obj.search_s(user_search_dn, scope, attrlist=attrlist)
+                    else:
+                        rdata = obj.search_s(user_search_dn, scope)
 
-      obj._results['messageid'] = (None, results, None, [page_control])
-      return msgid
+                obj._results["messageid"] = (None, rdata)
+                return "messageid"
 
-    def search_ext_s(user_search_dn, scope, sizelimit=None):
-      return [obj.search_s(user_search_dn, scope)]
+            page_control = serverctrls[0]
+            if page_control.controlType != ldap.controls.SimplePagedResultsControl.controlType:
+                return None
 
-    obj.search_ext = search_ext
-    obj.result = result
-    obj.result3 = result3
-    obj.search_ext_s = search_ext_s
+            if search_flt:
+                msgid = obj.search(user_search_dn, scope, search_flt, attrlist=attrlist)
+            else:
+                if attrlist:
+                    msgid = obj.search(user_search_dn, scope, attrlist=attrlist)
+                else:
+                    msgid = obj.search(user_search_dn, scope)
 
-    return obj
+            _, rdata = obj.result(msgid)
+            msgid = "messageid"
+            cookie = int(page_control.cookie) if page_control.cookie else 0
 
-  mockldap.start()
-  with patch('ldap.initialize', new=initializer):
-    yield _create_ldap(requires_email=requires_email)
-  mockldap.stop()
+            results = rdata[cookie : cookie + page_control.size]
+            cookie = cookie + page_control.size
+            if cookie > len(results):
+                page_control.cookie = None
+            else:
+                page_control.cookie = cookie
+
+            obj._results["messageid"] = (None, results, None, [page_control])
+            return msgid
+
+        def search_ext_s(user_search_dn, scope, sizelimit=None):
+            return [obj.search_s(user_search_dn, scope)]
+
+        obj.search_ext = search_ext
+        obj.result = result
+        obj.result3 = result3
+        obj.search_ext_s = search_ext_s
+
+        return obj
+
+    mockldap.start()
+    try:
+        with patch("ldap.initialize", new=initializer):
+            yield _create_ldap(
+                requires_email=requires_email,
+                user_filter=user_filter,
+                superuser_filter=superuser_filter,
+                restricted_user_filter=restricted_user_filter,
+                global_readonly_superuser_filter=global_readonly_superuser_filter,
+                enable_caching=enable_caching,
+                cache_ttl=cache_ttl,
+                enable_pooling=enable_pooling,
+            )
+    finally:
+        mockldap.stop()
 
 
 class TestLDAP(unittest.TestCase):
-  def setUp(self):
-    setup_database_for_testing(self)
-    self.app = app.test_client()
-    self.ctx = app.test_request_context()
-    self.ctx.__enter__()
+    def setUp(self):
+        setup_database_for_testing(self)
+        self.app = app.test_client()
+        self.ctx = app.test_request_context()
+        self.ctx.__enter__()
 
-  def tearDown(self):
-    finished_database_for_testing(self)
-    self.ctx.__exit__(True, None, None)
+    def tearDown(self):
+        finished_database_for_testing(self)
+        self.ctx.__exit__(True, None, None)
 
-  def test_invalid_admin_password(self):
-    base_dn = ['dc=quay', 'dc=io']
-    admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-    admin_passwd = 'INVALIDPASSWORD'
-    user_rdn = ['ou=employees']
-    uid_attr = 'uid'
-    email_attr = 'mail'
+    def test_invalid_admin_password(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "INVALIDPASSWORD"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
 
-    with mock_ldap():
-      ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                       uid_attr, email_attr)
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost", base_dn, admin_dn, admin_passwd, user_rdn, uid_attr, email_attr
+            )
 
-      # Try to login.
-      (response, err_msg) = ldap.verify_and_link_user('someuser', 'somepass')
-      self.assertIsNone(response)
-      self.assertEquals('LDAP Admin dn or password is invalid', err_msg)
+            # Try to login.
+            response, err_msg = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertIsNone(response)
+            self.assertEqual("LDAP Admin dn or password is invalid", err_msg)
 
-  def test_login(self):
-    with mock_ldap() as ldap:
-      # Verify we can login.
-      (response, _) = ldap.verify_and_link_user('someuser', 'somepass')
-      self.assertEquals(response.username, 'someuser')
-      self.assertTrue(model.user.has_user_prompt(response, 'confirm_username'))
+    def test_login(self):
+        with mock_ldap() as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
+            self.assertTrue(model.user.has_user_prompt(response, "confirm_username"))
 
-      # Verify we can confirm the user.
-      (response, _) = ldap.confirm_existing_user('someuser', 'somepass')
-      self.assertEquals(response.username, 'someuser')
+            # Verify we can confirm the user.
+            response, _ = ldap.confirm_existing_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
 
-  def test_login_empty_password(self):
-    with mock_ldap() as ldap:
-      # Verify we cannot login.
-      (response, err_msg) = ldap.verify_and_link_user('someuser', '')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Anonymous binding not allowed')
+    def test_login_empty_password(self):
+        with mock_ldap() as ldap:
+            # Verify we cannot login.
+            response, err_msg = ldap.verify_and_link_user("someuser", "")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Anonymous binding not allowed.")
 
-      # Verify we cannot confirm the user.
-      (response, err_msg) = ldap.confirm_existing_user('someuser', '')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid user')
+            # Verify we cannot confirm the user.
+            response, err_msg = ldap.confirm_existing_user("someuser", "")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-  def test_login_whitespace_password(self):
-    with mock_ldap() as ldap:
-      # Verify we cannot login.
-      (response, err_msg) = ldap.verify_and_link_user('someuser', '    ')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid password')
+    def test_login_whitespace_password(self):
+        with mock_ldap() as ldap:
+            # Verify we cannot login.
+            response, err_msg = ldap.verify_and_link_user("someuser", "    ")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-      # Verify we cannot confirm the user.
-      (response, err_msg) = ldap.confirm_existing_user('someuser', '    ')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid user')
+            # Verify we cannot confirm the user.
+            response, err_msg = ldap.confirm_existing_user("someuser", "    ")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-  def test_login_secondary(self):
-    with mock_ldap() as ldap:
-      # Verify we can login.
-      (response, _) = ldap.verify_and_link_user('secondaryuser', 'somepass')
-      self.assertEquals(response.username, 'secondaryuser')
+    def test_login_secondary(self):
+        with mock_ldap() as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("secondaryuser", "somepass")
+            self.assertEqual(response.username, "secondaryuser")
 
-      # Verify we can confirm the user.
-      (response, _) = ldap.confirm_existing_user('secondaryuser', 'somepass')
-      self.assertEquals(response.username, 'secondaryuser')
+            # Verify we can confirm the user.
+            response, _ = ldap.confirm_existing_user("secondaryuser", "somepass")
+            self.assertEqual(response.username, "secondaryuser")
 
-  def test_invalid_wildcard(self):
-    with mock_ldap() as ldap:
-      # Verify we cannot login with a wildcard.
-      (response, err_msg) = ldap.verify_and_link_user('some*', 'somepass')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Username not found')
+    def test_invalid_wildcard(self):
+        with mock_ldap() as ldap:
+            # Verify we cannot login with a wildcard.
+            response, err_msg = ldap.verify_and_link_user("some*", "somepass")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-      # Verify we cannot confirm the user.
-      (response, err_msg) = ldap.confirm_existing_user('some*', 'somepass')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid user')
+            # Verify we cannot confirm the user.
+            response, err_msg = ldap.confirm_existing_user("some*", "somepass")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-  def test_invalid_password(self):
-    with mock_ldap() as ldap:
-      # Verify we cannot login with an invalid password.
-      (response, err_msg) = ldap.verify_and_link_user('someuser', 'invalidpass')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid password')
+    def test_invalid_password(self):
+        with mock_ldap() as ldap:
+            # Verify we cannot login with an invalid password.
+            response, err_msg = ldap.verify_and_link_user("someuser", "invalidpass")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-      # Verify we cannot confirm the user.
-      (response, err_msg) = ldap.confirm_existing_user('someuser', 'invalidpass')
-      self.assertIsNone(response)
-      self.assertEquals(err_msg, 'Invalid user')
+            # Verify we cannot confirm the user.
+            response, err_msg = ldap.confirm_existing_user("someuser", "invalidpass")
+            self.assertIsNone(response)
+            self.assertEqual(err_msg, "Invalid username or password.")
 
-  def test_missing_mail(self):
-    with mock_ldap() as ldap:
-      (response, err_msg) = ldap.get_user('nomail')
-      self.assertIsNone(response)
-      self.assertEquals('Missing mail field "mail" in user record', err_msg)
+    def test_missing_mail(self):
+        with mock_ldap() as ldap:
+            response, err_msg = ldap.get_user("nomail")
+            self.assertIsNone(response)
+            self.assertEqual('Missing mail field "mail" in user record', err_msg)
 
-  def test_missing_mail_allowed(self):
-    with mock_ldap(requires_email=False) as ldap:
-      (response, _) = ldap.get_user('nomail')
-      self.assertEquals(response.username, 'nomail')
+    def test_missing_mail_allowed(self):
+        with mock_ldap(requires_email=False) as ldap:
+            response, _ = ldap.get_user("nomail")
+            self.assertEqual(response.username, "nomail")
 
-  def test_confirm_different_username(self):
-    with mock_ldap() as ldap:
-      # Verify that the user is logged in and their username was adjusted.
-      (response, _) = ldap.verify_and_link_user('cool.user', 'somepass')
-      self.assertEquals(response.username, 'cool_user')
+    def test_bytes_in_results(self):
+        with mock_ldap() as ldap:
+            response, _ = ldap.get_user("bytesuser")
+            self.assertEqual(response.username, "bytesuser")
 
-      # Verify we can confirm the user's quay username.
-      (response, _) = ldap.confirm_existing_user('cool_user', 'somepass')
-      self.assertEquals(response.username, 'cool_user')
+    def test_confirm_different_username(self):
+        with mock_ldap() as ldap:
+            # Verify that the user is logged in and their username was adjusted.
+            response, _ = ldap.verify_and_link_user("cool.user", "somepass")
+            self.assertEqual(response.username, "cool_user")
 
-      # Verify that we *cannot* confirm the LDAP username.
-      (response, _) = ldap.confirm_existing_user('cool.user', 'somepass')
-      self.assertIsNone(response)
+            # Verify we can confirm the user's quay username.
+            response, _ = ldap.confirm_existing_user("cool_user", "somepass")
+            self.assertEqual(response.username, "cool_user")
 
-  def test_referral(self):
-    with mock_ldap() as ldap:
-      (response, _) = ldap.verify_and_link_user('referred', 'somepass')
-      self.assertEquals(response.username, 'cool_user')
+            # Verify that we *cannot* confirm the LDAP username.
+            response, _ = ldap.confirm_existing_user("cool.user", "somepass")
+            self.assertIsNone(response)
 
-      # Verify we can confirm the user's quay username.
-      (response, _) = ldap.confirm_existing_user('cool_user', 'somepass')
-      self.assertEquals(response.username, 'cool_user')
+    def test_referral(self):
+        with mock_ldap() as ldap:
+            response, _ = ldap.verify_and_link_user("referred", "somepass")
+            self.assertEqual(response.username, "cool_user")
 
-  def test_invalid_referral(self):
-    with mock_ldap() as ldap:
-      (response, _) = ldap.verify_and_link_user('invalidreferred', 'somepass')
-      self.assertIsNone(response)
+            # Verify we can confirm the user's quay username.
+            response, _ = ldap.confirm_existing_user("cool_user", "somepass")
+            self.assertEqual(response.username, "cool_user")
 
-  def test_multientry(self):
-    with mock_ldap() as ldap:
-      (response, _) = ldap.verify_and_link_user('multientry', 'somepass')
-      self.assertEquals(response.username, 'multientry')
+    def test_invalid_referral(self):
+        with mock_ldap() as ldap:
+            response, _ = ldap.verify_and_link_user("invalidreferred", "somepass")
+            self.assertIsNone(response)
 
-  def test_login_empty_userdn(self):
-    with mock_ldap():
-      base_dn = ['ou=employees', 'dc=quay', 'dc=io']
-      admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-      admin_passwd = 'password'
-      user_rdn = []
-      uid_attr = 'uid'
-      email_attr = 'mail'
-      secondary_user_rdns = ['ou=otheremployees']
+    def test_multientry(self):
+        with mock_ldap() as ldap:
+            response, _ = ldap.verify_and_link_user("multientry", "somepass")
+            self.assertEqual(response.username, "multientry")
 
-      ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                       uid_attr, email_attr, secondary_user_rdns=secondary_user_rdns)
+    def test_login_empty_userdn(self):
+        with mock_ldap():
+            base_dn = ["ou=employees", "dc=quay", "dc=io"]
+            admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+            admin_passwd = "password"
+            user_rdn = []
+            uid_attr = "uid"
+            email_attr = "mail"
+            memberof_attr = "memberOf"
+            secondary_user_rdns = ["ou=otheremployees"]
 
-      # Verify we can login.
-      (response, _) = ldap.verify_and_link_user('someuser', 'somepass')
-      self.assertEquals(response.username, 'someuser')
+            ldap = LDAPUsers(
+                "ldap://localhost",
+                base_dn,
+                admin_dn,
+                admin_passwd,
+                user_rdn,
+                uid_attr,
+                email_attr,
+                memberof_attr,
+                secondary_user_rdns=secondary_user_rdns,
+            )
 
-      # Verify we can confirm the user.
-      (response, _) = ldap.confirm_existing_user('someuser', 'somepass')
-      self.assertEquals(response.username, 'someuser')
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
 
-  def test_link_user(self):
-    with mock_ldap() as ldap:
-      # Link someuser.
-      user, error_message = ldap.link_user('someuser')
-      self.assertIsNone(error_message)
-      self.assertIsNotNone(user)
-      self.assertEquals('someuser', user.username)
+            # Verify we can confirm the user.
+            response, _ = ldap.confirm_existing_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
 
-      # Link again. Should return the same user record.
-      user_again, _ = ldap.link_user('someuser')
-      self.assertEquals(user_again.id, user.id)
+    def test_link_user(self):
+        with mock_ldap() as ldap:
+            # Link someuser.
+            user, error_message = ldap.link_user("someuser")
+            self.assertIsNone(error_message)
+            self.assertIsNotNone(user)
+            self.assertEqual("someuser", user.username)
 
-      # Confirm someuser.
-      result, _ = ldap.confirm_existing_user('someuser', 'somepass')
-      self.assertIsNotNone(result)
-      self.assertEquals('someuser', result.username)
-      self.assertTrue(model.user.has_user_prompt(user, 'confirm_username'))
+            # Link again. Should return the same user record.
+            user_again, _ = ldap.link_user("someuser")
+            self.assertEqual(user_again.id, user.id)
 
-  def test_query(self):
-    with mock_ldap() as ldap:
-      # Lookup cool.
-      (response, federated_id, error_message) = ldap.query_users('cool')
-      self.assertIsNone(error_message)
-      self.assertEquals(1, len(response))
-      self.assertEquals('ldap', federated_id)
+            # Confirm someuser.
+            result, _ = ldap.confirm_existing_user("someuser", "somepass")
+            self.assertIsNotNone(result)
+            self.assertEqual("someuser", result.username)
+            self.assertTrue(model.user.has_user_prompt(user, "confirm_username"))
 
-      user_info = response[0]
-      self.assertEquals("cool.user", user_info.username)
-      self.assertEquals("foo@bar.com", user_info.email)
+    def test_query(self):
+        with mock_ldap() as ldap:
+            # Lookup cool.
+            response, federated_id, error_message = ldap.query_users("cool")
+            self.assertIsNone(error_message)
+            self.assertEqual(1, len(response))
+            self.assertEqual("ldap", federated_id)
 
-      # Lookup unknown.
-      (response, federated_id, error_message) = ldap.query_users('unknown')
-      self.assertIsNone(error_message)
-      self.assertEquals(0, len(response))
-      self.assertEquals('ldap', federated_id)
+            user_info = response[0]
+            self.assertEqual("cool.user", user_info.username)
+            self.assertEqual("foo@bar.com", user_info.email)
 
-  def test_timeout(self):
-    base_dn = ['dc=quay', 'dc=io']
-    admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-    admin_passwd = 'password'
-    user_rdn = ['ou=employees']
-    uid_attr = 'uid'
-    email_attr = 'mail'
-    secondary_user_rdns = ['ou=otheremployees']
+            # Lookup unknown.
+            response, federated_id, error_message = ldap.query_users("unknown")
+            self.assertIsNone(error_message)
+            self.assertEqual(0, len(response))
+            self.assertEqual("ldap", federated_id)
 
-    with self.assertRaisesRegexp(Exception, "Can't contact LDAP server"):
-      ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                       uid_attr, email_attr, secondary_user_rdns=secondary_user_rdns,
-                       requires_email=False, timeout=5)
-      ldap.query_users('cool')
+    def test_timeout(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "password"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
+        memberof_attr = "memberOf"
+        secondary_user_rdns = ["ou=otheremployees"]
 
-  def test_iterate_group_members(self):
-    with mock_ldap() as ldap:
-      (it, err) = ldap.iterate_group_members({'group_dn': 'cn=AwesomeFolk'},
-                                             disable_pagination=True)
-      self.assertIsNone(err)
+        with self.assertRaisesRegex(Exception, "Can't contact LDAP server"):
+            ldap = LDAPUsers(
+                "ldap://localhost",
+                base_dn,
+                admin_dn,
+                admin_passwd,
+                user_rdn,
+                uid_attr,
+                email_attr,
+                memberof_attr,
+                secondary_user_rdns=secondary_user_rdns,
+                requires_email=False,
+                timeout=5,
+            )
+            ldap.query_users("cool")
 
-      results = list(it)
-      self.assertEquals(2, len(results))
+    def test_iterate_group_members(self):
+        with mock_ldap() as ldap:
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
 
-      first = results[0][0]
-      second = results[1][0]
+            results = list(it)
+            self.assertEqual(5, len(results))
 
-      if first.id == 'testy':
-        testy, someuser = first, second
-      else:
-        testy, someuser = second, first
+            first = results[0][0]
+            second = results[1][0]
+            third = results[2][0]
+            fourth = results[3][0]
 
-      self.assertEquals('testy', testy.id)
-      self.assertEquals('testy', testy.username)
-      self.assertEquals('bar@baz.com', testy.email)
+            assert all(
+                x in [u[0].id for u in results]
+                for x in ["testy", "someuser", "somesuperuser", "somerestricteduser"]
+            )
 
-      self.assertEquals('someuser', someuser.id)
-      self.assertEquals('someuser', someuser.username)
-      self.assertEquals('foo@bar.com', someuser.email)
+            for i in results:
+                u = i[0]
+                if u.id == "testy":
+                    self.assertEqual("testy", u.id)
+                    self.assertEqual("testy", u.username)
+                    self.assertEqual("bar@baz.com", u.email)
 
-  def test_iterate_group_members_with_pagination(self):
-    with mock_ldap() as ldap:
-      for dn in ['cn=AwesomeFolk', 'cn=*Guys']:
-        (it, err) = ldap.iterate_group_members({'group_dn': dn}, page_size=1)
-        self.assertIsNone(err)
+                if u.id == "someuser":
+                    self.assertEqual("someuser", u.id)
+                    self.assertEqual("someuser", u.username)
+                    self.assertEqual("foo@bar.com", u.email)
 
-        results = list(it)
-        self.assertEquals(2, len(results))
+                if u.id == "somesuperuser":
+                    self.assertEqual("somesuperuser", u.id)
+                    self.assertEqual("somesuperuser", u.username)
+                    self.assertEqual("superfoo@bar.com", u.email)
 
-        first = results[0][0]
-        second = results[1][0]
+                if u.id == "somerestricteduser":
+                    self.assertEqual("somerestricteduser", u.id)
+                    self.assertEqual("somerestricteduser", u.username)
+                    self.assertEqual("restrictedfoo@bar.com", u.email)
 
-        if first.id == 'testy':
-          testy, someuser = first, second
-        else:
-          testy, someuser = second, first
+                if u.id == "someglobalreadonlysuperuser":
+                    self.assertEqual("someglobalreadonlysuperuser", u.id)
+                    self.assertEqual("someglobalreadonlysuperuser", u.username)
+                    self.assertEqual("globalreadonlysuperuserfoo@bar.com", u.email)
 
-        self.assertEquals('testy', testy.id)
-        self.assertEquals('testy', testy.username)
-        self.assertEquals('bar@baz.com', testy.email)
+    def test_iterate_group_members_with_pagination(self):
+        with mock_ldap() as ldap:
+            for dn in ["cn=AwesomeFolk", "cn=*Guys"]:
+                it, err = ldap.iterate_group_members({"group_dn": dn}, page_size=1)
+                self.assertIsNone(err)
 
-        self.assertEquals('someuser', someuser.id)
-        self.assertEquals('someuser', someuser.username)
-        self.assertEquals('foo@bar.com', someuser.email)
+                results = list(it)
+                self.assertEqual(2, len(results))
 
-  def test_check_group_lookup_args(self):
-    with mock_ldap() as ldap:
-      (result, err) = ldap.check_group_lookup_args({'group_dn': 'cn=invalid'},
-                                                   disable_pagination=True)
-      self.assertFalse(result)
-      self.assertIsNotNone(err)
+                first = results[0][0]
+                second = results[1][0]
 
-      (result, err) = ldap.check_group_lookup_args({'group_dn': 'cn=AwesomeFolk'},
-                                                   disable_pagination=True)
-      self.assertTrue(result)
-      self.assertIsNone(err)
+                if first.id == "testy":
+                    testy, someuser = first, second
+                else:
+                    testy, someuser = second, first
 
-      (result, err) = ldap.check_group_lookup_args({'group_dn': 'cn=*Guys'},
-                                                   disable_pagination=True)
-      self.assertTrue(result)
-      self.assertIsNone(err)
+                self.assertEqual("testy", testy.id)
+                self.assertEqual("testy", testy.username)
+                self.assertEqual("bar@baz.com", testy.email)
 
-  def test_metadata(self):
-    with mock_ldap() as ldap:
-      assert 'base_dn' in ldap.service_metadata()
+                self.assertEqual("someuser", someuser.id)
+                self.assertEqual("someuser", someuser.username)
+                self.assertEqual("foo@bar.com", someuser.email)
+
+    def test_check_group_lookup_args(self):
+        with mock_ldap() as ldap:
+            result, err = ldap.check_group_lookup_args(
+                {"group_dn": "cn=invalid"}, disable_pagination=True
+            )
+            self.assertFalse(result)
+            self.assertIsNotNone(err)
+
+            result, err = ldap.check_group_lookup_args(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertTrue(result)
+            self.assertIsNone(err)
+
+            result, err = ldap.check_group_lookup_args(
+                {"group_dn": "cn=*Guys"}, disable_pagination=True
+            )
+            self.assertTrue(result)
+            self.assertIsNone(err)
+
+    def test_check_group_lookup_args_closes_generator(self):
+        """Verify generator is explicitly closed to release LDAP connection."""
+        with mock_ldap() as ldap_users:
+            generator_closed = [False]
+            original_iterate = ldap_users.iterate_group_members
+
+            class TrackingGenerator:
+                def __init__(self, gen):
+                    self._gen = gen
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    return next(self._gen)
+
+                def close(self):
+                    generator_closed[0] = True
+                    self._gen.close()
+
+            def tracking_iterate(*args, **kwargs):
+                it, err = original_iterate(*args, **kwargs)
+                if it is None:
+                    return (it, err)
+                return (TrackingGenerator(it), err)
+
+            ldap_users.iterate_group_members = tracking_iterate
+
+            result, err = ldap_users.check_group_lookup_args(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertTrue(result)
+            self.assertTrue(generator_closed[0], "Generator was not explicitly closed")
+
+    def test_metadata(self):
+        with mock_ldap() as ldap:
+            assert "base_dn" in ldap.service_metadata()
+
+    def test_at_least_one_user_exists_invalid_creds(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "INVALIDPASSWORD"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
+
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost", base_dn, admin_dn, admin_passwd, user_rdn, uid_attr, email_attr
+            )
+
+            # Try to query with invalid credentials.
+            response, err_msg = ldap.at_least_one_user_exists()
+            self.assertFalse(response)
+            self.assertEqual("LDAP Admin dn or password is invalid", err_msg)
+
+    def test_at_least_one_user_exists_no_users(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "password"
+        user_rdn = ["ou=nonexistent"]
+        uid_attr = "uid"
+        email_attr = "mail"
+
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost", base_dn, admin_dn, admin_passwd, user_rdn, uid_attr, email_attr
+            )
+
+            # Try to find users in a nonexistent group.
+            response, err_msg = ldap.at_least_one_user_exists()
+            self.assertFalse(response)
+            assert err_msg is not None
+
+    def test_at_least_one_user_exists_true(self):
+        with mock_ldap() as ldap:
+            # Ensure we have at least a single user in the valid group
+            response, err_msg = ldap.at_least_one_user_exists()
+            self.assertIsNone(err_msg)
+            self.assertTrue(response)
+
+    def test_verify_credentials_debug_log_masks_password_attributes(self):
+        with mock_ldap() as ldap:
+            with self.assertLogs("data.users.externalldap", level="DEBUG") as logs:
+                response, err_msg = ldap.verify_and_link_user("someuser", "somepass")
+
+        self.assertIsNone(err_msg)
+        self.assertEqual(response.username, "someuser")
+
+        # The debug log keeps all LDAP attributes for debugging, but the values of
+        # password-like attributes (e.g. userPassword) are masked.
+        found_logs = [line for line in logs.output if "DN uid=someuser,ou=employees" in line]
+        self.assertEqual(len(found_logs), 1)
+        self.assertIn("'uid': ['someuser']", found_logs[0])
+        self.assertIn("'mail': ['foo@bar.com']", found_logs[0])
+        self.assertIn("'userPassword': ['******']", found_logs[0])
+        self.assertNotIn("somepass", found_logs[0])
+
+    def test_ldap_memberof_attr(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "password"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
+        memberof_attr = "strangeMemberOf"
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost",
+                base_dn,
+                admin_dn,
+                admin_passwd,
+                user_rdn,
+                uid_attr,
+                email_attr,
+                memberof_attr,
+            )
+            result, err = ldap.check_group_lookup_args(
+                {"group_dn": "cn=StrangeFolk"}, disable_pagination=True
+            )
+            self.assertTrue(result)
+            self.assertIsNone(err)
+
+    def test_ldap_user_filter_format(self):
+        some_user_filter = "(filterField=somevalue)"
+        with mock_ldap(user_filter=some_user_filter) as ldap:
+            search_flt = filter_format("(memberOf=%s,%s)", ("cn=AwesomeFolk", ldap._base_dn))
+            search_flt = ldap._add_user_filter(search_flt)
+            self.assertEqual(
+                search_flt, "(&(memberOf=cn=AwesomeFolk,dc=quay,dc=io)(filterField=somevalue))"
+            )
+
+        some_other_user_filter = some_user_filter + "(filterField2=someothervalue)"
+        with mock_ldap(user_filter=some_other_user_filter) as ldap:
+            search_flt = filter_format("(memberOf=%s,%s)", ("cn=AwesomeFolk", ldap._base_dn))
+            search_flt = ldap._add_user_filter(search_flt)
+            self.assertEqual(
+                search_flt,
+                "(&(memberOf=cn=AwesomeFolk,dc=quay,dc=io)(filterField=somevalue)(filterField2=someothervalue))",
+            )
+
+        some_superuser_filter = "(filterField=somesuperuser)"
+        some_restricted_user_filter = "(filterField=somerestricteduser)"
+        with mock_ldap(
+            user_filter=some_user_filter,
+            superuser_filter=some_superuser_filter,
+            restricted_user_filter=some_restricted_user_filter,
+        ) as ldap:
+            search_flt = filter_format("(memberOf=%s,%s)", ("cn=AwesomeFolk", ldap._base_dn))
+            search_flt = ldap._add_user_filter(search_flt)
+            superuser_search_flt = ldap._add_superuser_filter(search_flt)
+            restricted_user_search_flt = ldap._add_restricted_user_filter(search_flt)
+            self.assertEqual(
+                superuser_search_flt,
+                "(&(&(memberOf=cn=AwesomeFolk,dc=quay,dc=io)(filterField=somevalue))(filterField=somesuperuser))",
+            )
+            self.assertEqual(
+                restricted_user_search_flt,
+                "(&(&(memberOf=cn=AwesomeFolk,dc=quay,dc=io)(filterField=somevalue))(filterField=somerestricteduser))",
+            )
+
+    def test_ldap_user_filtering_no_users(self):
+        no_user_filter = "(filterField=anothervalue)"
+        with mock_ldap(user_filter=no_user_filter) as ldap:
+            # Verify we cannot login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            assert response is None
+
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+
+            results = list(it)
+            self.assertEqual(0, len(results))
+
+    def test_ldap_user_filtering_valid_users(self):
+        valid_user_filter = "(filterField=somevalue)"
+        with mock_ldap(user_filter=valid_user_filter) as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
+
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+
+            results = list(it)
+            self.assertEqual(5, len(results))
+
+    def test_ldap_superuser_and_restricted_user_filtering(self):
+        valid_user_filter = "(filterField=somevalue)"
+        valid_superuser_filter = "(filterField=superuser)"
+        valid_restricted_user_filter = "(filterField=restricted)"
+        valid_global_readonly_user_filter = "(filterField=globalreadonlysuperuser)"
+
+        with mock_ldap(user_filter=valid_user_filter) as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
+
+        with mock_ldap(
+            user_filter=valid_user_filter,
+            superuser_filter=valid_superuser_filter,
+            restricted_user_filter=valid_restricted_user_filter,
+            global_readonly_superuser_filter=valid_global_readonly_user_filter,
+        ) as ldap:
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+
+            results = list(it)
+            self.assertEqual(5, len(results))
+
+            for u in results:
+                user = u[0]
+
+                is_superuser = ldap.is_superuser(user.username)
+                is_restricted_user = ldap.is_restricted_user(user.username)
+                is_global_readonly_superuser = ldap.is_global_readonly_superuser(user.username)
+
+                if user.username == "somesuperuser":
+                    self.assertTrue(is_superuser)
+                    self.assertFalse(is_restricted_user)
+                    self.assertFalse(is_global_readonly_superuser)
+
+                    self.assertEqual("somesuperuser", user.id)
+                    self.assertEqual("somesuperuser", user.username)
+                    self.assertEqual("superfoo@bar.com", user.email)
+
+                elif user.username == "someglobalreadonlysuperuser":
+                    self.assertFalse(is_superuser)
+                    self.assertFalse(is_restricted_user)
+                    self.assertTrue(is_global_readonly_superuser)
+
+                    self.assertEqual("someglobalreadonlysuperuser", user.id)
+                    self.assertEqual("someglobalreadonlysuperuser", user.username)
+                    self.assertEqual("globalreadonlysuperuserfoo@bar.com", user.email)
+
+                elif user.username == "somerestricteduser":
+                    self.assertTrue(is_restricted_user)
+                    self.assertFalse(is_superuser)
+                    self.assertFalse(is_global_readonly_superuser)
+
+                    self.assertEqual("somerestricteduser", user.id)
+                    self.assertEqual("somerestricteduser", user.username)
+                    self.assertEqual("restrictedfoo@bar.com", user.email)
+
+                else:
+                    self.assertFalse(is_superuser)
+                    self.assertFalse(is_global_readonly_superuser)
+                    self.assertFalse(is_restricted_user)
+
+            self.assertTrue(ldap.has_superusers())
+            self.assertTrue(ldap.has_restricted_users())
+
+    def test_ldap_superuser_and_restricted_user_invalid_filter(self):
+        valid_user_filter = "(filterField=somevalue)"
+        invalid_superuser_filter = "(filterField=notsuperuser)"
+        invalid_restricted_user_filter = "(filterField=notrestricted)"
+        invalid_global_readonly_superuser_filter = "(filterField=notglobalreadonlysuperuser)"
+
+        with mock_ldap(user_filter=valid_user_filter) as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
+
+        with mock_ldap(
+            user_filter=valid_user_filter,
+            superuser_filter=invalid_superuser_filter,
+            restricted_user_filter=invalid_restricted_user_filter,
+            global_readonly_superuser_filter=invalid_global_readonly_superuser_filter,
+        ) as ldap:
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+
+            results = list(it)
+            self.assertEqual(5, len(results))
+
+            for u in results:
+                user = u[0]
+
+                is_superuser = ldap.is_superuser(user.username)
+                is_restricted_user = ldap.is_restricted_user(user.username)
+                is_global_readonly_superser = ldap.is_global_readonly_superuser(user.username)
+                self.assertFalse(is_superuser)
+                self.assertFalse(is_restricted_user)
+                self.assertFalse(is_global_readonly_superser)
+
+            self.assertFalse(ldap.has_superusers())
+            self.assertFalse(ldap.has_restricted_users())
+
+    def test_ldap_superuser_and_restricted_user_no_filter_set(self):
+        valid_user_filter = "(filterField=somevalue)"
+        superuser_filter = None
+        restricted_user_filter = None
+        global_readonly_superuser_filter = None
+
+        with mock_ldap(user_filter=valid_user_filter) as ldap:
+            # Verify we can login.
+            response, _ = ldap.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(response.username, "someuser")
+
+        with mock_ldap(
+            user_filter=valid_user_filter,
+            superuser_filter=superuser_filter,
+            restricted_user_filter=restricted_user_filter,
+            global_readonly_superuser_filter=global_readonly_superuser_filter,
+        ) as ldap:
+            it, err = ldap.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+
+            results = list(it)
+            self.assertEqual(5, len(results))
+
+            for u in results:
+                user = u[0]
+
+                is_superuser = ldap.is_superuser(user.username)
+                is_restricted_user = ldap.is_restricted_user(user.username)
+                is_global_readonly_superser = ldap.is_global_readonly_superuser(user.username)
+                self.assertFalse(is_superuser)
+                self.assertFalse(is_global_readonly_superser)
+                self.assertTrue(is_restricted_user)
+
+            self.assertFalse(ldap.has_superusers())
+            self.assertTrue(ldap.has_restricted_users())
+
+    def test_at_least_one_user_exists_filtered(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "password"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
+        memberof_attr = "memberOf"
+        secondary_user_rdns = ["ou=otheremployees"]
+
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost",
+                base_dn,
+                admin_dn,
+                admin_passwd,
+                user_rdn,
+                uid_attr,
+                email_attr,
+                memberof_attr,
+                ldap_user_filter="(filterField=somevalue)",
+            )
+            response, err_msg = ldap.at_least_one_user_exists()
+            self.assertIsNone(err_msg)
+            self.assertTrue(response)
+
+    def test_at_least_one_user_exists_filtered_away(self):
+        base_dn = ["dc=quay", "dc=io"]
+        admin_dn = "uid=testy,ou=employees,dc=quay,dc=io"
+        admin_passwd = "password"
+        user_rdn = ["ou=employees"]
+        uid_attr = "uid"
+        email_attr = "mail"
+        memberof_attr = "memberOf"
+        secondary_user_rdns = ["ou=otheremployees"]
+
+        with mock_ldap():
+            ldap = LDAPUsers(
+                "ldap://localhost",
+                base_dn,
+                admin_dn,
+                admin_passwd,
+                user_rdn,
+                uid_attr,
+                email_attr,
+                memberof_attr,
+                ldap_user_filter="(filterField=someothervalue)",
+            )
+            response, err_msg = ldap.at_least_one_user_exists()
+            self.assertIsNone(err_msg)
+            self.assertFalse(response)
 
 
-  def test_at_least_one_user_exists_invalid_creds(self):
-    base_dn = ['dc=quay', 'dc=io']
-    admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-    admin_passwd = 'INVALIDPASSWORD'
-    user_rdn = ['ou=employees']
-    uid_attr = 'uid'
-    email_attr = 'mail'
+class TestLDAPCache(unittest.TestCase):
+    def setUp(self):
+        setup_database_for_testing(self)
 
-    with mock_ldap():
-      ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                        uid_attr, email_attr)
+    def tearDown(self):
+        finished_database_for_testing(self)
 
-      # Try to query with invalid credentials.
-      (response, err_msg) = ldap.at_least_one_user_exists()
-      self.assertFalse(response)
-      self.assertEquals('LDAP Admin dn or password is invalid', err_msg)
+    def test_cache_disabled_by_default(self):
+        """Test that cache is None when not enabled."""
+        with mock_ldap() as ldap:
+            self.assertIsNone(ldap._cache)
 
-  def test_at_least_one_user_exists_no_users(self):
-    base_dn = ['dc=quay', 'dc=io']
-    admin_dn = 'uid=testy,ou=employees,dc=quay,dc=io'
-    admin_passwd = 'password'
-    user_rdn = ['ou=nonexistent']
-    uid_attr = 'uid'
-    email_attr = 'mail'
+    def test_cache_enabled(self):
+        """Test that cache is created when enabled."""
+        with mock_ldap(superuser_filter="(filterField=superuser)") as ldap:
+            # Default mock_ldap doesn't enable caching, so cache is None
+            self.assertIsNone(ldap._cache)
 
-    with mock_ldap():
-      ldap = LDAPUsers('ldap://localhost', base_dn, admin_dn, admin_passwd, user_rdn,
-                       uid_attr, email_attr)
+        # Test with caching enabled directly
+        from data.users.externalldap import LDAPCache
 
-      # Try to find users in a nonexistent group.
-      (response, err_msg) = ldap.at_least_one_user_exists()
-      self.assertFalse(response)
-      assert err_msg is not None
+        cache = LDAPCache(default_ttl=60)
+        self.assertIsNotNone(cache)
 
-  def test_at_least_one_user_exists_true(self):
-    with mock_ldap() as ldap:
-      # Ensure we have at least a single user in the valid group
-      (response, err_msg) = ldap.at_least_one_user_exists()
-      self.assertIsNone(err_msg)
-      self.assertTrue(response)
+    def test_ldap_cache_basic_operations(self):
+        """Test LDAPCache get/set operations."""
+        from data.users.externalldap import LDAPCache
+
+        cache = LDAPCache(default_ttl=60)
+
+        # Initially empty
+        self.assertIsNone(cache.get("nonexistent"))
+
+        # Set and retrieve
+        cache.set("test_key", True)
+        self.assertTrue(cache.get("test_key"))
+
+        cache.set("false_key", False)
+        self.assertFalse(cache.get("false_key"))
+
+    def test_ldap_cache_expiration(self):
+        """Test that cached entries expire after TTL."""
+        import time
+
+        from data.users.externalldap import LDAPCache
+
+        # Use very short TTL for testing
+        cache = LDAPCache(default_ttl=0.1)
+
+        cache.set("expires_soon", "value")
+        self.assertEqual(cache.get("expires_soon"), "value")
+
+        # Wait for expiration
+        time.sleep(0.15)
+        self.assertIsNone(cache.get("expires_soon"))
+
+    def test_ldap_cache_max_size_eviction(self):
+        """Test that cache evicts entries when max size is reached."""
+        from data.users.externalldap import LDAPCache
+
+        # Small cache for testing
+        cache = LDAPCache(default_ttl=60, max_size=3)
+
+        cache.set("key1", "value1")
+        cache.set("key2", "value2")
+        cache.set("key3", "value3")
+        self.assertEqual(cache.size(), 3)
+
+        # Adding a 4th key should evict one
+        cache.set("key4", "value4")
+        self.assertEqual(cache.size(), 3)
+
+        # The new key should be present
+        self.assertEqual(cache.get("key4"), "value4")
+
+    def test_ldap_cache_size_method(self):
+        """Test the size() method."""
+        from data.users.externalldap import LDAPCache
+
+        cache = LDAPCache(default_ttl=60)
+
+        self.assertEqual(cache.size(), 0)
+        cache.set("key1", "value1")
+        self.assertEqual(cache.size(), 1)
+        cache.set("key2", "value2")
+        self.assertEqual(cache.size(), 2)
+
+    def test_ldap_cache_lru_eviction_order(self):
+        """Test that LRU eviction removes least recently used items."""
+        from data.users.externalldap import LDAPCache
+
+        cache = LDAPCache(default_ttl=60, max_size=3)
+
+        # Add 3 items
+        cache.set("key1", "value1")
+        cache.set("key2", "value2")
+        cache.set("key3", "value3")
+
+        # Access key1 to make it most recently used
+        cache.get("key1")
+
+        # Add key4, should evict key2 (least recently used)
+        cache.set("key4", "value4")
+
+        self.assertEqual(cache.size(), 3)
+        self.assertEqual(cache.get("key1"), "value1")  # Still present
+        self.assertIsNone(cache.get("key2"))  # Evicted
+        self.assertEqual(cache.get("key3"), "value3")  # Still present
+        self.assertEqual(cache.get("key4"), "value4")  # Newly added
+
+    def test_permission_check_uses_cache(self):
+        """Test that permission checks use cache and skip LDAP lookup on cache hit."""
+        from unittest.mock import patch
+
+        with mock_ldap(
+            superuser_filter="(filterField=superuser)", enable_caching=True, cache_ttl=60.0
+        ) as ldap:
+            # First call - should hit LDAP
+            with patch.object(
+                ldap, "_ldap_single_user_search", wraps=ldap._ldap_single_user_search
+            ) as mock_search:
+                result1 = ldap.is_superuser("somesuperuser")
+                self.assertTrue(result1)
+                self.assertEqual(mock_search.call_count, 1)
+
+            # Second call - should use cache, not LDAP
+            with patch.object(ldap, "_ldap_single_user_search") as mock_search:
+                result2 = ldap.is_superuser("somesuperuser")
+                self.assertTrue(result2)
+                mock_search.assert_not_called()
+
+            # Verify cache has the entry
+            self.assertEqual(ldap._cache.size(), 1)
 
 
-if __name__ == '__main__':
-  unittest.main()
+class TestLDAPConnectionPool(unittest.TestCase):
+    def setUp(self):
+        setup_database_for_testing(self)
+        self.app = app.test_client()
+        self.ctx = app.test_request_context()
+        self.ctx.__enter__()
+
+    def tearDown(self):
+        finished_database_for_testing(self)
+        self.ctx.__exit__(True, None, None)
+
+    def test_pool_lazy_init(self):
+        """Pool queue is not created until first get_connection call."""
+        from data.users.externalldap import LDAPConnectionPool
+
+        builder = MagicMock()
+        pool = LDAPConnectionPool(builder, pool_size=5)
+        self.assertIsNone(pool._queue)
+
+    def test_pool_reuses_connections(self):
+        """Connections are returned to pool and reused on next checkout."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            result1, _ = ldap_users.get_user("someuser")
+            self.assertEqual(result1.username, "someuser")
+            self.assertEqual(ldap_users._ldap._total_created, 1)
+
+            result2, _ = ldap_users.get_user("someuser")
+            self.assertEqual(result2.username, "someuser")
+            self.assertEqual(ldap_users._ldap._total_created, 1)
+
+    def test_pool_resilient_after_not_found(self):
+        """Pool still functions correctly after a not-found lookup."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            ldap_users.get_user("someuser")
+
+            result, err = ldap_users.get_user("nonexistentuser")
+            self.assertIsNone(result)
+
+            result2, _ = ldap_users.get_user("someuser")
+            self.assertEqual(result2.username, "someuser")
+
+    def test_pool_verify_credentials_uses_bind_and_revert(self):
+        """verify_credentials routes through pool.verify_bind when pooling is enabled."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            from data.users.externalldap import LDAPConnectionPool
+
+            self.assertIsInstance(ldap_users._ldap, LDAPConnectionPool)
+            with patch.object(
+                ldap_users._ldap, "verify_bind", wraps=ldap_users._ldap.verify_bind
+            ) as mock_vb:
+                result, _ = ldap_users.verify_and_link_user("someuser", "somepass")
+                self.assertEqual(result.username, "someuser")
+                mock_vb.assert_called_once()
+
+    def test_pool_disabled_fallback(self):
+        """With pooling disabled, behavior is identical to LDAPConnectionBuilder."""
+        with mock_ldap(enable_pooling=False) as ldap_users:
+            from data.users.externalldap import LDAPConnectionBuilder
+
+            self.assertIsInstance(ldap_users._ldap, LDAPConnectionBuilder)
+
+            result, _ = ldap_users.get_user("someuser")
+            self.assertEqual(result.username, "someuser")
+
+    def test_pool_iterate_group_members(self):
+        """Team sync iteration works through pooled connections."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            it, err = ldap_users.iterate_group_members(
+                {"group_dn": "cn=AwesomeFolk"}, disable_pagination=True
+            )
+            self.assertIsNone(err)
+            results = list(it)
+            self.assertEqual(5, len(results))
+
+    def test_pool_ping(self):
+        """Ping works through pooled connections."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            ok, err = ldap_users.ping()
+            self.assertTrue(ok)
+            self.assertIsNone(err)
+
+    def test_pool_bind_and_revert_valid(self):
+        """Bind-and-revert verifies valid credentials through the pool."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            result, _ = ldap_users.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(result.username, "someuser")
+
+    def test_pool_bind_and_revert_invalid(self):
+        """Bind-and-revert rejects invalid credentials."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            result, err = ldap_users.verify_and_link_user("someuser", "wrongpass")
+            self.assertIsNone(result)
+            self.assertEqual(err, "Invalid username or password.")
+
+    def test_pool_bind_and_revert_empty_password(self):
+        """Empty password is rejected before reaching the pool."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            result, err = ldap_users.verify_and_link_user("someuser", "")
+            self.assertIsNone(result)
+            self.assertEqual(err, "Anonymous binding not allowed.")
+
+    def test_pool_disabled_uses_direct_connection(self):
+        """With pooling disabled, verify_credentials uses direct LDAPConnection."""
+        with mock_ldap(enable_pooling=False) as ldap_users:
+            result, _ = ldap_users.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(result.username, "someuser")
+
+            result, err = ldap_users.verify_and_link_user("someuser", "wrongpass")
+            self.assertIsNone(result)
+            self.assertEqual(err, "Invalid username or password.")
+
+    def test_pool_bind_and_revert_restores_admin_identity(self):
+        """After bind-and-revert, the pooled connection is rebound as admin
+        and can perform admin searches (not stuck as the user)."""
+        with mock_ldap(enable_pooling=True) as ldap_users:
+            # Login as someuser — this does bind-and-revert internally
+            result, _ = ldap_users.verify_and_link_user("someuser", "somepass")
+            self.assertEqual(result.username, "someuser")
+
+            # Now do an admin operation that requires the admin bind.
+            # If the connection were still bound as someuser, this would
+            # fail because the admin search uses the pooled connection.
+            result2, _ = ldap_users.get_user("testy")
+            self.assertEqual(result2.username, "testy")
+
+            # Do it again with a different user to prove the pool isn't
+            # leaking the first user's identity
+            result3, _ = ldap_users.verify_and_link_user("secondaryuser", "somepass")
+            self.assertEqual(result3.username, "secondaryuser")
+
+            # Admin search still works
+            result4, _ = ldap_users.get_user("someuser")
+            self.assertEqual(result4.username, "someuser")
+
+
+class TestLDAPConnectionPoolEdgeCases(unittest.TestCase):
+    """Tests for pool edge cases that can't be exercised through mockldap alone."""
+
+    def _make_pool(self, pool_size=2, max_wait=0.1, lifetime=300):
+        from data.users.externalldap import LDAPConnectionPool
+
+        builder = MagicMock()
+
+        def make_wrapper():
+            wrapper = MagicMock()
+            wrapper.__enter__ = MagicMock(return_value=MagicMock())
+            return wrapper
+
+        builder.get_connection.side_effect = lambda: make_wrapper()
+        pool = LDAPConnectionPool(
+            builder, pool_size=pool_size, max_wait=max_wait, connection_lifetime=lifetime
+        )
+        return pool, builder
+
+    def test_overflow_when_pool_exhausted(self):
+        """When all connections are checked out and none return in time,
+        an overflow connection is created with a warning."""
+        import time
+
+        from data.users.externalldap import LDAPConnectionPool, _PoolEntry
+
+        pool, builder = self._make_pool(pool_size=2, max_wait=0.1)
+
+        # Fill pool to capacity
+        conn1 = pool._checkout()
+        conn2 = pool._checkout()
+        self.assertEqual(pool._total_created, 2)
+
+        # Next checkout should wait, timeout, and create overflow
+        overflow = pool._checkout()
+        self.assertTrue(overflow.is_overflow)
+        self.assertEqual(pool._total_created, 3)
+
+        # Return overflow — it should be discarded, not pooled
+        pool._return(overflow)
+        self.assertEqual(pool._total_created, 2)
+
+        # Return the real ones
+        pool._return(conn1)
+        pool._return(conn2)
+
+    def test_lifetime_rotation_on_checkout(self):
+        """Expired connections are discarded and replaced on checkout."""
+        import time
+
+        from data.users.externalldap import _PoolEntry
+
+        pool, builder = self._make_pool(pool_size=2, lifetime=1)
+
+        # Create and return a connection
+        entry = pool._checkout()
+        pool._return(entry)
+
+        # Simulate time passing beyond lifetime
+        queued = pool._queue.get()
+        queued.created_at = time.monotonic() - 100
+        queued.lifetime_jitter = 1.0
+        pool._queue.put(queued)
+
+        # Next checkout should rotate it
+        new_entry = pool._checkout()
+        self.assertIsNot(new_entry.conn, queued.conn)
+
+    def test_lifetime_rotation_on_return(self):
+        """Expired connections are discarded on return, not put back in pool."""
+        import time
+
+        from data.users.externalldap import _PoolEntry
+
+        pool, builder = self._make_pool(pool_size=2, lifetime=1)
+
+        entry = pool._checkout()
+        entry.created_at = time.monotonic() - 100
+        entry.lifetime_jitter = 1.0
+
+        pool._return(entry)
+        self.assertTrue(pool._queue.empty())
+
+    def test_health_check_replaces_dead_connection(self):
+        """Idle connections that fail health check are replaced."""
+        import time
+
+        from data.users.externalldap import _PoolEntry
+
+        pool, builder = self._make_pool(pool_size=2)
+
+        entry = pool._checkout()
+        pool._return(entry)
+
+        # Simulate idle > 30s
+        queued = pool._queue.get()
+        queued.last_used = time.monotonic() - 60
+        queued.conn.search_s.side_effect = Exception("connection dead")
+        pool._queue.put(queued)
+
+        # Checkout should detect dead connection and create new one
+        new_entry = pool._checkout()
+        self.assertIsNot(new_entry.conn, queued.conn)
+
+    def test_verify_bind_admin_rebind_failure_discards_connection(self):
+        """If admin rebind fails after valid user bind, connection is discarded."""
+        pool, builder = self._make_pool(pool_size=2)
+
+        entry = pool._checkout()
+        pool._return(entry)
+
+        conn = pool._queue.get()
+        bind_call_count = [0]
+        original_conn = conn.conn
+
+        def side_effect_bind(dn, pw):
+            bind_call_count[0] += 1
+            if bind_call_count[0] == 2:
+                raise ldap.SERVER_DOWN("connection lost")
+
+        original_conn.simple_bind_s = MagicMock(side_effect=side_effect_bind)
+        pool._queue.put(conn)
+
+        # verify_bind should succeed (user bind works) but discard the connection
+        result = pool.verify_bind("uid=user,dc=test", "pass")
+        self.assertTrue(result)
+        self.assertTrue(pool._queue.empty())
+
+    def test_verify_bind_invalid_creds_rebind_failure_discards(self):
+        """If admin rebind fails after invalid user bind, connection is discarded."""
+        pool, builder = self._make_pool(pool_size=2)
+
+        entry = pool._checkout()
+        pool._return(entry)
+
+        conn = pool._queue.get()
+        original_conn = conn.conn
+        bind_call_count = [0]
+
+        def side_effect_bind(dn, pw):
+            bind_call_count[0] += 1
+            if bind_call_count[0] == 1:
+                raise ldap.INVALID_CREDENTIALS("wrong password")
+            raise ldap.SERVER_DOWN("connection lost during rebind")
+
+        original_conn.simple_bind_s = MagicMock(side_effect=side_effect_bind)
+        pool._queue.put(conn)
+
+        result = pool.verify_bind("uid=user,dc=test", "wrongpass")
+        self.assertFalse(result)
+        self.assertTrue(pool._queue.empty())
+
+    def test_verify_bind_connection_error_discards_and_raises(self):
+        """If user bind raises a connection error, connection is discarded
+        and the error is propagated."""
+        pool, builder = self._make_pool(pool_size=2)
+
+        entry = pool._checkout()
+        pool._return(entry)
+
+        conn = pool._queue.get()
+        conn.conn.simple_bind_s = MagicMock(side_effect=ldap.SERVER_DOWN("gone"))
+        pool._queue.put(conn)
+
+        with self.assertRaises(ldap.SERVER_DOWN):
+            pool.verify_bind("uid=user,dc=test", "pass")
+        self.assertTrue(pool._queue.empty())
+
+    def test_discard_handles_unbind_exception(self):
+        """_discard swallows exceptions from unbind_s."""
+        from data.users.externalldap import _PoolEntry
+
+        pool, builder = self._make_pool()
+        entry = _PoolEntry(conn=MagicMock())
+        entry.conn.unbind_s.side_effect = Exception("already closed")
+
+        pool._total_created = 1
+        pool._discard(entry)
+        self.assertEqual(pool._total_created, 0)
+
+    def test_context_manager_discards_on_exception(self):
+        """Connection is discarded (not returned) when an exception occurs
+        inside the context manager."""
+        pool, builder = self._make_pool(pool_size=2)
+
+        entry = pool._checkout()
+        pool._return(entry)
+        self.assertFalse(pool._queue.empty())
+
+        try:
+            with pool.get_connection():
+                raise ldap.SERVER_DOWN("simulated failure")
+        except ldap.SERVER_DOWN:
+            pass
+
+        self.assertTrue(pool._queue.empty())
+
+
+class TestLDAPPasswordRedaction(unittest.TestCase):
+    """
+    Unit tests for password redaction
+    """
+
+    _HEADER = (
+        "*** <ldap.ldapobject.SimpleLDAPObject object at 0x7f> "
+        "ldaps://ldap.example.com - SimpleLDAPObject.simple_bind"
+    )
+
+    def _make_bind_trace(self, dn, password):
+        """Multi-line pprint format (some python-ldap versions)."""
+        return (
+            f"*** <ldap.ldapobject.SimpleLDAPObject object at 0x7f> "
+            f"ldaps://ldap.example.com - SimpleLDAPObject.simple_bind\n"
+            f"(('{dn}',\n"
+            f"  '{password}',\n"
+            f"  None,\n"
+            f"  None),\n"
+            f" {{}})\n"
+        )
+
+    def _make_bind_trace_pprint(self, dn, password):
+        """Use real pprint.pformat to produce the trace, matching python-ldap."""
+        args = (dn, password, None, None)
+        return self._HEADER + "\n" + pprint.pformat((args, {})) + "\n"
+
+    def test_redacts_simple_password(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace("uid=user,dc=example", "s3cret"))
+        output = buf.getvalue()
+
+        self.assertNotIn("s3cret", output)
+        self.assertIn("******", output)
+        self.assertIn("uid=user,dc=example", output)
+
+    def test_redacts_complex_password(self):
+        buf = StringIO()
+        super_secret_password = "QUAY_FIXTURE_ONLY-#HRx-u9r>W+?.?QTtN_X"
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace("uid=user,dc=example", super_secret_password))
+        output = buf.getvalue()
+
+        self.assertNotIn(super_secret_password, output)
+        self.assertIn("******", output)
+        self.assertIn("uid=user,dc=example", output)
+
+    def test_redacts_passwords_with_escaped_quotes(self):
+        buf = StringIO()
+        super_secret_password = "pa'ssword"
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace_pprint("uid=user,dc=example", super_secret_password))
+        output = buf.getvalue()
+
+        self.assertNotIn(super_secret_password, output)
+        self.assertIn("******", output)
+        self.assertIn("uid=user,dc=example", output)
+
+    def test_redacts_single_line_trace(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        trace = (
+            "*** <SimpleLDAPObject 0x3ff76a67e30> "
+            "ldap://openldap.example.com:389 - SimpleLDAPObject.simple_bind\n"
+            "(('cn=admin,dc=quay,dc=io', 'password', None, None), {})"
+        )
+        redactor.write(trace)
+        output = buf.getvalue()
+
+        self.assertNotIn("'password'", output)
+        self.assertIn("******", output)
+        self.assertIn("cn=admin,dc=quay,dc=io", output)
+
+    def test_redacts_single_line_complex_password(self):
+        buf = StringIO()
+        secret = "QUAY_FIXTURE_ONLY-#HRx-u9r>W+?.?QTtN_X"
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        trace = (
+            "*** <SimpleLDAPObject 0x3ff76a67e30> "
+            "ldap://openldap.example.com:389 - SimpleLDAPObject.simple_bind\n"
+            f"(('cn=admin,dc=quay,dc=io', '{secret}', None, None), {{}})"
+        )
+        redactor.write(trace)
+        output = buf.getvalue()
+
+        self.assertNotIn(secret, output)
+        self.assertIn("******", output)
+
+    def test_redacts_dn_with_single_quote(self):
+        """When DN contains an apostrophe, pprint double-quotes it."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace_pprint("cn=O'Brien,dc=quay,dc=io", "MySecret"))
+        output = buf.getvalue()
+
+        self.assertNotIn("MySecret", output)
+        self.assertIn("******", output)
+
+    def test_redacts_dn_with_quote_and_pw_with_quote(self):
+        """Both DN and password contain single quotes (pprint double-quotes both)."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace_pprint("cn=O'Brien,dc=quay,dc=io", "pa'ssword"))
+        output = buf.getvalue()
+
+        self.assertNotIn("pa'ssword", output)
+        self.assertIn("******", output)
+
+    def test_redacts_password_with_double_quote(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace_pprint("cn=admin,dc=quay,dc=io", 'pa"ssword'))
+        output = buf.getvalue()
+
+        self.assertNotIn('pa"ssword', output)
+        self.assertIn("******", output)
+
+    def test_redacts_password_with_both_quotes(self):
+        """Password contains both ' and \" — pprint uses escaped single quotes."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._make_bind_trace_pprint("cn=admin,dc=quay,dc=io", "p'a\"ss"))
+        output = buf.getvalue()
+
+        self.assertNotIn("p'a", output)
+        self.assertIn("******", output)
+
+    def test_redacts_pprint_real_output(self):
+        """Use real pprint.pformat to verify redaction matches actual python-ldap output."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        cases = [
+            ("cn=admin,dc=quay,dc=io", "S3cret!"),
+            ("cn=admin,dc=quay,dc=io", "pa'ssword"),
+            ("cn=O'Brien,dc=quay,dc=io", "MySecret"),
+            ("cn=O'Brien,dc=quay,dc=io", "pa'ssword"),
+            ("cn=admin,dc=quay,dc=io", 'pa"ssword'),
+            ("cn=admin,dc=quay,dc=io", "pass\\word"),
+        ]
+        for dn, pw in cases:
+            buf.truncate(0)
+            buf.seek(0)
+            redactor.write(self._make_bind_trace_pprint(dn, pw))
+            output = buf.getvalue()
+            self.assertNotIn(pw, output, f"Password leaked for DN={dn}, PW={pw}")
+            self.assertIn("******", output, f"No redaction marker for DN={dn}, PW={pw}")
+
+    def _make_search_result_trace(self, result):
+        """Use real pprint.pformat to produce a search result trace, matching python-ldap."""
+        header = (
+            "*** <ldap.ldapobject.SimpleLDAPObject object at 0x3ff99b968d0> "
+            "ldap://10.250.64.5 - SimpleLDAPObject.result4"
+        )
+        return header + "\n=> result:\n" + pprint.pformat(result) + "\n"
+
+    def test_redacts_password_attribute_in_search_result(self):
+        """Search results may include userPassword hashes; they must be redacted."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        password_hash = (
+            b"{PBKDF2-SHA512}100000$ONCjgRfWvEhfL/+DIV23CIyBKfozw7jp$c"
+            b"/pkgmsLAoC0TnaWmG2bMgcPNB9xEsD93Oi+ylA9u6SNF56VdS06BpPbN"
+            b"83G45HXxXZATONCPqqWF+bRawIavA=="
+        )
+        result = [
+            (
+                "uid=testldap99,ou=users,dc=quay,dc=io",
+                {
+                    "uid": [b"testldap99"],
+                    "mail": [b"testldap99@quay.io"],
+                    "userPassword": [password_hash],
+                },
+            )
+        ]
+        redactor.write(self._make_search_result_trace(result))
+        output = buf.getvalue()
+
+        self.assertNotIn(password_hash.decode("utf-8"), output)
+        self.assertNotIn("PBKDF2", output)
+        self.assertIn("'userPassword': [b'******']", output)
+        # Non-sensitive attributes are preserved.
+        self.assertIn("testldap99", output)
+        self.assertIn("testldap99@quay.io", output)
+
+    def test_redacts_unicode_pwd_attribute_in_search_result(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        result = [("cn=user,dc=example", {"unicodePwd": [b"someadpassword"]})]
+        redactor.write(self._make_search_result_trace(result))
+        output = buf.getvalue()
+
+        self.assertNotIn("someadpassword", output)
+        self.assertIn("'unicodePwd': [b'******']", output)
+
+    def test_redacts_password_attribute_with_quote_in_value(self):
+        """A value containing a quote is double-quoted by pprint."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        secret = "pa'ssword"
+        result = [("uid=user,dc=example", {"userPassword": [secret]})]
+        redactor.write(self._make_search_result_trace(result))
+        output = buf.getvalue()
+
+        self.assertNotIn(secret, output)
+        self.assertIn("'userPassword': [b'******']", output)
+
+    def test_redacts_multiple_password_attribute_values(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        result = [("uid=user,dc=example", {"userPassword": ["first", "second"], "uid": ["user"]})]
+        redactor.write(self._make_search_result_trace(result))
+        output = buf.getvalue()
+
+        self.assertNotIn("'first'", output)
+        self.assertNotIn("'second'", output)
+        self.assertIn("'userPassword': [b'******']", output)
+        self.assertIn("'uid': ['user']", output)
+
+    def test_search_result_without_password_attributes_unchanged(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        result = [("uid=user,dc=example", {"uid": [b"user"], "mail": [b"user@example.com"]})]
+        trace = self._make_search_result_trace(result)
+        redactor.write(trace)
+
+        self.assertEqual(buf.getvalue(), trace)
+
+    def test_redacts_password_attribute_across_search_and_bind(self):
+        """A trace containing both a bind and a search result redacts both."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        result = [("uid=user,dc=example", {"userPassword": [b"hashvalue"]})]
+        redactor.write(self._make_bind_trace_pprint("cn=admin,dc=quay,dc=io", "adminsecret"))
+        redactor.write(self._make_search_result_trace(result))
+        output = buf.getvalue()
+
+        self.assertNotIn("adminsecret", output)
+        self.assertNotIn("hashvalue", output)
+
+    def test_password_attribute_regex_no_exponential_backtracking(self):
+        """Regression test for CodeQL py/redos: many empty literals after a
+        password-like key, with no closing bracket, must not cause
+        exponential backtracking in the value pattern."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        # With an ambiguous separator this input takes ~4x longer per added
+        # repetition (11s at n=25, effectively a hang beyond n~30).
+        pathological = "'userPassword': [\"\" " + '"" ' * 1000
+        redactor.write(pathological)
+        output = buf.getvalue()
+
+        self.assertIn("userPassword", output)
+
+    def test_redacts_split_write_header_then_args(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._HEADER)
+        self.assertEqual(buf.getvalue(), "")
+
+        redactor.write("\n(('cn=admin,dc=quay,dc=io', 'S3cret!P@ss', None, None), {})\n")
+        output = buf.getvalue()
+
+        self.assertNotIn("S3cret!P@ss", output)
+        self.assertIn("******", output)
+        self.assertIn("cn=admin,dc=quay,dc=io", output)
+
+    def test_redacts_split_write_header_plus_partial_dn(self):
+        """Split after the DN but before the password."""
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        redactor.write(self._HEADER + "\n(('cn=admin,dc=quay,dc=io', ")
+        self.assertEqual(buf.getvalue(), "")
+
+        redactor.write("'S3cret!P@ss', None, None), {})\n")
+        output = buf.getvalue()
+
+        self.assertNotIn("S3cret!P@ss", output)
+        self.assertIn("******", output)
+
+    def test_flush_emits_buffered_header(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        header = (
+            "*** <SimpleLDAPObject 0x3ff76a67e30> "
+            "ldap://openldap.example.com:389 - SimpleLDAPObject.simple_bind"
+        )
+        redactor.write(header)
+        self.assertEqual(buf.getvalue(), "")
+
+        redactor.flush()
+        self.assertIn("SimpleLDAPObject.simple_bind", buf.getvalue())
+
+    def test_non_bind_trace_not_buffered(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        search_trace = "*** <ldap...> - SimpleLDAPObject.search_ext\n(('dc=example',), {})\n"
+        redactor.write(search_trace)
+
+        self.assertEqual(buf.getvalue(), search_trace)
+
+    def test_trace_pass_unchanged(self):
+        buf = StringIO()
+        redactor = _LDAPTraceRedactor(stream=buf)
+
+        search_trace = "*** <ldap...> - SimpleLDAPObject.search_ext\n(('dc=example',), {})\n"
+        redactor.write(search_trace)
+
+        self.assertEqual(buf.getvalue(), search_trace)
+
+    def test_flush_delegates_to_stream(self):
+        mock_stream = MagicMock()
+        redactor = _LDAPTraceRedactor(stream=mock_stream)
+        redactor.flush()
+
+        mock_stream.flush.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

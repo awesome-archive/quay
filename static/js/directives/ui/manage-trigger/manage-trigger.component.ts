@@ -19,17 +19,20 @@ export class ManageTriggerComponent implements OnChanges {
   @Input('<') public repository: Repository;
   @Input('<') public trigger: Trigger;
 
-  @Output() public activateTrigger: EventEmitter<{config: TriggerConfig, pull_robot?: any}> = new EventEmitter();
+  @Output() public activateTrigger: EventEmitter<{ config: TriggerConfig, pull_robot?: any }> = new EventEmitter();
 
   public config: TriggerConfig;
   public local: Local = {
-    selectedRepository: {name: ''},
+    selectedRepository: { name: '' },
     hasValidDockerfilePath: false,
     dockerfileLocations: [],
-    triggerOptions: {},
-    namespaceOptions: {filter: '', predicate: 'score', reverse: false, page: 0},
-    repositoryOptions: {filter: '', predicate: 'score', reverse: false, page: 0, hideStale: true},
-    robotOptions: {filter: '', predicate: 'score', reverse: false, page: 0},
+    triggerOptions: {
+      'tag_templates': []
+    },
+    namespaceOptions: { filter: '', predicate: 'score', reverse: false, page: 0 },
+    repositoryOptions: { filter: '', predicate: 'score', reverse: false, page: 0, hideStale: true },
+    robotOptions: { filter: '', predicate: 'score', reverse: false, page: 0 },
+    currentTagTemplate: null
   };
 
   private namespacesPerPage: number = 10;
@@ -42,11 +45,12 @@ export class ManageTriggerComponent implements OnChanges {
   private githubTriggerClientId: string;
 
   constructor(@Inject('ApiService') private apiService: any,
-              @Inject('TableService') private tableService: any,
-              @Inject('TriggerService') private triggerService: any,
-              @Inject('RolesService') private rolesService: any,
-              @Inject('KeyService') private keyService: any,
-              @Inject('$scope') private $scope: ng.IScope) {
+    @Inject('TableService') private tableService: any,
+    @Inject('TriggerService') private triggerService: any,
+    @Inject('RolesService') private rolesService: any,
+    @Inject('KeyService') private keyService: any,
+    @Inject('DocumentationService') private DocumentationService: any,
+    @Inject('$scope') private $scope: ng.IScope) {
     this.githubTriggerEndpoint = keyService['githubTriggerEndpoint'];
     this.githubTriggerClientId = keyService['githubTriggerClientId'];
   }
@@ -121,13 +125,13 @@ export class ManageTriggerComponent implements OnChanges {
         dockerfile_path: path.substr(1),
         context: context
       };
-      const data = {config: config};
+      const data = { config: config };
 
       // Try to analyze git repository, fall back to retrieving all namespace's robots
       this.apiService.analyzeBuildTrigger(data, params)
         .then((resp) => {
           if (resp['status'] === 'notimplemented') {
-            return this.apiService.getRobots(this.repository.namespace, null, {'permissions': true, 'token': false});
+            return this.apiService.getRobots(this.repository.namespace, null, { 'permissions': true, 'token': false });
           } else {
             this.local.triggerAnalysis = Object.assign({}, resp);
           }
@@ -164,8 +168,12 @@ export class ManageTriggerComponent implements OnChanges {
       config.branchtag_regex = this.local.triggerOptions['branchTagFilter'];
     }
 
+    config.default_tag_from_ref = this.local.triggerOptions['default_tag_from_ref'];
+    config.latest_for_default_branch = this.local.triggerOptions['latest_for_default_branch'];
+    config.tag_templates = this.local.triggerOptions['tag_templates'] || null;
+
     const activate = () => {
-      this.activateTrigger.emit({config: config, pull_robot: Object.assign({}, this.local.robotAccount)});
+      this.activateTrigger.emit({ config: config, pull_robot: Object.assign({}, this.local.robotAccount) });
     };
 
     if (this.local.triggerAnalysis.status == 'requiresrobot' && this.local.robotAccount) {
@@ -173,7 +181,7 @@ export class ManageTriggerComponent implements OnChanges {
         activate();
       } else {
         // Add read permission onto the base repository for the robot and then activate the trigger.
-        const baseRepo: any = {name: this.local.triggerAnalysis.name, namespace: this.local.triggerAnalysis.namespace};
+        const baseRepo: any = { name: this.local.triggerAnalysis.name, namespace: this.local.triggerAnalysis.namespace };
         this.rolesService.setRepositoryRole(baseRepo, 'read', 'robot', this.local.robotAccount.name, activate);
       }
     } else {
@@ -251,7 +259,10 @@ export class ManageTriggerComponent implements OnChanges {
     this.local.selectedRepository = null;
     this.local.repositoryRefs = null;
     this.local.triggerOptions = {
-      'hasBranchTagFilter': false
+      'hasBranchTagFilter': false,
+      'default_tag_from_ref': true,
+      'latest_for_default_branch': true,
+      'tag_templates': []
     };
 
     this.local.orderedRepositories = null;
@@ -273,10 +284,29 @@ export class ManageTriggerComponent implements OnChanges {
     }, this.apiService.errorDisplay('Could not retrieve repositories'));
   }
 
+  private addTagTemplate(): void {
+    if (!this.local.currentTagTemplate) {
+      return;
+    }
+
+    this.local.triggerOptions['tag_templates'].push(this.local.currentTagTemplate);
+    this.local.currentTagTemplate = null;
+  }
+
+  private removeTagTemplate(template: string): void {
+    var opts = this.local.triggerOptions;
+    opts['tag_templates'] = opts['tag_templates'].filter(function (item) {
+      return item != template;
+    });
+  }
+
   private loadRepositoryRefs(repository: any): void {
     this.local.repositoryRefs = null;
     this.local.triggerOptions = {
-      'hasBranchTagFilter': false
+      'hasBranchTagFilter': false,
+      'default_tag_from_ref': true,
+      'latest_for_default_branch': true,
+      'tag_templates': []
     };
 
     const params = {
@@ -313,7 +343,7 @@ export class ManageTriggerComponent implements OnChanges {
       'repository': this.repository.namespace + '/' + this.repository.name,
       'trigger_uuid': this.trigger.id
     };
-    const config: TriggerConfig = {build_source: repository.full_name};
+    const config: TriggerConfig = { build_source: repository.full_name };
 
     this.apiService.listBuildTriggerSubdirs(config, params)
       .then((resp) => {

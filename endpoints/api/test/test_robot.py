@@ -1,104 +1,636 @@
-import pytest
 import json
+from unittest.mock import Mock, patch
+
+import pytest
+import requests
 
 from data import model
+from data.database import FederatedLogin
+from data.model import api_token
 from endpoints.api import api
+from endpoints.api.robot import (
+    OrgRobot,
+    OrgRobotFederation,
+    OrgRobotList,
+    UserRobot,
+    UserRobotFederation,
+    UserRobotList,
+    _parse_federation_config,
+)
 from endpoints.api.test.shared import conduct_api_call
-from endpoints.api.robot import UserRobot, OrgRobot, UserRobotList, OrgRobotList
 from endpoints.test.shared import client_with_identity
+from test.fixtures import *
+from test.test_ldap import mock_ldap
 from util.names import parse_robot_username
 
-from test.test_ldap import mock_ldap
 
-from test.fixtures import *
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        UserRobot,
+        OrgRobot,
+    ],
+)
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {},
+        {"description": "this is a description"},
+        {"unstructured_metadata": {"foo": "bar"}},
+        {"description": "this is a description", "unstructured_metadata": {"foo": "bar"}},
+    ],
+)
+def test_create_robot_with_metadata(endpoint, body, app):
+    with client_with_identity("devtable", app) as cl:
+        # Create the robot with the specified body.
+        conduct_api_call(
+            cl,
+            endpoint,
+            "PUT",
+            {"orgname": "buynlarge", "robot_shortname": "somebot"},
+            body,
+            expected_code=201,
+        )
 
-@pytest.mark.parametrize('endpoint', [
-  UserRobot,
-  OrgRobot,
-])
-@pytest.mark.parametrize('body', [
-  {},
-  {'description': 'this is a description'},
-  {'unstructured_metadata': {'foo': 'bar'}},
-  {'description': 'this is a description', 'unstructured_metadata': {'foo': 'bar'}},
-])
-def test_create_robot_with_metadata(endpoint, body, client):
-  with client_with_identity('devtable', client) as cl:
-    # Create the robot with the specified body.
-    conduct_api_call(cl, endpoint, 'PUT', {'orgname': 'buynlarge', 'robot_shortname': 'somebot'},
-                     body, expected_code=201)
+        # Ensure the create succeeded.
+        resp = conduct_api_call(
+            cl,
+            endpoint,
+            "GET",
+            {
+                "orgname": "buynlarge",
+                "robot_shortname": "somebot",
+            },
+        )
 
-    # Ensure the create succeeded.
-    resp = conduct_api_call(cl, endpoint, 'GET', {
-      'orgname': 'buynlarge',
-      'robot_shortname': 'somebot',
-    })
-
-    body = body or {}
-    assert resp.json['description'] == (body.get('description') or '')
-    assert resp.json['unstructured_metadata'] == (body.get('unstructured_metadata') or {})
+        body = body or {}
+        assert resp.json["description"] == (body.get("description") or "")
+        assert resp.json["unstructured_metadata"] == (body.get("unstructured_metadata") or {})
 
 
-@pytest.mark.parametrize('endpoint, params', [
-  (UserRobot, {'robot_shortname': 'dtrobot'}),
-  (OrgRobot, {'orgname': 'buynlarge', 'robot_shortname': 'coolrobot'}),
-])
-def test_retrieve_robot(endpoint, params, app, client):
-  with client_with_identity('devtable', client) as cl:
-    result = conduct_api_call(cl, endpoint, 'GET', params, None)
-    assert result.json['token'] is not None
+@pytest.mark.parametrize(
+    "endpoint, params",
+    [
+        (UserRobot, {"robot_shortname": "dtrobot"}),
+        (OrgRobot, {"orgname": "buynlarge", "robot_shortname": "coolrobot"}),
+    ],
+)
+def test_retrieve_robot(endpoint, params, app):
+    with client_with_identity("devtable", app) as cl:
+        result = conduct_api_call(cl, endpoint, "GET", params, None)
+        assert result.json["token"] is not None
 
 
-@pytest.mark.parametrize('endpoint, params, bot_endpoint', [
-  (UserRobotList, {}, UserRobot),
-  (OrgRobotList, {'orgname': 'buynlarge'}, OrgRobot),
-])
-@pytest.mark.parametrize('include_token', [
-  True,
-  False,
-])
-@pytest.mark.parametrize('limit', [
-  None,
-  1,
-  5,
-])
-def test_retrieve_robots(endpoint, params, bot_endpoint, include_token, limit, app, client):
-  params['token'] = 'true' if include_token else 'false'
-
-  if limit is not None:
-    params['limit'] = limit
-
-  with client_with_identity('devtable', client) as cl:
-    result = conduct_api_call(cl, endpoint, 'GET', params, None)
+@pytest.mark.parametrize(
+    "endpoint, params, bot_endpoint",
+    [
+        (UserRobotList, {}, UserRobot),
+        (OrgRobotList, {"orgname": "buynlarge"}, OrgRobot),
+    ],
+)
+@pytest.mark.parametrize(
+    "include_token",
+    [
+        True,
+        False,
+    ],
+)
+@pytest.mark.parametrize(
+    "limit",
+    [
+        None,
+        1,
+        5,
+    ],
+)
+def test_retrieve_robots(endpoint, params, bot_endpoint, include_token, limit, app):
+    params["token"] = "true" if include_token else "false"
 
     if limit is not None:
-      assert len(result.json['robots']) <= limit
+        params["limit"] = limit
 
-    for robot in result.json['robots']:
-      assert (robot.get('token') is not None) == include_token
-      if include_token:
-        bot_params = dict(params)
-        bot_params['robot_shortname'] = parse_robot_username(robot['name'])[1]
-        result = conduct_api_call(cl, bot_endpoint, 'GET', bot_params, None)
-        assert robot.get('token') == result.json['token']
+    with client_with_identity("devtable", app) as cl:
+        result = conduct_api_call(cl, endpoint, "GET", params, None)
+
+        if limit is not None:
+            assert len(result.json["robots"]) <= limit
+
+        for robot in result.json["robots"]:
+            assert (robot.get("token") is not None) == include_token
+            if include_token:
+                bot_params = dict(params)
+                bot_params["robot_shortname"] = parse_robot_username(robot["name"])[1]
+                result = conduct_api_call(cl, bot_endpoint, "GET", bot_params, None)
+                assert robot.get("token") == result.json["token"]
 
 
-@pytest.mark.parametrize('username, is_admin', [
-  ('devtable', True),
-  ('reader', False),
-])
-@pytest.mark.parametrize('with_permissions', [
-  True,
-  False,
-])
-def test_retrieve_robots_token_permission(username, is_admin, with_permissions, app, client):
-  with client_with_identity(username, client) as cl:
-    params = {'orgname': 'buynlarge', 'token': 'true'}
-    if with_permissions:
-      params['permissions'] = 'true'
+@pytest.mark.parametrize(
+    "username, is_admin",
+    [
+        ("devtable", True),
+        ("reader", False),
+    ],
+)
+@pytest.mark.parametrize(
+    "with_permissions",
+    [
+        True,
+        False,
+    ],
+)
+def test_retrieve_robots_token_permission(username, is_admin, with_permissions, app):
+    with client_with_identity(username, app) as cl:
+        params = {"orgname": "buynlarge", "token": "true"}
+        if with_permissions:
+            params["permissions"] = "true"
 
-    result = conduct_api_call(cl, OrgRobotList, 'GET', params, None)
-    assert result.json['robots']
-    for robot in result.json['robots']:
-      assert (robot.get('token') is not None) == is_admin
-      assert (robot.get('repositories') is not None) == (is_admin and with_permissions)
+        result = conduct_api_call(cl, OrgRobotList, "GET", params, None)
+        assert result.json["robots"]
+        for robot in result.json["robots"]:
+            assert (robot.get("token") is not None) == is_admin
+            assert (robot.get("repositories") is not None) == (is_admin and with_permissions)
+
+
+def test_duplicate_robot_creation(app):
+    with client_with_identity("devtable", app) as cl:
+        resp = conduct_api_call(
+            cl,
+            UserRobot,
+            "PUT",
+            {"robot_shortname": "dtrobot"},
+            expected_code=400,
+        )
+        assert resp.json["error_message"] == "Existing robot with name: devtable+dtrobot"
+
+        resp = conduct_api_call(
+            cl,
+            OrgRobot,
+            "PUT",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            expected_code=400,
+        )
+        assert resp.json["error_message"] == "Existing robot with name: buynlarge+coolrobot"
+
+
+def test_robot_api_token_cannot_create_nested_robot(app):
+    parent = model.user.lookup_robot("devtable+dtrobot")
+    creator = model.user.get_user("devtable")
+    _, secret = api_token.create_token_under_limit(
+        parent, creator, "user:admin", 3600, "Nested robot creation"
+    )
+
+    with app.test_client() as cl:
+        response = conduct_api_call(
+            cl,
+            UserRobot,
+            "PUT",
+            {"robot_shortname": "nested"},
+            {},
+            expected_code=400,
+            headers={"Authorization": "Bearer " + secret},
+        )
+
+    assert response.json["error_message"] == "Robot accounts cannot own robot accounts"
+    with pytest.raises(model.InvalidRobotException):
+        model.user.lookup_robot("devtable+dtrobot+nested")
+
+
+def test_globalreadonlysuperuser_org_robot_list_hides_token(app):
+    with client_with_identity("globalreadonlysuperuser", app) as cl:
+        result = conduct_api_call(
+            cl, OrgRobotList, "GET", {"orgname": "buynlarge", "token": "true"}, None
+        )
+        assert result.json["robots"]
+        for robot in result.json["robots"]:
+            assert robot.get("token") is None
+
+
+def test_globalreadonlysuperuser_org_robot_list_permissions(app):
+    with client_with_identity("globalreadonlysuperuser", app) as cl:
+        result = conduct_api_call(
+            cl,
+            OrgRobotList,
+            "GET",
+            {"orgname": "buynlarge", "token": "true", "permissions": "true"},
+            None,
+        )
+        assert result.json["robots"]
+        for robot in result.json["robots"]:
+            assert robot.get("token") is None
+            assert "teams" in robot
+            assert "repositories" in robot
+
+
+def test_globalreadonlysuperuser_org_robot_get_hides_token(app):
+    with client_with_identity("globalreadonlysuperuser", app) as cl:
+        result = conduct_api_call(
+            cl,
+            OrgRobot,
+            "GET",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            None,
+        )
+        assert result.json["name"] == "buynlarge+coolrobot"
+        assert result.json.get("token") is None
+
+
+def test_org_admin_still_sees_robot_token(app):
+    with client_with_identity("devtable", app) as cl:
+        result = conduct_api_call(
+            cl, OrgRobotList, "GET", {"orgname": "buynlarge", "token": "true"}, None
+        )
+        assert result.json["robots"]
+        for robot in result.json["robots"]:
+            assert robot.get("token") is not None
+
+        result = conduct_api_call(
+            cl,
+            OrgRobot,
+            "GET",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            None,
+        )
+        assert result.json["token"] is not None
+
+
+def test_full_access_superuser_sees_robot_token(app):
+    with patch(
+        "auth.permissions.usermanager.is_superuser", lambda username: username == "freshuser"
+    ):
+        with client_with_identity("freshuser", app) as cl:
+            result = conduct_api_call(
+                cl, OrgRobotList, "GET", {"orgname": "buynlarge", "token": "true"}, None
+            )
+            assert result.json["robots"]
+            for robot in result.json["robots"]:
+                assert robot.get("token") is not None
+
+            result = conduct_api_call(
+                cl,
+                OrgRobot,
+                "GET",
+                {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+                None,
+            )
+            assert result.json["token"] is not None
+
+
+def test_robot_federation_create(app):
+    with client_with_identity("devtable", app) as cl:
+        # Create the robot with the specified body.
+        conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "POST",
+            {
+                "orgname": "buynlarge",
+                "robot_shortname": "coolrobot",
+            },
+            [{"issuer": "https://issuer1", "subject": "subject1"}],
+            expected_code=200,
+        )
+
+        # Ensure the create succeeded.
+        resp = conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "GET",
+            {
+                "orgname": "buynlarge",
+                "robot_shortname": "coolrobot",
+            },
+            expected_code=200,
+        )
+
+        assert len(resp.json) == 1
+        assert resp.json[0].get("issuer") == "https://issuer1"
+        assert resp.json[0].get("subject") == "subject1"
+
+        resp = conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "DELETE",
+            {
+                "orgname": "buynlarge",
+                "robot_shortname": "coolrobot",
+            },
+            expected_code=204,
+        )
+
+        resp = conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "GET",
+            {
+                "orgname": "buynlarge",
+                "robot_shortname": "coolrobot",
+            },
+            expected_code=200,
+        )
+
+        assert len(resp.json) == 0
+
+
+def test_user_robot_federation_create(app):
+    with client_with_identity("devtable", app) as cl:
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            {"robot_shortname": "dtrobot"},
+            [{"issuer": "https://issuer1", "subject": "subject1"}],
+            expected_code=200,
+        )
+
+        resp = conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "GET",
+            {"robot_shortname": "dtrobot"},
+            expected_code=200,
+        )
+
+        assert len(resp.json) == 1
+        assert resp.json[0].get("issuer") == "https://issuer1"
+        assert resp.json[0].get("subject") == "subject1"
+
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "DELETE",
+            {"robot_shortname": "dtrobot"},
+            expected_code=204,
+        )
+
+        resp = conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "GET",
+            {"robot_shortname": "dtrobot"},
+            expected_code=200,
+        )
+
+        assert len(resp.json) == 0
+
+
+def test_user_robot_federation_does_not_reuse_deleted_binding_id(app):
+    with client_with_identity("devtable", app) as cl:
+        params = {"robot_shortname": "dtrobot"}
+        response = conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            params,
+            [{"issuer": "https://issuer1", "subject": "subject1"}],
+            expected_code=200,
+        )
+        deleted_binding_id = response.json[0]["id"]
+
+        conduct_api_call(cl, UserRobotFederation, "DELETE", params, expected_code=204)
+
+        response = conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            params,
+            [
+                {
+                    "id": deleted_binding_id,
+                    "issuer": "https://issuer2",
+                    "subject": "subject2",
+                }
+            ],
+            expected_code=200,
+        )
+        assert response.json[0]["id"] != deleted_binding_id
+
+
+def test_user_robot_federation_multiple_configs(app):
+    with client_with_identity("devtable", app) as cl:
+        fed_config = [
+            {"issuer": "https://issuer1", "subject": "subject1"},
+            {"issuer": "https://issuer2", "subject": "subject2"},
+        ]
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            {"robot_shortname": "dtrobot"},
+            fed_config,
+            expected_code=200,
+        )
+
+        resp = conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "GET",
+            {"robot_shortname": "dtrobot"},
+            expected_code=200,
+        )
+
+        assert len(resp.json) == 2
+
+
+LEGACY_FEDERATION_BINDINGS = [
+    {
+        "issuer": "https://issuer.example",
+        "subject": "system:serviceaccount:ci:builder-a",
+        "audiences": ["quay"],
+        "api_scopes": "repo:read",
+    },
+    {
+        "issuer": "https://issuer.example",
+        "subject": "system:serviceaccount:ci:builder-b",
+        "audiences": ["quay"],
+    },
+]
+
+
+def _store_legacy_federation_config(robot, bindings):
+    """Write bindings in the pre-id JSON shape (no id, no version) straight into the row."""
+    federated = FederatedLogin.get(FederatedLogin.user == robot)
+    federated.metadata_json = json.dumps({"federation_config": bindings})
+    federated.save()
+
+
+def test_user_robot_federation_legacy_bindings_get_stable_ids(app):
+    # PROJQUAY-13549: legacy bindings are listed with ids, saved with them, and removed by them.
+    robot = model.user.lookup_robot("devtable+dtrobot")
+    _store_legacy_federation_config(robot, [dict(b) for b in LEGACY_FEDERATION_BINDINGS])
+    params = {"robot_shortname": "dtrobot"}
+
+    with client_with_identity("devtable", app) as cl:
+        loaded = conduct_api_call(cl, UserRobotFederation, "GET", params, expected_code=200).json
+        assert [binding.get("version") for binding in loaded] == [1, 1]
+        assert all(binding.get("id") for binding in loaded)
+        assert len({binding["id"] for binding in loaded}) == 2
+
+        # Saving what was loaded persists exactly those ids.
+        saved = conduct_api_call(
+            cl, UserRobotFederation, "POST", params, loaded, expected_code=200
+        ).json
+        assert saved == loaded
+        assert (
+            conduct_api_call(cl, UserRobotFederation, "GET", params, expected_code=200).json
+            == saved
+        )
+
+        # Keeping only the second binding removes the first and keeps the second's id.
+        retained = conduct_api_call(
+            cl, UserRobotFederation, "POST", params, [saved[1]], expected_code=200
+        ).json
+        assert retained == [saved[1]]
+        assert (
+            conduct_api_call(cl, UserRobotFederation, "GET", params, expected_code=200).json
+            == retained
+        )
+
+
+def test_user_robot_federation_rejects_null_binding_id(app):
+    # Guard for the strict schema: a null id is never accepted, the server assigns ids.
+    with client_with_identity("devtable", app) as cl:
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            {"robot_shortname": "dtrobot"},
+            [{"id": None, "issuer": "https://issuer1", "subject": "subject1"}],
+            expected_code=400,
+        )
+
+
+def test_user_robot_federation_invalid_issuer(app):
+    with client_with_identity("devtable", app) as cl:
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            {"robot_shortname": "dtrobot"},
+            [{"issuer": "not-a-url", "subject": "subject1"}],
+            expected_code=400,
+        )
+
+
+def test_user_robot_federation_empty_config(app):
+    with client_with_identity("devtable", app) as cl:
+        conduct_api_call(
+            cl,
+            UserRobotFederation,
+            "POST",
+            {"robot_shortname": "dtrobot"},
+            [{}],
+            expected_code=400,
+        )
+
+
+def test_org_robot_federation_unauthorized_reader(app):
+    with client_with_identity("reader", app) as cl:
+        conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "GET",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            expected_code=403,
+        )
+
+        conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "POST",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            [{"issuer": "https://issuer1", "subject": "subject1"}],
+            expected_code=403,
+        )
+
+        conduct_api_call(
+            cl,
+            OrgRobotFederation,
+            "DELETE",
+            {"orgname": "buynlarge", "robot_shortname": "coolrobot"},
+            expected_code=403,
+        )
+
+
+@pytest.mark.parametrize(
+    "fed_config, raises_error, error_message",
+    [
+        (
+            [{"issuer": "issuer1", "subject": "subject1"}],
+            True,
+            "Issuer must be a URL (http:// or https://)",
+        ),
+        ([{"issuer": "https://issuer1", "subject": "subject1"}], False, None),
+        (
+            [{"bad_key": "issuer1", "subject": "subject1"}],
+            True,
+            "Missing one or more required fields",
+        ),
+        (
+            [{"issuer": "https://issuer1", "subject": "subject1"}, {}],
+            True,
+            "Missing one or more required fields",
+        ),
+        (
+            [
+                {"issuer": "https://issuer1", "subject": "subject1"},
+                {"issuer": "https://issuer2", "subject": "subject1"},
+                {"issuer": "https://issuer1", "subject": "subject1"},
+            ],
+            True,
+            "Duplicate federation config entry",
+        ),
+        (
+            [
+                {"id": "binding", "issuer": "https://issuer1", "subject": "subject1"},
+                {"id": "binding", "issuer": "https://issuer2", "subject": "subject2"},
+            ],
+            True,
+            "Duplicate federation config entry",
+        ),
+    ],
+)
+def test_parse_federation_config(app, fed_config, raises_error, error_message):
+    request = Mock(requests.Request)
+    request.json = fed_config
+
+    with app.app_context():
+        if raises_error:
+            with pytest.raises(Exception) as ex:
+                parsed = _parse_federation_config(request)
+            assert error_message in str(ex.value)
+        else:
+            _parse_federation_config(request)
+
+
+def test_parse_federation_config_defaults_and_preserves_audiences(app):
+    request = Mock(requests.Request)
+    request.json = [
+        {
+            "issuer": "https://issuer1",
+            "subject": "subject1",
+            "api_scopes": "repo:read",
+            "audiences": ["quay", "ci"],
+        },
+        {"issuer": "https://issuer2", "subject": "subject2"},
+    ]
+
+    with app.app_context():
+        assert _parse_federation_config(request) == [
+            {
+                "issuer": "https://issuer1",
+                "subject": "subject1",
+                "api_scopes": "repo:read",
+                "audiences": ["quay", "ci"],
+            },
+            {"issuer": "https://issuer2", "subject": "subject2", "audiences": ["quay"]},
+        ]
+
+
+@pytest.mark.parametrize("audiences", [[], [""], "quay"])
+def test_parse_federation_config_rejects_invalid_audiences(app, audiences):
+    request = Mock(requests.Request)
+    request.json = [{"issuer": "https://issuer1", "subject": "subject1", "audiences": audiences}]
+
+    with app.app_context(), pytest.raises(Exception, match="Audiences must be a non-empty list"):
+        _parse_federation_config(request)

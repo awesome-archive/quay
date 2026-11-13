@@ -1,0 +1,121 @@
+import {
+  Form,
+  FormGroup,
+  FormHelperText,
+  HelperText,
+  HelperTextItem,
+  TextInput,
+} from '@patternfly/react-core';
+import ExclamationCircleIcon from '@patternfly/react-icons/dist/esm/icons/exclamation-circle-icon';
+import {useEffect, useState} from 'react';
+
+type validate = 'success' | 'error' | 'default';
+
+export default function NameAndDescription(props: NameAndDescriptionProps) {
+  const [validatedName, setValidatedName] = useState<validate>('default');
+  const [nameHelperText, setNameHelperText] = useState(props.nameHelperText);
+
+  // validate description
+  const [validatedDescription, setValidatedDescription] =
+    useState<validate>('default');
+
+  const handleDescriptionChange = (desc: string) => {
+    props.setDescription(desc);
+    setValidatedDescription(desc.length > 255 ? 'error' : 'default');
+  };
+
+  const handleNameChange = (robotName: string) => {
+    props.setName(robotName);
+    setNameHelperText('Validating...');
+  };
+
+  useEffect(() => {
+    if (props.name == '') {
+      setValidatedName('default');
+      setNameHelperText(props.nameHelperText);
+      return;
+    }
+    if (props.validateName()) {
+      setValidatedName('success');
+    } else {
+      setValidatedName('error');
+    }
+    setNameHelperText(props.nameHelperText);
+  }, [props.name]);
+
+  return (
+    <Form>
+      <FormGroup label={props.nameLabel} fieldId="form-name" isRequired>
+        <TextInput
+          data-testid="robot-wizard-form-name"
+          isRequired
+          type="text"
+          id="robot-wizard-form-name"
+          name="form-name"
+          value={props.name}
+          onChange={(_event, robotName: string) => handleNameChange(robotName)}
+          validated={validatedName}
+          aria-describedby="name-helper"
+          aria-invalid={validatedName === 'error'}
+        />
+
+        <FormHelperText>
+          <HelperText>
+            <HelperTextItem
+              id="name-helper"
+              variant={validatedName}
+              {...(validatedName === 'error' && {
+                icon: <ExclamationCircleIcon />,
+              })}
+            >
+              {nameHelperText}
+            </HelperTextItem>
+          </HelperText>
+        </FormHelperText>
+      </FormGroup>
+      <FormGroup label={props.descriptionLabel} fieldId="form-description">
+        <TextInput
+          data-testid="robot-wizard-form-description"
+          type="text"
+          id="robot-wizard-form-description"
+          name="form-description"
+          value={props.description}
+          onChange={(_event, robotDescription: string) =>
+            handleDescriptionChange(robotDescription)
+          }
+          validated={validatedDescription}
+          aria-describedby="description-helper"
+          aria-invalid={validatedDescription === 'error'}
+        />
+
+        <FormHelperText>
+          <HelperText>
+            <HelperTextItem
+              id="description-helper"
+              variant={validatedDescription}
+              {...(validatedDescription === 'error' && {
+                icon: <ExclamationCircleIcon />,
+              })}
+            >
+              {validatedDescription === 'error'
+                ? 'Description must not exceed 255 characters.'
+                : props.helperText}
+            </HelperTextItem>
+          </HelperText>
+        </FormHelperText>
+      </FormGroup>
+    </Form>
+  );
+}
+
+interface NameAndDescriptionProps {
+  name: string;
+  setName: (robotName) => void;
+  description: string;
+  setDescription: (robotDescription) => void;
+  nameLabel: string;
+  descriptionLabel: string;
+  helperText: string;
+  nameHelperText: string;
+  validateName: () => boolean;
+}

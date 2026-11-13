@@ -20,13 +20,10 @@ angular.module('quay').directive('labelView', function () {
         return '';
       };
 
-      $scope.viewLabelValue = function() {
-        bootbox.alert({
-          size: "small",
-          title: $scope.label.key,
-          message: '<pre>' + $sanitize($scope.label.value.replace('<', '&lt;').replace('>', '&gt;')) + '</pre>'
-        });
+      $scope.isUrl = function(value) {
+        return value && value.indexOf('https:') == 0;
       };
+
     }
   };
 });

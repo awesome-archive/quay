@@ -1,274 +1,659 @@
-""" Manage user and organization robot accounts. """
+"""
+Manage user and organization robot accounts.
+"""
 
-from endpoints.api import (resource, nickname, ApiResource, log_action, related_user_resource,
-                           require_user_admin, require_scope, path_param, parse_args,
-                           truthy_bool, query_param, validate_json_request, max_json_size)
-from endpoints.api.robot_models_pre_oci import pre_oci_model as model
-from endpoints.exception import Unauthorized
-from auth.permissions import AdministerOrganizationPermission, OrganizationMemberPermission
-from auth.auth_context import get_authenticated_user
-from auth import scopes
-from util.names import format_robot_username
+import json
+import logging
+
 from flask import abort, request
 
+import features
+from auth import scopes
+from auth.auth_context import get_authenticated_user
+from auth.permissions import (
+    AdministerOrganizationPermission,
+    OrganizationMemberPermission,
+)
+from data.database import FederatedLogin, LoginService
+from data.model import InvalidRobotException
+from data.model.api_token import validate_api_scope_string
+from data.model.user import (
+    attach_federated_login,
+    create_federated_user,
+    create_robot_federation_config,
+    delete_robot_federation_config,
+    get_robot_federation_config,
+    lookup_robot,
+)
+from endpoints.api import (
+    ApiResource,
+    allow_if_any_superuser,
+    allow_if_global_readonly_superuser,
+    allow_if_superuser,
+    allow_if_superuser_with_full_access,
+    log_action,
+    max_json_size,
+    nickname,
+    parse_args,
+    path_param,
+    query_param,
+    related_user_resource,
+    request_error,
+    require_scope,
+    require_user_admin,
+    resource,
+    validate_json_request,
+)
+from endpoints.api.organization_application_tokens import _can_mint_scope
+from endpoints.api.robot_models_pre_oci import pre_oci_model as model
+from endpoints.exception import Unauthorized
+from util.names import format_robot_username
+from util.parsing import truthy_bool
 
 CREATE_ROBOT_SCHEMA = {
-  'type': 'object',
-  'description': 'Optional data for creating a robot',
-  'properties': {
-    'description': {
-      'type': 'string',
-      'description': 'Optional text description for the robot',
-      'maxLength': 255,
+    "type": "object",
+    "description": "Optional data for creating a robot",
+    "properties": {
+        "description": {
+            "type": "string",
+            "description": "Optional text description for the robot",
+            "maxLength": 255,
+        },
+        "unstructured_metadata": {
+            "type": "object",
+            "description": "Optional unstructured metadata for the robot",
+        },
     },
-    'unstructured_metadata': {
-      'type': 'object',
-      'description': 'Optional unstructured metadata for the robot',
-    },
-  },
 }
 
-ROBOT_MAX_SIZE = 1024 * 1024 # 1 KB.
+CREATE_ROBOT_FEDERATION_SCHEMA = {
+    "type": "array",
+    "description": "Federation configuration for the robot",
+    "items": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Stable identifier of an existing federation binding",
+            },
+            "issuer": {
+                "type": "string",
+                "description": "The issuer of the token",
+            },
+            "subject": {
+                "type": "string",
+                "description": "The subject of the token",
+            },
+            "api_scopes": {
+                "type": "string",
+                "description": "Optional Management API scopes allowed for this workload identity",
+            },
+            "audiences": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "description": "OIDC token audiences allowed for this workload identity",
+            },
+        },
+        "required": ["issuer", "subject"],
+    },
+}
+
+ROBOT_MAX_SIZE = 1024 * 1024  # 1 KB.
+
+
+def _validate_federation_scopes(namespace, federation_config):
+    creator = get_authenticated_user()
+    for binding in federation_config:
+        scope = binding.get("api_scopes", "")
+        if not scope:
+            continue
+        if not isinstance(scope, str) or not validate_api_scope_string(scope):
+            abort(400, "Invalid federation API scope")
+        if scopes.SUPERUSER in scopes.scopes_from_scope_string(scope) and not features.SUPER_USERS:
+            abort(400, "super:user scope is disabled")
+        if not _can_mint_scope(namespace, scope, creator):
+            raise Unauthorized()
+
+
+logger = logging.getLogger(__name__)
 
 
 def robots_list(prefix, include_permissions=False, include_token=False, limit=None):
-  robots = model.list_entity_robot_permission_teams(prefix, limit=limit,
-                                                    include_token=include_token,
-                                                    include_permissions=include_permissions)
-  return {'robots': [robot.to_dict(include_token=include_token) for robot in robots]}
+    robots = model.list_entity_robot_permission_teams(
+        prefix, limit=limit, include_token=include_token, include_permissions=include_permissions
+    )
+    return {"robots": [robot.to_dict(include_token=include_token) for robot in robots]}
 
 
-@resource('/v1/user/robots')
+@resource("/v1/user/robots")
 class UserRobotList(ApiResource):
-  """ Resource for listing user robots. """
+    """
+    Resource for listing user robots.
+    """
 
-  @require_user_admin
-  @nickname('getUserRobots')
-  @parse_args()
-  @query_param('permissions',
-               'Whether to include repositories and teams in which the robots have permission.',
-               type=truthy_bool, default=False)
-  @query_param('token',
-               'If false, the robot\'s token is not returned.',
-               type=truthy_bool, default=True)
-  @query_param('limit',
-               'If specified, the number of robots to return.',
-               type=int, default=None)
-  def get(self, parsed_args):
-    """ List the available robots for the user. """
-    user = get_authenticated_user()
-    return robots_list(user.username, include_token=parsed_args.get('token', True),
-                       include_permissions=parsed_args.get('permissions', False),
-                       limit=parsed_args.get('limit'))
+    @require_user_admin()
+    @nickname("getUserRobots")
+    @parse_args()
+    @query_param(
+        "permissions",
+        "Whether to include repositories and teams in which the robots have permission.",
+        type=truthy_bool,
+        default=False,
+    )
+    @query_param(
+        "token", "If false, the robot's token is not returned.", type=truthy_bool, default=True
+    )
+    @query_param("limit", "If specified, the number of robots to return.", type=int, default=None)
+    def get(self, parsed_args):
+        """
+        List the available robots for the user.
+        """
+        user = get_authenticated_user()
+        return robots_list(
+            user.username,
+            include_token=parsed_args.get("token", True),
+            include_permissions=parsed_args.get("permissions", False),
+            limit=parsed_args.get("limit"),
+        )
 
 
-@resource('/v1/user/robots/<robot_shortname>')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
+@resource("/v1/user/robots/<robot_shortname>")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
 class UserRobot(ApiResource):
-  """ Resource for managing a user's robots. """
-  schemas = {
-    'CreateRobot': CREATE_ROBOT_SCHEMA,
-  }
+    """
+    Resource for managing a user's robots.
+    """
 
-  @require_user_admin
-  @nickname('getUserRobot')
-  def get(self, robot_shortname):
-    """ Returns the user's robot with the specified name. """
-    parent = get_authenticated_user()
-    robot = model.get_user_robot(robot_shortname, parent)
-    return robot.to_dict(include_metadata=True, include_token=True)
-
-  @require_user_admin
-  @nickname('createUserRobot')
-  @max_json_size(ROBOT_MAX_SIZE)
-  @validate_json_request('CreateRobot', optional=True)
-  def put(self, robot_shortname):
-    """ Create a new user robot with the specified name. """
-    parent = get_authenticated_user()
-    create_data = request.get_json() or {}
-    robot = model.create_user_robot(robot_shortname, parent, create_data.get('description'),
-                                    create_data.get('unstructured_metadata'))
-    log_action('create_robot', parent.username, {
-      'robot': robot_shortname,
-      'description': create_data.get('description'),
-      'unstructured_metadata': create_data.get('unstructured_metadata'),
-    })
-    return robot.to_dict(include_metadata=True, include_token=True), 201
-
-  @require_user_admin
-  @nickname('deleteUserRobot')
-  def delete(self, robot_shortname):
-    """ Delete an existing robot. """
-    parent = get_authenticated_user()
-    model.delete_robot(format_robot_username(parent.username, robot_shortname))
-    log_action('delete_robot', parent.username, {'robot': robot_shortname})
-    return '', 204
-
-
-@resource('/v1/organization/<orgname>/robots')
-@path_param('orgname', 'The name of the organization')
-@related_user_resource(UserRobotList)
-class OrgRobotList(ApiResource):
-  """ Resource for listing an organization's robots. """
-
-  @require_scope(scopes.ORG_ADMIN)
-  @nickname('getOrgRobots')
-  @parse_args()
-  @query_param('permissions',
-               'Whether to include repostories and teams in which the robots have permission.',
-               type=truthy_bool, default=False)
-  @query_param('token',
-               'If false, the robot\'s token is not returned.',
-               type=truthy_bool, default=True)
-  @query_param('limit',
-               'If specified, the number of robots to return.',
-               type=int, default=None)
-  def get(self, orgname, parsed_args):
-    """ List the organization's robots. """
-    permission = OrganizationMemberPermission(orgname)
-    if permission.can():
-      include_token = (AdministerOrganizationPermission(orgname).can() and
-                       parsed_args.get('token', True))
-      include_permissions = (AdministerOrganizationPermission(orgname).can() and
-                             parsed_args.get('permissions', False))
-      return robots_list(orgname, include_permissions=include_permissions,
-                         include_token=include_token,
-                         limit=parsed_args.get('limit'))
-
-    raise Unauthorized()
-
-
-@resource('/v1/organization/<orgname>/robots/<robot_shortname>')
-@path_param('orgname', 'The name of the organization')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
-@related_user_resource(UserRobot)
-class OrgRobot(ApiResource):
-  """ Resource for managing an organization's robots. """
-  schemas = {
-    'CreateRobot': CREATE_ROBOT_SCHEMA,
-  }
-
-  @require_scope(scopes.ORG_ADMIN)
-  @nickname('getOrgRobot')
-  def get(self, orgname, robot_shortname):
-    """ Returns the organization's robot with the specified name. """
-    permission = AdministerOrganizationPermission(orgname)
-    if permission.can():
-      robot = model.get_org_robot(robot_shortname, orgname)
-      return robot.to_dict(include_metadata=True, include_token=True)
-
-    raise Unauthorized()
-
-  @require_scope(scopes.ORG_ADMIN)
-  @nickname('createOrgRobot')
-  @max_json_size(ROBOT_MAX_SIZE)
-  @validate_json_request('CreateRobot', optional=True)
-  def put(self, orgname, robot_shortname):
-    """ Create a new robot in the organization. """
-    permission = AdministerOrganizationPermission(orgname)
-    if permission.can():
-      create_data = request.get_json() or {}
-      robot = model.create_org_robot(robot_shortname, orgname, create_data.get('description'),
-                                     create_data.get('unstructured_metadata'))
-      log_action('create_robot', orgname, {
-        'robot': robot_shortname,
-        'description': create_data.get('description'),
-        'unstructured_metadata': create_data.get('unstructured_metadata'),
-      })
-      return robot.to_dict(include_metadata=True, include_token=True), 201
-
-    raise Unauthorized()
-
-  @require_scope(scopes.ORG_ADMIN)
-  @nickname('deleteOrgRobot')
-  def delete(self, orgname, robot_shortname):
-    """ Delete an existing organization robot. """
-    permission = AdministerOrganizationPermission(orgname)
-    if permission.can():
-      model.delete_robot(format_robot_username(orgname, robot_shortname))
-      log_action('delete_robot', orgname, {'robot': robot_shortname})
-      return '', 204
-
-    raise Unauthorized()
-
-
-@resource('/v1/user/robots/<robot_shortname>/permissions')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
-class UserRobotPermissions(ApiResource):
-  """ Resource for listing the permissions a user's robot has in the system. """
-
-  @require_user_admin
-  @nickname('getUserRobotPermissions')
-  def get(self, robot_shortname):
-    """ Returns the list of repository permissions for the user's robot. """
-    parent = get_authenticated_user()
-    robot = model.get_user_robot(robot_shortname, parent)
-    permissions = model.list_robot_permissions(robot.name)
-
-    return {
-      'permissions': [permission.to_dict() for permission in permissions]
+    schemas = {
+        "CreateRobot": CREATE_ROBOT_SCHEMA,
     }
 
+    @require_user_admin()
+    @nickname("getUserRobot")
+    def get(self, robot_shortname):
+        """
+        Returns the user's robot with the specified name.
+        """
+        parent = get_authenticated_user()
+        robot = model.get_user_robot(robot_shortname, parent)
+        return robot.to_dict(include_metadata=True, include_token=True)
 
-@resource('/v1/organization/<orgname>/robots/<robot_shortname>/permissions')
-@path_param('orgname', 'The name of the organization')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
+    @require_user_admin(disallow_for_restricted_users=True)
+    @nickname("createUserRobot")
+    @max_json_size(ROBOT_MAX_SIZE)
+    @validate_json_request("CreateRobot", optional=True)
+    def put(self, robot_shortname):
+        """
+        Create a new user robot with the specified name.
+        """
+        parent = get_authenticated_user()
+        if parent.robot:
+            raise request_error(message="Robot accounts cannot own robot accounts")
+
+        create_data = request.get_json(silent=True) or {}
+
+        try:
+            robot = model.create_user_robot(
+                robot_shortname,
+                parent,
+                create_data.get("description"),
+                create_data.get("unstructured_metadata"),
+            )
+        except InvalidRobotException as e:
+            raise request_error(message=str(e))
+        log_action(
+            "create_robot",
+            parent.username,
+            {
+                "robot": robot_shortname,
+                "description": create_data.get("description"),
+                "unstructured_metadata": create_data.get("unstructured_metadata"),
+            },
+        )
+        return robot.to_dict(include_metadata=True, include_token=True), 201
+
+    @require_user_admin(disallow_for_restricted_users=True)
+    @nickname("deleteUserRobot")
+    def delete(self, robot_shortname):
+        """
+        Delete an existing robot.
+        """
+        parent = get_authenticated_user()
+        robot_username = format_robot_username(parent.username, robot_shortname)
+
+        if not model.robot_has_mirror(robot_username):
+            model.delete_robot(robot_username)
+            log_action("delete_robot", parent.username, {"robot": robot_shortname})
+            return "", 204
+        else:
+            raise request_error(message="Robot is being used by a mirror")
+
+
+@resource("/v1/organization/<orgname>/robots")
+@path_param("orgname", "The name of the organization")
+@related_user_resource(UserRobotList)
+class OrgRobotList(ApiResource):
+    """
+    Resource for listing an organization's robots.
+    """
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("getOrgRobots")
+    @parse_args()
+    @query_param(
+        "permissions",
+        "Whether to include repostories and teams in which the robots have permission.",
+        type=truthy_bool,
+        default=False,
+    )
+    @query_param(
+        "token", "If false, the robot's token is not returned.", type=truthy_bool, default=True
+    )
+    @query_param("limit", "If specified, the number of robots to return.", type=int, default=None)
+    def get(self, orgname, parsed_args):
+        """
+        List the organization's robots.
+        """
+        permission = OrganizationMemberPermission(orgname)
+        # Global readonly superusers can always view, regular superusers need FULL_ACCESS
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
+        ):
+            is_org_admin = AdministerOrganizationPermission(orgname).can()
+            is_full_access_superuser = features.SUPERUSERS_FULL_ACCESS and allow_if_superuser()
+            include_token = (is_org_admin or is_full_access_superuser) and parsed_args.get(
+                "token", True
+            )
+            include_permissions = (
+                is_org_admin or is_full_access_superuser or allow_if_global_readonly_superuser()
+            ) and parsed_args.get("permissions", False)
+            result = robots_list(
+                orgname,
+                include_permissions=include_permissions,
+                include_token=include_token,
+                limit=parsed_args.get("limit"),
+            )
+            return result
+
+        raise Unauthorized()
+
+
+@resource("/v1/organization/<orgname>/robots/<robot_shortname>")
+@path_param("orgname", "The name of the organization")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
+@related_user_resource(UserRobot)
+class OrgRobot(ApiResource):
+    """
+    Resource for managing an organization's robots.
+    """
+
+    schemas = {
+        "CreateRobot": CREATE_ROBOT_SCHEMA,
+    }
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("getOrgRobot")
+    def get(self, orgname, robot_shortname):
+        """
+        Returns the organization's robot with the specified name.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        is_org_admin = permission.can()
+        if (
+            is_org_admin
+            or allow_if_global_readonly_superuser()
+            or (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
+        ):
+            robot = model.get_org_robot(robot_shortname, orgname)
+            include_token = is_org_admin or (
+                features.SUPERUSERS_FULL_ACCESS and allow_if_superuser()
+            )
+            result = robot.to_dict(include_metadata=True, include_token=include_token)
+            return result
+
+        raise Unauthorized()
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("createOrgRobot")
+    @max_json_size(ROBOT_MAX_SIZE)
+    @validate_json_request("CreateRobot", optional=True)
+    def put(self, orgname, robot_shortname):
+        """
+        Create a new robot in the organization.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if permission.can() or allow_if_superuser_with_full_access():
+            create_data = request.get_json(silent=True) or {}
+
+            try:
+                robot = model.create_org_robot(
+                    robot_shortname,
+                    orgname,
+                    create_data.get("description"),
+                    create_data.get("unstructured_metadata"),
+                )
+            except InvalidRobotException as e:
+                raise request_error(message=str(e))
+            log_action(
+                "create_robot",
+                orgname,
+                {
+                    "robot": robot_shortname,
+                    "description": create_data.get("description"),
+                    "unstructured_metadata": create_data.get("unstructured_metadata"),
+                },
+            )
+            return robot.to_dict(include_metadata=True, include_token=True), 201
+
+        raise Unauthorized()
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("deleteOrgRobot")
+    def delete(self, orgname, robot_shortname):
+        """
+        Delete an existing organization robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if permission.can() or allow_if_superuser_with_full_access():
+            robot_username = format_robot_username(orgname, robot_shortname)
+            if not model.robot_has_mirror(robot_username):
+                model.delete_robot(robot_username)
+                log_action("delete_robot", orgname, {"robot": robot_shortname})
+                return "", 204
+            else:
+                raise request_error(message="Robot is being used by a mirror")
+
+        raise Unauthorized()
+
+
+@resource("/v1/user/robots/<robot_shortname>/permissions")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
+class UserRobotPermissions(ApiResource):
+    """
+    Resource for listing the permissions a user's robot has in the system.
+    """
+
+    @require_user_admin()
+    @nickname("getUserRobotPermissions")
+    def get(self, robot_shortname):
+        """
+        Returns the list of repository permissions for the user's robot.
+        """
+        parent = get_authenticated_user()
+        robot = model.get_user_robot(robot_shortname, parent)
+        permissions = model.list_robot_permissions(robot.name)
+
+        return {"permissions": [permission.to_dict() for permission in permissions]}
+
+
+@resource("/v1/organization/<orgname>/robots/<robot_shortname>/permissions")
+@path_param("orgname", "The name of the organization")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
 @related_user_resource(UserRobotPermissions)
 class OrgRobotPermissions(ApiResource):
-  """ Resource for listing the permissions an org's robot has in the system. """
+    """
+    Resource for listing the permissions an org's robot has in the system.
+    """
 
-  @require_user_admin
-  @nickname('getOrgRobotPermissions')
-  def get(self, orgname, robot_shortname):
-    """ Returns the list of repository permissions for the org's robot. """
-    permission = AdministerOrganizationPermission(orgname)
-    if permission.can():
-      robot = model.get_org_robot(robot_shortname, orgname)
-      permissions = model.list_robot_permissions(robot.name)
+    @require_user_admin()
+    @nickname("getOrgRobotPermissions")
+    def get(self, orgname, robot_shortname):
+        """
+        Returns the list of repository permissions for the org's robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        # Global readonly superusers can always view, regular superusers need FULL_ACCESS
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
+        ):
+            robot = model.get_org_robot(robot_shortname, orgname)
+            permissions = model.list_robot_permissions(robot.name)
 
-      return {
-        'permissions': [permission.to_dict() for permission in permissions]
-      }
+            return {"permissions": [permission.to_dict() for permission in permissions]}
 
-    abort(403)
+        abort(403)
 
 
-@resource('/v1/user/robots/<robot_shortname>/regenerate')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
+@resource("/v1/user/robots/<robot_shortname>/regenerate")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
 class RegenerateUserRobot(ApiResource):
-  """ Resource for regenerate an organization's robot's token. """
+    """
+    Resource for regenerate an organization's robot's token.
+    """
 
-  @require_user_admin
-  @nickname('regenerateUserRobotToken')
-  def post(self, robot_shortname):
-    """ Regenerates the token for a user's robot. """
-    parent = get_authenticated_user()
-    robot = model.regenerate_user_robot_token(robot_shortname, parent)
-    log_action('regenerate_robot_token', parent.username, {'robot': robot_shortname})
-    return robot.to_dict(include_token=True)
+    @require_user_admin(disallow_for_restricted_users=True)
+    @nickname("regenerateUserRobotToken")
+    def post(self, robot_shortname):
+        """
+        Regenerates the token for a user's robot.
+        """
+        parent = get_authenticated_user()
+        robot = model.regenerate_user_robot_token(robot_shortname, parent)
+        log_action("regenerate_robot_token", parent.username, {"robot": robot_shortname})
+        return robot.to_dict(include_token=True)
 
 
-@resource('/v1/organization/<orgname>/robots/<robot_shortname>/regenerate')
-@path_param('orgname', 'The name of the organization')
-@path_param('robot_shortname',
-            'The short name for the robot, without any user or organization prefix')
+@resource("/v1/organization/<orgname>/robots/<robot_shortname>/regenerate")
+@path_param("orgname", "The name of the organization")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
 @related_user_resource(RegenerateUserRobot)
 class RegenerateOrgRobot(ApiResource):
-  """ Resource for regenerate an organization's robot's token. """
+    """
+    Resource for regenerate an organization's robot's token.
+    """
 
-  @require_scope(scopes.ORG_ADMIN)
-  @nickname('regenerateOrgRobotToken')
-  def post(self, orgname, robot_shortname):
-    """ Regenerates the token for an organization robot. """
-    permission = AdministerOrganizationPermission(orgname)
-    if permission.can():
-      robot = model.regenerate_org_robot_token(robot_shortname, orgname)
-      log_action('regenerate_robot_token', orgname, {'robot': robot_shortname})
-      return robot.to_dict(include_token=True)
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("regenerateOrgRobotToken")
+    def post(self, orgname, robot_shortname):
+        """
+        Regenerates the token for an organization robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if permission.can() or allow_if_superuser_with_full_access():
+            robot = model.regenerate_org_robot_token(robot_shortname, orgname)
+            log_action("regenerate_robot_token", orgname, {"robot": robot_shortname})
+            return robot.to_dict(include_token=True)
 
-    raise Unauthorized()
+        raise Unauthorized()
+
+
+def _parse_federation_config(request):
+    """
+    Parse and validate federation configuration from the request body.
+
+    Expects a JSON array of objects with 'issuer' (a URL) and 'subject' fields.
+    Raises request_error on missing fields, invalid issuer URLs, or duplicates.
+    """
+    fed_config = list()
+    seen = set()
+    seen_ids = set()
+    for item in request.json:
+        if not item:
+            raise request_error(message="Missing one or more required fields (issuer, subject)")
+        issuer = item.get("issuer")
+        subject = item.get("subject")
+        if not issuer or not subject:
+            raise request_error(message="Missing one or more required fields (issuer, subject)")
+        if not (issuer.startswith("http://") or issuer.startswith("https://")):
+            raise request_error(message="Issuer must be a URL (http:// or https://)")
+        entry = {"issuer": issuer, "subject": subject}
+        if item.get("id"):
+            if item["id"] in seen_ids:
+                raise request_error(message="Duplicate federation config entry")
+            seen_ids.add(item["id"])
+            entry["id"] = item["id"]
+        if "api_scopes" in item:
+            entry["api_scopes"] = item["api_scopes"]
+        audiences = item.get("audiences", ["quay"])
+        if (
+            not audiences
+            or not isinstance(audiences, list)
+            or not all(isinstance(audience, str) and audience for audience in audiences)
+        ):
+            raise request_error(message="Audiences must be a non-empty list of strings")
+        entry["audiences"] = audiences
+
+        if (issuer, subject) in seen:
+            raise request_error(message="Duplicate federation config entry")
+
+        seen.add((issuer, subject))
+        fed_config.append(entry)
+
+    return list(fed_config)
+
+
+@resource("/v1/user/robots/<robot_shortname>/federation")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
+class UserRobotFederation(ApiResource):
+    """
+    Resource for managing federation configuration of a user's robot account.
+    """
+
+    schemas = {
+        "CreateRobotFederation": CREATE_ROBOT_FEDERATION_SCHEMA,
+    }
+
+    @require_user_admin()
+    @nickname("getUserRobotFederation")
+    def get(self, robot_shortname):
+        """
+        Returns the federation configuration for the user's robot.
+        """
+        parent = get_authenticated_user()
+        robot_username = format_robot_username(parent.username, robot_shortname)
+        robot = lookup_robot(robot_username)
+        return get_robot_federation_config(robot)
+
+    @require_user_admin(disallow_for_restricted_users=True)
+    @nickname("createUserRobotFederation")
+    @validate_json_request("CreateRobotFederation", optional=False)
+    def post(self, robot_shortname):
+        """
+        Create or update federation configuration for the user's robot.
+        """
+        parent = get_authenticated_user()
+        fed_config = _parse_federation_config(request)
+
+        robot_username = format_robot_username(parent.username, robot_shortname)
+        robot = lookup_robot(robot_username)
+        _validate_federation_scopes(parent.username, fed_config)
+        fed_config = create_robot_federation_config(robot, fed_config)
+        log_action(
+            "create_robot_federation",
+            parent.username,
+            {"config": fed_config, "robot": robot_shortname},
+        )
+        return fed_config
+
+    @require_user_admin(disallow_for_restricted_users=True)
+    @nickname("deleteUserRobotFederation")
+    def delete(self, robot_shortname):
+        """
+        Delete federation configuration for the user's robot.
+        """
+        parent = get_authenticated_user()
+        robot_username = format_robot_username(parent.username, robot_shortname)
+        robot = lookup_robot(robot_username)
+        delete_robot_federation_config(robot)
+        log_action(
+            "delete_robot_federation",
+            parent.username,
+            {"robot": robot_shortname},
+        )
+        return "", 204
+
+
+@resource("/v1/organization/<orgname>/robots/<robot_shortname>/federation")
+@path_param("orgname", "The name of the organization")
+@path_param(
+    "robot_shortname", "The short name for the robot, without any user or organization prefix"
+)
+@related_user_resource(UserRobotFederation)
+class OrgRobotFederation(ApiResource):
+    """
+    Resource for managing federation configuration of an organization's robot account.
+    """
+
+    schemas = {
+        "CreateRobotFederation": CREATE_ROBOT_FEDERATION_SCHEMA,
+    }
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("getOrgRobotFederation")
+    def get(self, orgname, robot_shortname):
+        """
+        Returns the federation configuration for the organization's robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if (
+            permission.can()
+            or allow_if_global_readonly_superuser()
+            or (features.SUPERUSERS_FULL_ACCESS and allow_if_superuser())
+        ):
+            robot_username = format_robot_username(orgname, robot_shortname)
+            robot = lookup_robot(robot_username)
+            return get_robot_federation_config(robot)
+
+        raise Unauthorized()
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("createOrgRobotFederation")
+    @validate_json_request("CreateRobotFederation", optional=False)
+    def post(self, orgname, robot_shortname):
+        """
+        Create or update federation configuration for the organization's robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if permission.can() or allow_if_superuser_with_full_access():
+            fed_config = _parse_federation_config(request)
+
+            robot_username = format_robot_username(orgname, robot_shortname)
+            robot = lookup_robot(robot_username)
+            _validate_federation_scopes(orgname, fed_config)
+            fed_config = create_robot_federation_config(robot, fed_config)
+            log_action(
+                "create_robot_federation",
+                orgname,
+                {"config": fed_config, "robot": robot_shortname},
+            )
+            return fed_config
+
+        raise Unauthorized()
+
+    @require_scope(scopes.ORG_ADMIN)
+    @nickname("deleteOrgRobotFederation")
+    def delete(self, orgname, robot_shortname):
+        """
+        Delete federation configuration for the organization's robot.
+        """
+        permission = AdministerOrganizationPermission(orgname)
+        if permission.can() or allow_if_superuser_with_full_access():
+            robot_username = format_robot_username(orgname, robot_shortname)
+            robot = lookup_robot(robot_username)
+            delete_robot_federation_config(robot)
+            log_action(
+                "delete_robot_federation",
+                orgname,
+                {"robot": robot_shortname},
+            )
+            return "", 204
+        raise Unauthorized()

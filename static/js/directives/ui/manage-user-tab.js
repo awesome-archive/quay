@@ -15,10 +15,11 @@ angular.module('quay').directive('manageUserTab', function () {
                           TableService, Features, StateService) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.Features = Features;
-      $scope.user = UserService.currentUser();
+      UserService.updateUserIn($scope);
       $scope.users = null;
       $scope.orderedUsers = [];
       $scope.usersPerPage = 10;
+      $scope.backgroundLoadingUsers = false;
 
       $scope.newUser = {};
       $scope.createdUser = null;
@@ -29,6 +30,38 @@ angular.module('quay').directive('manageUserTab', function () {
         'filter': null,
         'page': 0
       };
+      $scope.disk_size_units = {
+        'KiB': 1024,
+        'MiB': 1024**2,
+        'GiB': 1024**3,
+        'TiB': 1024**4,
+      };
+      $scope.quotaUnits = Object.keys($scope.disk_size_units);
+
+      $scope.showQuotaConfig = function (user) {
+        if (StateService.inReadOnlyMode()) {
+          return;
+        }
+
+        $('#quotaConfigModal-'+user.username).modal('show');
+      };
+
+      $scope.bytesToHumanReadableString = function(bytes) {
+        let units = Object.keys($scope.disk_size_units).reverse();
+        let result = null;
+        let byte_unit = null;
+
+        for (const key in units) {
+          byte_unit = units[key];
+          result = (bytes / $scope.disk_size_units[byte_unit]).toFixed(2);
+          if (bytes >= $scope.disk_size_units[byte_unit]) {
+            return result.toString() + " " + byte_unit;
+          }
+        }
+
+        return result.toString() + " " + byte_unit;
+      };
+
 
       $scope.showCreateUser = function () {
         if (StateService.inReadOnlyMode()) {
@@ -45,14 +78,28 @@ angular.module('quay').directive('manageUserTab', function () {
                                                              ['username', 'email'], []);
       };
 
-      var loadUsersInternal = function () {
-        ApiService.listAllUsers().then(function (resp) {
-          $scope.users = resp['users'];
+      var loadUsersInternal = function() {
+        $scope.users = [];
+        if($scope.backgroundLoadingUsers){
+          return;
+        }
+        loadPaginatedUsers();
+      };
+
+      var loadPaginatedUsers = function(nextPageToken = null) {
+        $scope.backgroundLoadingUsers = true;
+        var params = nextPageToken != null ? {limit: 50, next_page: nextPageToken} : {limit: 50};
+        ApiService.listAllUsers(null, params).then(function(resp) {
+          $scope.users = [...$scope.users, ...resp['users']];
+          if(resp["next_page"] != null){
+            loadPaginatedUsers(resp["next_page"]);
+          } else {
+            $scope.backgroundLoadingUsers = false;
+          }
           sortUsers();
-          $scope.showInterface = true;
-        }, function (resp) {
-          $scope.users = [];
+        }, function(resp){
           $scope.usersError = ApiService.getErrorMessage(resp);
+          $scope.backgroundLoadingUsers = false;
         });
       };
       $scope.tablePredicateClass = function(name, predicate, reverse) {

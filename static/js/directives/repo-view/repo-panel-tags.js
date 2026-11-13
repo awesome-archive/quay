@@ -14,7 +14,6 @@ angular.module('quay').directive('repoPanelTags', function () {
       'selectedTags': '=selectedTags',
       'historyFilter': '=historyFilter',
       'imagesResource': '=imagesResource',
-      'imageLoader': '=imageLoader',
 
       'isEnabled': '=isEnabled',
 
@@ -27,7 +26,7 @@ angular.module('quay').directive('repoPanelTags', function () {
       });
 
       $scope.Features = Features;
-      
+
       $scope.maxTrackCount = 5;
 
       $scope.checkedTags = UIService.createCheckStateController([], 'name');
@@ -44,13 +43,12 @@ angular.module('quay').directive('repoPanelTags', function () {
       $scope.tagsPerPage = 25;
 
       $scope.expandedView = false;
+      $scope.showCosignSignatures = false;
       $scope.labelCache = {};
 
       $scope.manifestVulnerabilities = {};
       $scope.repoDelegationsInfo = null;
-
-      $scope.defcon1 = {};
-      $scope.hasDefcon1 = false;
+      $scope.cosignedManifests = {};
 
       var loadRepoSignatures = function() {
         if (!$scope.repository || !$scope.repository.trust_enabled) {
@@ -71,6 +69,35 @@ angular.module('quay').directive('repoPanelTags', function () {
         });
       };
 
+      var matchCosignSignature = function(tag) {
+        // matches cosign style tags and returns the match with a matching group containing the signed manifest digest
+
+        var cosignNamingPattern = new RegExp('^sha256-([a-f0-9]{64})\.sig$');
+        tag = tag.trim()
+        return tag.match(cosignNamingPattern);
+      }
+
+      var getCosignSignatures = function() {
+        if (!$scope.repositoryTags || !$scope.selectedTags) { return; }
+
+        // Build a list of all digests which are signed by cosign
+        $scope.cosignedManifests = [];
+
+        for (var tag in $scope.repositoryTags) {
+          if (!$scope.repositoryTags.hasOwnProperty(tag)) { continue; }
+
+          var cosignSignatureTag = matchCosignSignature(tag);
+
+          if (cosignSignatureTag) {
+            signedManifestDigest = cosignSignatureTag[1]; // cosign signature tags contain the signature of the signed manifest
+            $scope.cosignedManifests["sha256:" + signedManifestDigest] = { // map signed manifests to their cosign signature artifact
+              'signatureTagName': tag,
+              'signatureManifestDigest':  $scope.repositoryTags[tag].manifest_digest
+            };
+          }
+        }
+      }
+
       var setTagState = function() {
         if (!$scope.repositoryTags || !$scope.selectedTags) { return; }
 
@@ -79,89 +106,93 @@ angular.module('quay').directive('repoPanelTags', function () {
         for (var tag in $scope.repositoryTags) {
           if (!$scope.repositoryTags.hasOwnProperty(tag)) { continue; }
 
+          if (matchCosignSignature(tag) && !$scope.showCosignSignatures) { continue; }
+
           var tagData = $scope.repositoryTags[tag];
           var tagInfo = $.extend(tagData, {
             'name': tag,
             'last_modified_datetime': TableService.getReversedTimestamp(tagData.last_modified),
             'expiration_date': tagData.expiration ? TableService.getReversedTimestamp(tagData.expiration) : null,
+            'cosign_signature_tag': $scope.cosignedManifests.hasOwnProperty(tagData.manifest_digest) ? $scope.cosignedManifests[tagData.manifest_digest].signatureTagName : null,
+            'cosign_signature_manifest_digest': $scope.cosignedManifests.hasOwnProperty(tagData.manifest_digest) ? $scope.cosignedManifests[tagData.manifest_digest].signatureManifestDigest : null,
           });
 
           allTags.push(tagInfo);
         }
 
         // Sort the tags by the predicate and the reverse, and map the information.
-        var imageIDs = [];
         var ordered = TableService.buildOrderedItems(allTags, $scope.options,
-            ['name'], ['last_modified_datetime', 'size']).entries;
+            ['name', 'manifest_digest'], ['last_modified_datetime', 'size']).entries;
 
         var checked = [];
-        var imageMap = {};
-        var imageIndexMap = {};
+        var manifestMap = {};
+        var manifestIndexMap = {};
+        var manifestDigests = [];
         for (var i = 0; i < ordered.length; ++i) {
           var tagInfo = ordered[i];
-          if (!tagInfo.image_id) {
+          if (!tagInfo.manifest_digest) {
             continue;
           }
 
-          if (!imageMap[tagInfo.image_id]) {
-            imageMap[tagInfo.image_id] = [];
-            imageIDs.push(tagInfo.image_id)
+          if (!manifestMap[tagInfo.manifest_digest]) {
+            manifestMap[tagInfo.manifest_digest] = [];
+            manifestDigests.push(tagInfo.manifest_digest)
           }
 
-          imageMap[tagInfo.image_id].push(tagInfo);
+          manifestMap[tagInfo.manifest_digest].push(tagInfo);
           if ($.inArray(tagInfo.name, $scope.selectedTags) >= 0) {
             checked.push(tagInfo);
           }
 
-          if (!imageIndexMap[tagInfo.image_id]) {
-            imageIndexMap[tagInfo.image_id] = {'start': i, 'end': i};
+          if (!manifestIndexMap[tagInfo.manifest_digest]) {
+            manifestIndexMap[tagInfo.manifest_digest] = {'start': i, 'end': i};
           }
 
-          imageIndexMap[tagInfo.image_id]['end'] = i;
+          manifestIndexMap[tagInfo.manifest_digest]['end'] = i;
         };
 
         // Calculate the image tracks.
         var colors = d3.scale.category10();
-        if (Object.keys(imageMap).length > 10) {
+        if (Object.keys(manifestMap).length > 10) {
           colors = d3.scale.category20();
         }
 
-        var imageTracks = [];
-        var imageTrackEntries = [];
-        var trackEntryForImage = {};
+        var manifestTracks = [];
+        var manifestTrackEntries = [];
+        var trackEntryForManifest = {};
 
         var visibleStartIndex = ($scope.options.page * $scope.tagsPerPage);
         var visibleEndIndex = (($scope.options.page + 1) * $scope.tagsPerPage);
 
-        imageIDs.sort().map(function(image_id) {
-          if (imageMap[image_id].length >= 2){
+        manifestDigests.sort().map(function(manifest_digest) {
+          if (manifestMap[manifest_digest].length >= 2){
             // Create the track entry.
-            var imageIndexRange = imageIndexMap[image_id];
-            var colorIndex = imageTrackEntries.length;
+            var manifestIndexRange = manifestIndexMap[manifest_digest];
+            var colorIndex = manifestTrackEntries.length;
             var trackEntry = {
-              'image_id': image_id,
+              'manifest_digest': manifest_digest,
               'color': colors(colorIndex),
-              'count': imageMap[image_id].length,
-              'tags': imageMap[image_id],
-              'index_range': imageIndexRange,
-              'visible': visibleStartIndex <= imageIndexRange.end && imageIndexRange.start <= visibleEndIndex,
+              'count': manifestMap[manifest_digest].length,
+              'tags': manifestMap[manifest_digest],
+              'index_range': manifestIndexRange,
+              'visible': visibleStartIndex <= manifestIndexRange.end && manifestIndexRange.start <= visibleEndIndex,
             };
 
-            trackEntryForImage[image_id] = trackEntry;
-            imageMap[image_id]['color'] = colors(colorIndex);
+            trackEntryForManifest[manifest_digest] = trackEntry;
+            manifestMap[manifest_digest]['color'] = colors(colorIndex);
 
             // Find the track in which we can place the entry, if any.
             var existingTrack = null;
-            for (var i = 0; i < imageTracks.length; ++i) {
+            for (var i = 0; i < manifestTracks.length; ++i) {
               // For the current track, ensure that the start and end index
               // for the current entry is outside of the range of the track's
               // entries. If so, then we can add the entry to the track.
-              var currentTrack = imageTracks[i];
+              var currentTrack = manifestTracks[i];
               var canAddToCurrentTrack = true;
               for (var j = 0; j < currentTrack.entries.length; ++j) {
                 var currentTrackEntry = currentTrack.entries[j];
-                var entryInfo = imageIndexMap[currentTrackEntry.image_id];
-                if (Math.max(entryInfo.start, imageIndexRange.start) <= Math.min(entryInfo.end, imageIndexRange.end)) {
+                var entryInfo = manifestIndexMap[currentTrackEntry.manifest_digest];
+                if (Math.max(entryInfo.start, manifestIndexRange.start) <= Math.min(entryInfo.end, manifestIndexRange.end)) {
                   canAddToCurrentTrack = false;
                   break;
                 }
@@ -176,38 +207,38 @@ angular.module('quay').directive('repoPanelTags', function () {
             // Add the entry to the track or create a new track if necessary.
             if (existingTrack) {
               existingTrack.entries.push(trackEntry)
-              existingTrack.entryByImageId[image_id] = trackEntry;
-              existingTrack.endIndex = Math.max(existingTrack.endIndex, imageIndexRange.end);
+              existingTrack.entryByManifestDigest[manifest_digest] = trackEntry;
+              existingTrack.endIndex = Math.max(existingTrack.endIndex, manifestIndexRange.end);
 
-              for (var j = imageIndexRange.start; j <= imageIndexRange.end; j++) {
+              for (var j = manifestIndexRange.start; j <= manifestIndexRange.end; j++) {
                 existingTrack.entryByIndex[j] = trackEntry;
               }
             } else {
-              var entryByImageId = {};
-              entryByImageId[image_id] = trackEntry;
+              var entryByManifestDigest = {};
+              entryByManifestDigest[manifest_digest] = trackEntry;
 
               var entryByIndex = {};
-              for (var j = imageIndexRange.start; j <= imageIndexRange.end; j++) {
+              for (var j = manifestIndexRange.start; j <= manifestIndexRange.end; j++) {
                 entryByIndex[j] = trackEntry;
               }
 
-              imageTracks.push({
+              manifestTracks.push({
                 'entries': [trackEntry],
-                'entryByImageId': entryByImageId,
-                'startIndex': imageIndexRange.start,
-                'endIndex': imageIndexRange.end,
+                'entryByManifestDigest': entryByManifestDigest,
+                'startIndex': manifestIndexRange.start,
+                'endIndex': manifestIndexRange.end,
                 'entryByIndex': entryByIndex,
               });
             }
 
-            imageTrackEntries.push(trackEntry);
+            manifestTrackEntries.push(trackEntry);
           }
         });
 
-        $scope.imageMap = imageMap;
-        $scope.imageTracks = imageTracks;
-        $scope.imageTrackEntries = imageTrackEntries;
-        $scope.trackEntryForImage = trackEntryForImage;
+        $scope.manifestMap = manifestMap;
+        $scope.manifestTracks = manifestTracks;
+        $scope.manifestTrackEntries = manifestTrackEntries;
+        $scope.trackEntryForManifest = trackEntryForManifest;
 
         $scope.options.page = 0;
 
@@ -234,6 +265,7 @@ angular.module('quay').directive('repoPanelTags', function () {
       $scope.$watch('options.predicate', setTagState);
       $scope.$watch('options.reverse', setTagState);
       $scope.$watch('options.filter', setTagState);
+      $scope.$watch('showCosignSignatures', setTagState);
 
       $scope.$watch('options.page', function(page) {
         if (page != null && $scope.checkedTags) {
@@ -242,7 +274,7 @@ angular.module('quay').directive('repoPanelTags', function () {
       });
 
       $scope.$watch('selectedTags', function(selectedTags) {
-        if (!selectedTags || !$scope.repository || !$scope.imageMap) { return; }
+        if (!selectedTags || !$scope.repository || !$scope.manifestMap) { return; }
 
         $scope.checkedTags.setChecked(selectedTags.map(function(tag) {
           return $scope.repositoryTags[tag];
@@ -251,13 +283,30 @@ angular.module('quay').directive('repoPanelTags', function () {
 
       $scope.$watch('repository', function(updatedRepoObject, previousRepoObject) {
         // Process each of the tags.
+        getCosignSignatures();
         setTagState();
         loadRepoSignatures();
       });
 
       $scope.$watch('repositoryTags', function(newTags, oldTags) {
         if (newTags === oldTags) { return; }
+
+        // Filter out properties that should not cause the tag list to be reset,
+        // specifically loading sub-manifests
+        let filteredOldTags = {};
+        for (const [key, value] of Object.entries(oldTags)) {
+          let {manifest_list_loading, manifest_list, $$hashKey, _mapped_manifests, ...properties} = value;
+          filteredOldTags[key] = properties;
+        }
+        let filteredNewTags = {};
+        for (const [key, value] of Object.entries(newTags)) {
+          let {manifest_list_loading, manifest_list, $$hashKey, _mapped_manifests, ...properties} = value;
+          filteredNewTags[key] = properties;
+        }
+        if(JSON.stringify(filteredOldTags) === JSON.stringify(filteredNewTags)){return;}
+
         // Process each of the tags.
+        getCosignSignatures();
         setTagState();
         loadRepoSignatures();
       }, true);
@@ -377,7 +426,7 @@ angular.module('quay').directive('repoPanelTags', function () {
         if ($scope.inReadOnlyMode) {
           return;
         }
-        $scope.tagActionHandler.askAddTag(tag.image_id, tag.manifest_digest);
+        $scope.tagActionHandler.askAddTag(tag.manifest_digest);
       };
 
       $scope.showLabelEditor = function(tag) {
@@ -403,6 +452,19 @@ angular.module('quay').directive('repoPanelTags', function () {
         return tag.name.match(r);
       };
 
+      $scope.cosignTagFilter = function(tag) {
+        var r = new RegExp('^sha256-[A-Fa-f0-9]{64}\.sig$');
+        return tag.name.match(r);
+      };
+
+      $scope.signedTagFilter = function(tag) {
+        return tag.hasOwnProperty("cosign_signature_manifest_digest") && tag.cosign_signature_manifest_digest != null;
+      };
+
+      $scope.unsignedTagFilter = function(tag) {
+        return tag.hasOwnProperty("cosign_signature_manifest_digest") && tag.cosign_signature_manifest_digest == null;
+      };
+
       $scope.allTagFilter = function(tag) {
         return true;
       };
@@ -411,8 +473,8 @@ angular.module('quay').directive('repoPanelTags', function () {
         return false;
       };
 
-      $scope.imageIDFilter = function(image_id, tag) {
-        return tag.image_id == image_id;
+      $scope.manifestDigestFilter = function(manifest_digest, tag) {
+        return tag.manifest_digest == manifest_digest;
       };
 
       $scope.setTab = function(tab) {
@@ -421,7 +483,7 @@ angular.module('quay').directive('repoPanelTags', function () {
 
       $scope.selectTrack = function(it) {
         $scope.checkedTags.checkByFilter(function(tag) {
-          return $scope.imageIDFilter(it.image_id, tag);
+          return $scope.manifestDigestFilter(it.manifest_digest, tag);
         });
       };
 
@@ -434,8 +496,16 @@ angular.module('quay').directive('repoPanelTags', function () {
         $scope.setTab('history');
       };
 
+      $scope.toggleExpandedView = function() {
+        $scope.expandedView = !$scope.expandedView;
+      };
+
       $scope.setExpanded = function(expanded) {
         $scope.expandedView = expanded;
+      };
+
+      $scope.toggleCosignSignatureDisplay = function() {
+        $scope.showCosignSignatures = !$scope.showCosignSignatures;
       };
 
       $scope.getTagNames = function(checked) {
@@ -468,6 +538,30 @@ angular.module('quay').directive('repoPanelTags', function () {
         }, ApiService.errorDisplay('Could not load manifest list contents'))
       };
 
+      $scope.loadManifestLayers = function(manifest) {
+        if (manifest.layers_loading) {
+          return;
+        }
+
+        manifest.layers_loading = true;
+
+        var params = {
+          'repository': $scope.repository.namespace + '/' + $scope.repository.name,
+          'manifestref': manifest.digest
+        };
+
+        ApiService.getRepoManifest(null, params).then(function(resp) {
+          child_manifest = JSON.parse(resp['manifest_data']);
+          manifest.layers = child_manifest["layers"];
+          manifest.layers_loading = false;
+        }, function() {
+          // if we fail to get the manifest child for some reason, set layers to
+          // an empty array to avoid an infinite loop.
+          manifest.layers_loading = false;
+          manifest.layers = [];
+	});
+      };
+
       $scope.manifestsOf = function(tag) {
         if (!tag.is_manifest_list) {
           return [];
@@ -478,14 +572,33 @@ angular.module('quay').directive('repoPanelTags', function () {
           return [];
         }
 
+        childrenLayers = tag.manifest_list.manifests.every(function(manifest) {
+          return manifest.layers
+        })
+        if (!childrenLayers) {
+          tag.manifest_list.manifests.forEach(function(child_manifest) {
+            if(!child_manifest.layers){
+              $scope.loadManifestLayers(child_manifest);
+            }
+          });
+          return tag.manifest_list.manifests;
+        }
+
         if (!tag._mapped_manifests) {
           // Calculate once and cache to avoid angular digest cycles.
           tag._mapped_manifests = tag.manifest_list.manifests.map(function(manifest) {
+
+            var layers_compressed_size = 0;
+            for (var i = 0; i < manifest.layers.length; i++) {
+              layers_compressed_size += manifest.layers[i]["size"];
+            }
+
             return {
               'raw': manifest,
               'os': manifest.platform.os,
               'size': manifest.size,
               'digest': manifest.digest,
+              'layers_compressed_size': layers_compressed_size,
               'description': `${manifest.platform.os} on ${manifest.platform.architecture}`,
             };
           });

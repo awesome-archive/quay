@@ -17,7 +17,22 @@ SHA=$( git rev-parse --short HEAD )
 git checkout $SHA
 
 REPO=quay.io/quay/quay:$SHA
-docker build -t $REPO .
+
+# Use buildah, podman or docker
+if [ -x /usr/bin/buildah ]; then
+	BUILDER="/usr/bin/buildah bud"
+elif [ -x /usr/bin/podman ]; then
+	BUILDER="/usr/bin/podman build"
+elif [ -x /usr/bin/docker ] ; then
+	BUILDER="/usr/bin/docker build"
+fi
+if [[ -z "$BUILDER" ]]; then
+  echo 'Unable to find buildah, podman or docker' >&2
+  exit 1
+fi
+echo $BUILDER
+
+$BUILDER -t $REPO .
 echo $REPO
 
 git checkout "$NAME"

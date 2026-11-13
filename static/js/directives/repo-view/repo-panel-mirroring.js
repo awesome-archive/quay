@@ -39,10 +39,12 @@ angular.module('quay').directive('repoPanelMirror', function () {
       vm.robot = null;
       vm.status = null;
       vm.syncInterval = null;
-      vm.syncStartDate = null;
+      vm.skopeoTimeout = null;
+      vm.syncStartDate = moment().unix();
       vm.tags = null;
       vm.username = null;
       vm.verifyTLS = null;
+      vm.unsignedImages = null;
 
       /**
        * Fetch the latest Repository Mirror Configuration
@@ -55,6 +57,7 @@ angular.module('quay').directive('repoPanelMirror', function () {
           vm.isEnabled = resp.is_enabled;
           vm.externalReference = resp.external_reference;
           vm.syncInterval = resp.sync_interval;
+          vm.skopeoTimeout = resp.skopeo_timeout_interval;
           vm.username = resp.external_registry_username;
           vm.syncStartDate = resp.sync_start_date;
           vm.status = resp.sync_status;
@@ -70,10 +73,11 @@ angular.module('quay').directive('repoPanelMirror', function () {
             };
           }
 
-          vm.tags = resp.root_rule.rule_value || []; // TODO: Use RepoMirrorRule-specific endpoint
+          vm.tags = resp.root_rule.rule_value || [];
 
           // TODO: These are not consistently provided by the API. Correct that in the API.
           vm.verifyTLS = resp.external_registry_config.verify_tls;
+          vm.unsignedImages = resp.external_registry_config.unsigned_images;
           if (resp.external_registry_config.proxy) {
             vm.httpProxy = resp.external_registry_config.proxy.http_proxy;
             vm.httpsProxy = resp.external_registry_config.proxy.https_proxy;
@@ -119,6 +123,7 @@ angular.module('quay').directive('repoPanelMirror', function () {
       vm.locationChanges = null;
       vm.noProxyChanges = null;
       vm.syncIntervalChanges = null;
+      vm.skopeoTimeoutChanges = null;
       vm.syncStartDateChanges = null;
       vm.tagChanges = null;
 
@@ -132,6 +137,15 @@ angular.module('quay').directive('repoPanelMirror', function () {
           'fieldName': 'synchronization interval',
           'values': {
             'sync_interval': vm.syncInterval
+          }
+        }
+      }
+
+      vm.showChangeSkopeoTimeoutInterval = function() {
+        vm.skopeoTimeoutChanges = {
+          'fieldName': 'skopeo timeout interval',
+          'values': {
+            'skopeo_timeout_interval': vm.skopeoTimeout
           }
         }
       }
@@ -285,6 +299,47 @@ angular.module('quay').directive('repoPanelMirror', function () {
       }
 
       /**
+       * Enable `Accept Unsigned Images`.
+       */
+      vm.enableUnsignedImages = function() {
+        let data = {
+          'fieldName': 'Accept Unsigned Images',
+          'values': {
+            'external_registry_config': {
+              'unsigned_images': true
+            }
+          }
+        }
+
+        return vm.changeConfig(data, null);
+      }
+
+      /**
+       * Disable `Accept Unsigned Images`
+       */
+      vm.disableUnsignedImages = function() {
+        console.log("disabling unsigned images");
+        let data = {
+          'fieldName': 'Accept Unsigned Images',
+          'values': {
+            'external_registry_config': {
+              'unsigned_images': false
+            }
+          }
+        }
+
+        return vm.changeConfig(data, null);
+      }
+
+      /**
+       * Toggle `Accept Unsigned Images`.
+       */
+      vm.toggleUnsignedImages = function() {
+        if (vm.unsignedImages) return vm.disableUnsignedImages();
+        else return vm.enableUnsignedImages();
+      }
+
+      /**
        *  Change Robot user.
        */
       vm.changeRobot = function(robot) {
@@ -356,8 +411,16 @@ angular.module('quay').directive('repoPanelMirror', function () {
        * Update Tag-Rules
        */
       vm.changeTagRules = function(data, callback) {
-        let csv = data.values.rule_value;
-        let patterns = csv.split(',');
+        let csv = data.values.rule_value,
+            patterns;
+
+        // If already an array then the data has not changed
+        if (Array.isArray(csv)) {
+          patterns = csv;
+        } else {
+          patterns = csv.split(',').map(s => s.trim());
+        }
+
 
         patterns.map(s => s.trim()); // Trim excess whitespace
         patterns = Array.from(new Set(patterns)); // De-duplicate
@@ -370,7 +433,7 @@ angular.module('quay').directive('repoPanelMirror', function () {
 
         data = {
           'root_rule': {
-            'rule_type': 'TAG_GLOB_CSV',
+            'rule_kind': "tag_glob_csv",
             'rule_value': patterns
           }
         }
@@ -378,7 +441,7 @@ angular.module('quay').directive('repoPanelMirror', function () {
         let displayError = ApiService.errorDisplay('Could not change Tag Rules', callback);
 
         ApiService
-        .changeRepoMirrorRule(data, params)
+        .changeRepoMirrorConfig(data, params)
         .then(function(resp) {
           vm.getMirror();
           callback(true);
@@ -432,8 +495,7 @@ angular.module('quay').directive('repoPanelMirror', function () {
       vm.setupMirror = function() {
 
         // Apply transformations
-        let now = vm.timestampToISO(moment().unix());
-        let syncStartDate = vm.timestampToISO(vm.syncStartDate) || now;
+        let syncStartDate = vm.timestampToISO(vm.syncStartDate || moment().unix());
         let patterns = Array.from(new Set(vm.tags.split(',').map(s => s.trim()))); // trim + de-dupe
 
         let requestBody = {
@@ -441,10 +503,12 @@ angular.module('quay').directive('repoPanelMirror', function () {
            'external_registry_username': vm.username,
            'external_registry_password': vm.password,
            'sync_interval': vm.syncInterval,
+           'skopeo_timeout_interval': vm.skopeoTimeout,
            'sync_start_date': syncStartDate,
            'robot_username': vm.robot.name,
            'external_registry_config': {
              'verify_tls': vm.verifyTLS || false, // `null` not allowed
+             'unsigned_images': vm.unsignedImages || false,
              'proxy': {
                'http_proxy': vm.httpProxy,
                'https_proxy': vm.httpsProxy,
@@ -452,9 +516,9 @@ angular.module('quay').directive('repoPanelMirror', function () {
              }
            },
            'root_rule': {
-             'rule_type': 'TAG_GLOB_CSV',
+             'rule_kind': "tag_glob_csv",
              'rule_value': patterns
-           }
+           },
         }
 
         let successHandler = function(resp) { vm.getMirror(); return true; }

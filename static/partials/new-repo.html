@@ -31,14 +31,6 @@
             <div class="section">
               <div class="new-header">
                 <div class="namespace-selector-header">
-                  <span quay-show="Features.APP_REGISTRY">
-                    <span class="visible-xs xs-label">Repository Kind:</span>
-                    <select class="form-control repo-kind-select" ng-model="repo.repo_kind">
-                      <option value="image">Container Image Repository</option>
-                      <option value="application">Application Repository</option>
-                    </select>
-                  </span>
-
                   <span class="visible-xs xs-label">Namespace:</span>
                   <span class="namespace-selector" user="user" namespace="repo.namespace" require-create="true"></span>
 
@@ -47,10 +39,11 @@
                   <span class="visible-xs xs-label">Repository Name:</span>
                   <span class="name-container">
                     <input id="repoName" name="repoName" type="text" class="form-control" placeholder="Repository Name" ng-model="repo.name"
-                           required autofocus data-trigger="manual" data-content="{{ createError }}" data-placement="right" ng-pattern="/^[.a-z0-9_-]+$/">
+                           required autofocus data-trigger="manual" data-content="{{ createError }}" data-placement="right"
+                           ng-pattern="repositoryNameRegex">
                   </span>
                   <span class="co-alert co-alert-warning co-alert-popin-warning" ng-show="!creating && !newRepoForm.repoName.$error.required && !newRepoForm.repoName.$valid">
-                    Repository names must match [a-z0-9_-]+
+                    {{ Features.EXTENDED_REPOSITORY_NAMES ? "Repository names must match [a-z0-9][.a-z0-9_-]*(\/[a-z0-9][.a-z0-9_-]*)*" : "Repository names must match [a-z0-9][.a-z0-9_-]*" }}
                   </span>
                   <span class="co-alert co-alert-danger co-alert-popin-warning" ng-show="!creating && createError">
                     {{ createError }}

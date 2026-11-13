@@ -1,0 +1,460 @@
+import {
+  Button,
+  Divider,
+  Dropdown,
+  DropdownItem,
+  DropdownList,
+  MenuGroup,
+  MenuItem,
+  MenuList,
+  Flex,
+  FlexItem,
+  Icon,
+  MenuContent,
+  MenuToggle,
+  Menu,
+  NotificationBadge,
+  NotificationBadgeVariant,
+  Switch,
+  ToggleGroup,
+  ToggleGroupItem,
+  Toolbar,
+  ToolbarContent,
+  ToolbarGroup,
+  ToolbarItem,
+  Tooltip,
+  Popper,
+} from '@patternfly/react-core';
+import {
+  PowerOffIcon,
+  QuestionCircleIcon,
+  UserIcon,
+  UserCogIcon,
+  WindowMaximizeIcon,
+} from '@patternfly/react-icons';
+import React, {useEffect, useRef, useState} from 'react';
+import {useAppNotifications} from 'src/hooks/useAppNotifications';
+import {GlobalAuthState, logoutUser} from 'src/resources/AuthResource';
+import ErrorModal from '../errors/ErrorModal';
+
+import {useQueryClient} from '@tanstack/react-query';
+import 'src/components/header/HeaderToolbar.css';
+import {useCurrentUser} from 'src/hooks/UseCurrentUser';
+import Avatar from 'src/components/Avatar';
+
+import MoonIcon from '@patternfly/react-icons/dist/esm/icons/moon-icon';
+import SunIcon from '@patternfly/react-icons/dist/esm/icons/sun-icon';
+
+import {ThemePreference, useTheme} from 'src/contexts/ThemeContext';
+import {useQuayConfig} from 'src/hooks/UseQuayConfig';
+import {useLocation, useNavigate} from 'react-router-dom';
+import HeaderSearchBar from 'src/components/header/HeaderSearchBar';
+
+export function HeaderToolbar({toggleDrawer}: {toggleDrawer: () => void}) {
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const toggleRef = React.useRef<HTMLButtonElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const {themePreference, setThemePreference} = useTheme();
+  const quayConfig = useQuayConfig();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const showUIToggle =
+    quayConfig?.features?.UI_V2 &&
+    !(
+      quayConfig?.config?.DISABLE_ANGULAR_UI &&
+      quayConfig?.config?.DEFAULT_UI === 'react'
+    );
+
+  const queryClient = useQueryClient();
+  const {user} = useCurrentUser();
+  const [err, setErr] = useState<string>();
+
+  const onDropdownToggle = () => {
+    setIsDropdownOpen((prev) => !prev);
+  };
+
+  // Handle closing the menu when the escape key is pressed or the user clicks outside the menu
+  useEffect(() => {
+    const handleMenuKeys = (event: KeyboardEvent) => {
+      if (!isDropdownOpen) return;
+      if (
+        menuRef.current?.contains(event.target as Node) ||
+        toggleRef.current?.contains(event.target as Node)
+      ) {
+        if (event.key === 'Escape' || event.key === 'Tab') {
+          setIsDropdownOpen(false);
+          toggleRef.current?.focus();
+        }
+      }
+    };
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        isDropdownOpen &&
+        !menuRef.current?.contains(event.target as Node) &&
+        !toggleRef.current?.contains(event.target as Node)
+      ) {
+        setIsDropdownOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleMenuKeys);
+    window.addEventListener('click', handleClickOutside);
+    return () => {
+      window.removeEventListener('keydown', handleMenuKeys);
+      window.removeEventListener('click', handleClickOutside);
+    };
+  }, [isDropdownOpen]);
+
+  const onMenuSelect = async (
+    event: React.MouseEvent | undefined,
+    itemId: string | number | undefined,
+  ) => {
+    switch (itemId) {
+      case 'account-settings':
+        navigate(`/organization/${user?.username}?tab=Settings`);
+        setIsDropdownOpen(false);
+        break;
+      case 'logout':
+        try {
+          await logoutUser();
+        } catch (err) {
+          console.error('Logout API failed:', err);
+          // Don't show error modal - user still wants to log out locally
+        } finally {
+          // ALWAYS cleanup and redirect, even on network error
+          // Clear global auth state before redirect
+          GlobalAuthState.isLoggedIn = false;
+          GlobalAuthState.csrfToken = undefined;
+          GlobalAuthState.bearerToken = undefined;
+          queryClient.invalidateQueries(['user']);
+          // Redirect to signin page (full page reload will clear React Query cache)
+          window.location.href = '/signin';
+        }
+        setIsDropdownOpen(false);
+        break;
+      case 'theme-selector':
+        break;
+      case 'ui-toggle':
+        // Keep menu open when interacting with the UI toggle switch
+        break;
+      default:
+        setIsDropdownOpen(false);
+        break;
+    }
+  };
+
+  // Toggle between old UI and new UI
+  const [isChecked, setIsChecked] = useState<boolean>(true);
+  const toggleSwitch = (
+    _event: React.FormEvent<HTMLInputElement>,
+    checked: boolean,
+  ) => {
+    setIsChecked(checked);
+
+    // Reload page and trigger patternfly cookie removal
+    const protocol = window.location.protocol;
+    const host = window.location.host;
+    const path = 'angular';
+
+    // Add a random arg so nginx redirect to / doesn't get cached by browser
+    const randomArg = '?_=' + new Date().getTime();
+    window.location.replace(`${protocol}//${host}/${path}/${randomArg}`);
+  };
+
+  const helpDropdown = (
+    <Dropdown
+      isOpen={isHelpOpen}
+      onSelect={() => setIsHelpOpen(false)}
+      onOpenChange={setIsHelpOpen}
+      popperProps={{position: 'end'}}
+      toggle={(toggleRef) => (
+        <MenuToggle
+          ref={toggleRef}
+          onClick={() => setIsHelpOpen((prev) => !prev)}
+          isExpanded={isHelpOpen}
+          variant="plain"
+          aria-label="Help menu"
+          data-testid="help-menu-toggle"
+        >
+          <QuestionCircleIcon />
+        </MenuToggle>
+      )}
+    >
+      <DropdownList>
+        {quayConfig?.config?.DOCUMENTATION_ROOT && (
+          <DropdownItem
+            key="documentation"
+            to={quayConfig.config.DOCUMENTATION_ROOT}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-testid="help-documentation-link"
+          >
+            Documentation
+          </DropdownItem>
+        )}
+        <DropdownItem
+          key="api-reference"
+          to="/api/v1/discovery"
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="help-api-reference-link"
+        >
+          API Reference
+        </DropdownItem>
+        {quayConfig?.version_number && (
+          <>
+            <Divider component="li" />
+            <DropdownItem
+              key="version"
+              isDisabled
+              isAriaDisabled
+              data-testid="help-version-info"
+            >
+              {quayConfig.version_number}
+            </DropdownItem>
+          </>
+        )}
+      </DropdownList>
+    </Dropdown>
+  );
+
+  const userMenu = (
+    <Menu ref={menuRef} onSelect={onMenuSelect}>
+      <MenuContent>
+        <MenuGroup label="Appearance" key="theme">
+          <MenuList>
+            <MenuItem
+              itemId="theme-selector"
+              key="theme-selector"
+              component="object"
+            >
+              <ToggleGroup id="theme-toggle" aria-label="Theme toggle group">
+                <ToggleGroupItem
+                  icon={
+                    <Icon size="sm">
+                      <SunIcon />
+                    </Icon>
+                  }
+                  aria-label="light theme"
+                  aria-describedby="tooltip-auto-theme"
+                  buttonId="toggle-group-light-theme"
+                  onChange={() => {
+                    if (themePreference !== ThemePreference.LIGHT) {
+                      setThemePreference(ThemePreference.LIGHT);
+                    }
+                  }}
+                  isSelected={themePreference === ThemePreference.LIGHT}
+                />
+                <ToggleGroupItem
+                  icon={
+                    <Icon size="sm">
+                      <MoonIcon />
+                    </Icon>
+                  }
+                  aria-label="dark theme"
+                  buttonId="toggle-group-dark-theme"
+                  onChange={() => {
+                    if (themePreference !== ThemePreference.DARK) {
+                      setThemePreference(ThemePreference.DARK);
+                    }
+                  }}
+                  isSelected={themePreference === ThemePreference.DARK}
+                />
+                <ToggleGroupItem
+                  icon={
+                    <Icon size="sm">
+                      <WindowMaximizeIcon />
+                    </Icon>
+                  }
+                  aria-label="auto theme"
+                  buttonId="toggle-group-auto-theme"
+                  onChange={() => {
+                    if (themePreference !== ThemePreference.AUTO) {
+                      setThemePreference(ThemePreference.AUTO);
+                    }
+                  }}
+                  isSelected={themePreference === ThemePreference.AUTO}
+                />
+              </ToggleGroup>
+            </MenuItem>
+            {showUIToggle && (
+              <MenuItem itemId="ui-toggle" key="ui-toggle" component="object">
+                <Flex
+                  spaceItems={{default: 'spaceItemsMd'}}
+                  flexWrap={{default: 'nowrap'}}
+                  className="pf-v6-u-text-nowrap pf-v6-u-pr-md"
+                >
+                  <FlexItem alignSelf={{default: 'alignSelfFlexStart'}}>
+                    Legacy UI
+                  </FlexItem>
+                  <Switch
+                    id="menu-ui-switch"
+                    label="Current UI"
+                    isChecked={isChecked}
+                    onChange={toggleSwitch}
+                  />
+                </Flex>
+              </MenuItem>
+            )}
+          </MenuList>
+        </MenuGroup>
+        <Divider />
+        <MenuGroup label="Actions" key="user">
+          <MenuList>
+            <MenuItem
+              icon={<UserCogIcon aria-hidden />}
+              itemId="account-settings"
+              key="account-settings"
+              component="button"
+            >
+              Account Settings
+            </MenuItem>
+            <MenuItem
+              icon={<PowerOffIcon aria-hidden />}
+              isDanger={true}
+              itemId="logout"
+              key="logout"
+              component="button"
+            >
+              Logout
+            </MenuItem>
+          </MenuList>
+        </MenuGroup>
+        <Tooltip
+          id="tooltip-light-theme"
+          content="Light theme"
+          position="bottom"
+          triggerRef={() =>
+            document.getElementById(
+              'toggle-group-light-theme',
+            ) as HTMLButtonElement
+          }
+        />
+        <Tooltip
+          id="tooltip-dark-theme"
+          content="Dark theme"
+          position="bottom"
+          triggerRef={() =>
+            document.getElementById(
+              'toggle-group-dark-theme',
+            ) as HTMLButtonElement
+          }
+        />
+        <Tooltip
+          id="tooltip-auto-theme"
+          content="Device-based theme"
+          position="bottom"
+          triggerRef={() =>
+            document.getElementById(
+              'toggle-group-auto-theme',
+            ) as HTMLButtonElement
+          }
+        />
+      </MenuContent>
+    </Menu>
+  );
+
+  const toggle = (
+    <MenuToggle
+      ref={toggleRef}
+      onClick={onDropdownToggle}
+      isExpanded={isDropdownOpen}
+      icon={
+        user?.avatar ? <Avatar avatar={user.avatar} size="sm" /> : <UserIcon />
+      }
+      id="user-menu-toggle"
+      data-testid="user-menu-toggle"
+      aria-label="User menu"
+    >
+      {user?.username}
+    </MenuToggle>
+  );
+
+  const menuContainer = (
+    <div ref={containerRef}>
+      <Popper
+        trigger={toggle}
+        popper={userMenu}
+        appendTo={() => document.body}
+        isVisible={isDropdownOpen}
+        placement="bottom-end"
+      />
+    </div>
+  );
+
+  const signInButtonText = quayConfig?.config?.REGISTRY_TITLE_SHORT
+    ? `Sign in to ${quayConfig.config.REGISTRY_TITLE_SHORT}`
+    : 'Sign In';
+
+  // Use full page reload instead of React Router navigation to ensure
+  // React Query cache and auth state are properly cleared before signin
+  const signInButton = (
+    <Button component="a" href="/signin">
+      {signInButtonText}
+    </Button>
+  );
+
+  const isAuthenticated = !!user?.username;
+  const {unreadCount, additional} = useAppNotifications(isAuthenticated);
+  const notificationLabel =
+    unreadCount === 0
+      ? 'Notifications'
+      : additional
+        ? `Notifications, more than ${unreadCount}`
+        : `Notifications, ${unreadCount}`;
+  // The search page has its own search box, so don't render a second one.
+  const searchingAllowed =
+    (quayConfig?.features?.ANONYMOUS_ACCESS || isAuthenticated) &&
+    location.pathname !== '/search';
+
+  return (
+    <>
+      <ErrorModal error={err} setError={setErr} />
+      <Toolbar id="toolbar" isFullHeight isStatic>
+        <ToolbarContent>
+          <ToolbarGroup
+            variant="action-group-plain"
+            align={{default: 'alignEnd'}}
+            gap={{default: 'gapNone', md: 'gapMd'}}
+            data-testid="header-action-group"
+          >
+            {searchingAllowed && (
+              <ToolbarItem data-testid="header-search-item">
+                <HeaderSearchBar />
+              </ToolbarItem>
+            )}
+            {isAuthenticated && (
+              <ToolbarItem
+                gap={{
+                  default: 'gapNone',
+                  md: 'gapSm',
+                  lg: 'gapMd',
+                  xl: 'gapLg',
+                }}
+              >
+                <NotificationBadge
+                  variant={
+                    unreadCount > 0
+                      ? NotificationBadgeVariant.unread
+                      : NotificationBadgeVariant.read
+                  }
+                  count={additional ? undefined : unreadCount}
+                  onClick={toggleDrawer}
+                  aria-label={notificationLabel}
+                  data-testid="notification-bell"
+                >
+                  {additional ? `${unreadCount}+` : undefined}
+                </NotificationBadge>
+              </ToolbarItem>
+            )}
+            <ToolbarItem>{helpDropdown}</ToolbarItem>
+            <ToolbarItem>
+              {isAuthenticated ? menuContainer : signInButton}
+            </ToolbarItem>
+          </ToolbarGroup>
+        </ToolbarContent>
+      </Toolbar>
+    </>
+  );
+}

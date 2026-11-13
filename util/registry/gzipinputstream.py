@@ -1,113 +1,176 @@
-import zlib
 import string
+import zlib
 
 BLOCK_SIZE = 16384
 """Read block size"""
 
+MAX_PEEK_SIZE = 65536
+"""Most bytes read to decide the stream format"""
+
 WINDOW_BUFFER_SIZE = 16 + zlib.MAX_WBITS
 """zlib window buffer size, set to gzip's format"""
 
+GZIP_MAGIC = b"\x1f\x8b"
+"""Leading bytes of every gzip member (RFC 1952)"""
+
+JSON_LEAD = (b"{", b"[")
+"""First non-whitespace byte of a JSON document"""
+
+HEAD_BYTES = 32
+"""How many leading bytes an UnrecognizedStreamError carries"""
+
+
+class UnrecognizedStreamError(ValueError):
+    """
+    The stream starts with neither the gzip magic nor a JSON document.
+
+    `head` holds the first HEAD_BYTES bytes for logging.
+    """
+
+    def __init__(self, head):
+        super().__init__("stream is neither gzip nor JSON")
+        self.head = head[:HEAD_BYTES]
+
 
 class GzipInputStream(object):
-  """
-  Simple class that allow streaming reads from GZip files.
-
-  Python 2.x gzip.GZipFile relies on .seek() and .tell(), so it
-  doesn't support this (@see: http://bo4.me/YKWSsL).
-
-  Adapted from: https://gist.github.com/beaufour/4205533
-  """
-
-  def __init__(self, fileobj):
     """
-    Initialize with the given file-like object.
+    Simple class that allow streaming reads from GZip files.
 
-    @param fileobj: file-like object,
-    """
-    self._file = fileobj
-    self._zip = zlib.decompressobj(WINDOW_BUFFER_SIZE)
-    self._offset = 0  # position in unzipped stream
-    self._data = ""
+    Python 2.x gzip.GZipFile relies on .seek() and .tell(), so it
+    doesn't support this (@see: http://bo4.me/YKWSsL).
 
-  def __fill(self, num_bytes):
-    """
-    Fill the internal buffer with 'num_bytes' of data.
+    The leading bytes decide how the stream is read, before any byte is served:
+    the gzip magic means decompress; a JSON document (after optional whitespace)
+    is passed through unchanged, because some storage backends (e.g. Google
+    Cloud Storage) decompress objects stored with Content-Encoding: gzip on the
+    way out; anything else raises UnrecognizedStreamError. A short first read
+    (e.g. a single leading byte) is not enough to decide, so reads of up to
+    BLOCK_SIZE are accumulated until the case is decided, the stream ends, or
+    the prefix reaches MAX_PEEK_SIZE (so at most just under MAX_PEEK_SIZE + BLOCK_SIZE).
+    `passthrough` tells the caller which of the first two applied. A stream
+    that starts with the gzip magic but is corrupt still raises zlib.error
+    while being read, and a truncated gzip stream still yields the partial
+    payload without error.
 
-    @param num_bytes: int, number of bytes to read in (0 = everything)
+    Adapted from: https://gist.github.com/beaufour/4205533
     """
 
-    if not self._zip:
-      return
+    def __init__(self, fileobj):
+        """
+        Initialize with the given file-like object.
 
-    while not num_bytes or len(self._data) < num_bytes:
-      data = self._file.read(BLOCK_SIZE)
-      if not data:
-        self._data = self._data + self._zip.flush()
-        self._zip = None  # no more data
-        break
+        @param fileobj: file-like object,
+        """
+        self._file = fileobj
+        self._zip = zlib.decompressobj(WINDOW_BUFFER_SIZE)
+        self._offset = 0  # position in unzipped stream
 
-      self._data = self._data + self._zip.decompress(data)
+        first = self._file.read(BLOCK_SIZE)
+        while True:
+            if first.startswith(GZIP_MAGIC):
+                break
+            still_could_be_magic = len(first) < len(GZIP_MAGIC) and GZIP_MAGIC.startswith(first)
+            if not still_could_be_magic and first.lstrip():
+                break
+            if len(first) >= MAX_PEEK_SIZE:
+                break
+            chunk = self._file.read(BLOCK_SIZE)
+            if not chunk:
+                break
+            first += chunk
 
-  def __iter__(self):
-    return self
+        if first.startswith(GZIP_MAGIC):
+            self.passthrough = False
+            self._data = self._zip.decompress(first)
+        elif first.lstrip().startswith(JSON_LEAD):
+            self.passthrough = True
+            self._data = first
+        else:
+            raise UnrecognizedStreamError(first)
 
-  def seek(self, offset, whence=0):
-    if whence == 0:
-      position = offset
-    elif whence == 1:
-      position = self._offset + offset
-    else:
-      raise IOError("Illegal argument")
+    def __fill(self, num_bytes):
+        """
+        Fill the internal buffer with 'num_bytes' of data.
 
-    if position < self._offset:
-      raise IOError("Cannot seek backwards")
+        @param num_bytes: int, number of bytes to read in (0 = everything)
+        """
 
-    # skip forward, in blocks
-    while position > self._offset:
-      if not self.read(min(position - self._offset, BLOCK_SIZE)):
-        break
+        if not self._zip:
+            return
 
-  def tell(self):
-    return self._offset
+        while not num_bytes or len(self._data) < num_bytes:
+            data = self._file.read(BLOCK_SIZE)
+            if not data:
+                if not self.passthrough:
+                    self._data = self._data + self._zip.flush()
+                self._zip = None  # no more data
+                break
 
-  def read(self, size=0):
-    self.__fill(size)
-    if size:
-      data = self._data[:size]
-      self._data = self._data[size:]
-    else:
-      data = self._data
-      self._data = ""
+            if self.passthrough:
+                self._data = self._data + data
+            else:
+                self._data = self._data + self._zip.decompress(data)
 
-    self._offset = self._offset + len(data)
-    return data
+    def __iter__(self):
+        return self
 
-  def next(self):
-    line = self.readline()
-    if not line:
-      raise StopIteration()
-    return line
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            position = offset
+        elif whence == 1:
+            position = self._offset + offset
+        else:
+            raise IOError("Illegal argument")
 
-  def readline(self):
-    # make sure we have an entire line
-    while self._zip and "\n" not in self._data:
-      self.__fill(len(self._data) + 512)
+        if position < self._offset:
+            raise IOError("Cannot seek backwards")
 
-    pos = string.find(self._data, "\n") + 1
-    if pos <= 0:
-      return self.read()
+        # skip forward, in blocks
+        while position > self._offset:
+            if not self.read(min(position - self._offset, BLOCK_SIZE)):
+                break
 
-    return self.read(pos)
+    def tell(self):
+        return self._offset
 
-  def readlines(self):
-    lines = []
-    while True:
-      line = self.readline()
-      if not line:
-        break
+    def read(self, size=0):
+        self.__fill(size)
+        if size:
+            data = self._data[:size]
+            self._data = self._data[size:]
+        else:
+            data = self._data
+            self._data = b""
 
-      lines.append(line)
-    return lines
+        self._offset = self._offset + len(data)
+        return data
 
-  def close(self):
-    self._file.close()
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration()
+        return line
+
+    def readline(self):
+        # make sure we have an entire line
+        while self._zip and b"\n" not in self._data:
+            self.__fill(len(self._data) + 512)
+
+        pos = self._data.find(b"\n") + 1
+        if pos <= 0:
+            return self.read()
+
+        return self.read(pos)
+
+    def readlines(self):
+        lines = []
+        while True:
+            line = self.readline()
+            if not line:
+                break
+
+            lines.append(line)
+        return lines
+
+    def close(self):
+        self._file.close()

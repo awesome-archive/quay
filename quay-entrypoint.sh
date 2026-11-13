@@ -10,7 +10,7 @@ if ! whoami &> /dev/null; then
 fi
 
 display_usage() {
-    echo "Usage: ${0} <registry|config|migrate|repomirror|shell|help>"
+    echo "Usage: ${0} <registry|config|migrate|repomirror|servicekey-expire|shell|help>"
     echo
     echo "If the first argument isn't one of the above modes,"
     echo "the arguments will be exec'd directly, i.e.:"
@@ -34,68 +34,88 @@ cat << "EOF"
  \ \/ \ \/ /   \_  ___/  \____/ /_/    \_\ |_|
   \__/ \__/      \ \__
                   \___\ by Red Hat
-
  Build, Store, and Distribute your Containers
-
-
 EOF
 
 # Custom environment variables for use in conf/supervisord.conf
 # The gunicorn-registry process DB_CONNECTION_POOLING must default to true
 export DB_CONNECTION_POOLING_REGISTRY=${DB_CONNECTION_POOLING:-"true"}
+export CONFIG_APP_PASSWORD=${CONFIG_APP_PASSWORD:-"\"\""}
+export OPERATOR_ENDPOINT=${OPERATOR_ENDPOINT:-"\"\""}
+export QUAY_CONFIG_READ_ONLY_FIELD_GROUPS=${QUAY_CONFIG_READ_ONLY_FIELD_GROUPS:-"\"\""}
 
 case "$QUAYENTRY" in
     "shell")
         echo "Entering shell mode"
-        exec /usr/bin/scl enable python27 rh-nginx112 /bin/bash
-        ;;
-    "config")
-        echo "Entering config mode, only copying config-app entrypoints"
-        if [ -z "$2" ]
-        then
-            if [ -z "${CONFIG_APP_PASSWORD}" ]
-            then
-                echo "Missing password for configuration tool"
-                exit
-            else
-                openssl passwd -apr1 "${CONFIG_APP_PASSWORD}" >> $QUAYDIR/config_app/conf/htpasswd
-            fi
-        else
-            openssl passwd -apr1 "$2" >> $QUAYDIR/config_app/conf/htpasswd
-        fi
-
-        /usr/bin/scl enable python27 rh-nginx112 "${QUAYPATH}/config_app/init/certs_create.sh"
-        /usr/bin/scl enable python27 rh-nginx112 "supervisord -c ${QUAYPATH}/config_app/conf/supervisord.conf 2>&1"
+        exec /bin/bash
         ;;
     "migrate")
-        echo "Entering migration mode to version: ${2}"
-        exec /usr/bin/scl enable python27 rh-nginx112 "PYTHONPATH=${QUAYPATH} ENCRYPTED_ROBOT_TOKEN_MIGRATION_PHASE=remove-old-fields alembic upgrade ${2}"
+        echo ""; echo "Startup timestamp: "; date; echo ""
+        : "${MIGRATION_VERSION:=$2}"
+        : "${MIGRATION_VERSION:?Missing version argument}"
+        "${QUAYPATH}/conf/init/certs_install.sh" || exit
+        "${QUAYPATH}/conf/init/client_certs.sh" || exit
+        echo "Entering migration mode to version: ${MIGRATION_VERSION}"
+        PYTHONPATH="${PYTHONPATH}:${QUAYPATH}" alembic upgrade "${MIGRATION_VERSION}"
         ;;
-    "repomirror")
-        echo "Entering repository mirroring mode"
-        if [ -z "${QUAY_SERVICES}" ]
-        then
-            export QUAY_SERVICES=repomirrorworker,prometheus-aggregator
-        else
-            export QUAY_SERVICES=${QUAY_SERVICES},repomirrorworker,prometheus-aggregator
-        fi
-        ;&
+    "registry-nomigrate")
+        echo ""; echo "Startup timestamp: "; date; echo ""
+        echo "Running all default registry services without migration"
+        for f in "${QUAYCONF}"/init/*.sh; do
+            if [ "$f" != "/quay-registry/conf/init/runmigration.sh" ]; then
+                echo "Running init script '$f'"
+                ENSURE_NO_MIGRATION=true "$f" || exit
+            fi
+        done
+        exec supervisord -c "${QUAYCONF}/supervisord.conf" 2>&1
+        ;;
     "registry")
-        if [ -z "${QUAY_SERVICES}" ]
-        then
+        echo ""; echo "Startup timestamp: "; date; echo ""
+        if [ -z "${QUAY_SERVICES}" ]; then
             echo "Running all default registry services"
         else
             echo "Running services ${QUAY_SERVICES}"
         fi
-        for f in $(ls ${QUAYCONF}/init/*.sh); do
+        for f in "${QUAYCONF}"/init/*.sh; do
             echo "Running init script '$f'"
-            /usr/bin/scl enable python27 rh-nginx112 "$f" || exit -1;
+            "$f" || exit
         done
-        /usr/bin/scl enable python27 rh-nginx112 "supervisord -c ${QUAYCONF}/supervisord.conf 2>&1"
+        exec supervisord -c "${QUAYCONF}/supervisord.conf" 2>&1
+        ;;
+    "repomirror-nomigrate")
+        echo ""; echo "Startup timestamp: "; date; echo ""
+        echo "Entering repository mirroring mode"
+        export QUAY_SERVICES="${QUAY_SERVICES}${QUAY_SERVICES:+,}repomirrorworker,pushgateway"
+        echo "Running services ${QUAY_SERVICES}"
+        for f in "${QUAYCONF}"/init/*.sh; do
+            if [ "$f" != "/quay-registry/conf/init/runmigration.sh" ]; then
+                echo "Running init script '$f'"
+                ENSURE_NO_MIGRATION=true "$f" || exit
+            fi
+        done
+        exec supervisord -c "${QUAYCONF}/supervisord.conf" 2>&1
+        ;;
+    "repomirror")
+        echo ""; echo "Startup timestamp: "; date; echo ""
+        echo "Entering repository mirroring mode"
+        export QUAY_SERVICES="${QUAY_SERVICES}${QUAY_SERVICES:+,}repomirrorworker,pushgateway"
+        echo "Running services ${QUAY_SERVICES}"
+        for f in "${QUAYCONF}"/init/*.sh; do
+            echo "Running init script '$f'"
+            "$f" || exit
+        done
+        exec supervisord -c "${QUAYCONF}/supervisord.conf" 2>&1
+        ;;
+    "servicekey-expire")
+        echo "Expiring service key"
+        "${QUAYPATH}/conf/init/certs_install.sh" || exit
+        "${QUAYPATH}/conf/init/client_certs.sh" || exit
+        shift
+        PYTHONPATH="${PYTHONPATH}:${QUAYPATH}" python3 \
+            "${QUAYPATH}/tools/manage_servicekey.py" expire "$@"
         ;;
     *)
         echo "Running '$QUAYENTRY'"
-        /usr/bin/scl enable python27 rh-nginx112 "$QUAYENTRY" || exit -1;
+        eval exec "$@"
         ;;
 esac
-

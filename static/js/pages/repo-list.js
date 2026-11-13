@@ -21,6 +21,8 @@
     $scope.resources = [];
     $scope.Features = Features;
     $scope.inReadOnlyMode = StateService.inReadOnlyMode();
+    $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR
+    $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT && Config.FEATURE_EDIT_QUOTA;
 
     // When loading the UserService, if the user is logged in, create a list of
     // relevant namespaces and collect the relevant repositories.
@@ -103,10 +105,12 @@
           'namespace': namespace.name,
           'last_modified': true,
           'popularity': true,
-          'public': namespace.public
+          'public': namespace.public,
+          'state': true,
+          'quota': $scope.quotaManagementEnabled,
         };
 
-        namespace.repositories = ApiService.listReposAsResource().withOptions(options).get(function(resp) {
+        namespace.repositories = ApiService.listReposAsResource().withPagination('repositories').withOptions(options).get(function(resp) {
           return resp.repositories.map(findDuplicateRepo);
         });
 

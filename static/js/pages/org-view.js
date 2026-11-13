@@ -23,6 +23,7 @@
     $scope.showTeamsCounter = 0;
     $scope.changeEmailInfo = null;
     $scope.context = {};
+    $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT && Config.FEATURE_EDIT_QUOTA;
 
     $scope.Config = Config;
     $scope.Features = Features;
@@ -31,20 +32,52 @@
       'changingOrganization': false,
       'organizationEmail': ''
     };
+    $scope.disk_size_units = {
+      'KiB': 1024,
+      'MiB': 1024**2,
+      'GiB': 1024**3,
+      'TiB': 1024**4,
+      };
+    $scope.quotaUnits = Object.keys($scope.disk_size_units);
+
 
     $scope.$watch('orgScope.organizationEmail', function(e) {
       UIService.hidePopover('#changeEmailForm input');
     });
+
+    $scope.bytesToHumanReadableString = function(bytes) {
+      let units = Object.keys($scope.disk_size_units).reverse();
+      let result = null;
+      let byte_unit = null;
+
+      for (const key in units) {
+        byte_unit = units[key];
+        result = (bytes / $scope.disk_size_units[byte_unit]).toFixed(2);
+        if (bytes >= $scope.disk_size_units[byte_unit]) {
+          return result.toString() + " " + byte_unit;
+        }
+      }
+
+      return result.toString() + " " + byte_unit;
+    };
+
+    $scope.quotaPercentConsumed = function(organization) {
+      if (organization.quota_report && organization.quota_report.configured_quota) {
+	return Math.round(organization.quota_report.quota_bytes / organization.quota_report.configured_quota * 100);
+      }
+      return 0;
+    };
 
     var loadRepositories = function() {
       var options = {
         'namespace': orgname,
         'public': true,
         'last_modified': true,
-        'popularity': true
+        'popularity': true,
+        'quota': $scope.quotaManagementEnabled,
       };
 
-      $scope.organization.repositories = ApiService.listReposAsResource().withOptions(options).get(function(resp) {
+      $scope.organization.repositories = ApiService.listReposAsResource().withPagination('repositories').withOptions(options).get(function(resp) {
         return resp.repositories;
       });
     };

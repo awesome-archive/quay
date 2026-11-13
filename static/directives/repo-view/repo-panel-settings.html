@@ -1,7 +1,14 @@
 <div class="repo-panel-settings-element">
   <h3 class="tab-header"><span class="repository-title" repository="repository"></span> Settings</h3>
 
-    <!-- User/Team Permissions -->
+  <div ng-if="Config.FEATURE_AUTO_PRUNE && Config.DEFAULT_NAMESPACE_AUTOPRUNE_POLICY != null">
+    <div class="co-alert co-alert-warning" >
+     Registry wide autopruning is in effect <i class="fa fa-info-circle" data-title="Tags will be pruned across all repositories with the policy method: {{Config.DEFAULT_NAMESPACE_AUTOPRUNE_POLICY.method}} and value: {{Config.DEFAULT_NAMESPACE_AUTOPRUNE_POLICY.value}}" bs-tooltip></i>
+     </div>
+    <br/>
+  </div>
+
+   <!-- User/Team Permissions -->
     <div class="co-panel" id="repoPermissions">
       <div class="co-panel-heading"><i class="fa fa-key"></i> User and Robot Permissions</div>
       <div class="panel-body" style="padding-top: 5px;">
@@ -70,21 +77,13 @@
           <i class="fa fa-refresh lock-icon" quay-show="Features.REPO_MIRROR && repository.state == 'MIRROR'" ng-show="repository.state == 'MIRROR'"></i>
 
           <div>
-            This <span class="repository-title" repository="repository"></span> state is currently <b>{{ repository.state }}</b>.
+            This <span class="repository-title" repository="repository"></span> state is currently <b>{{ selectedState.title }}</b>.
             <span ng-show="repository.state == 'NORMAL'">Standard permissions apply.</span>
             <span ng-show="repository.state == 'READ_ONLY'">Users will not be able to push or modify images.</span>
             <span ng-show="repository.state == 'MIRROR'" quay-show="Features.REPO_MIRROR && repository.state == 'MIRROR'">The images and tags are maintained by Quay and Users can not push or modify them.</span>
           </div>
 
-          <!-- TODO: Enhance the appearance of this. Move style to .css file. -->
-          <div style="margin-top: 1em">
-            <form>
-              <select ng-options="option for option in repoStates"
-                      ng-model="selectedState"
-                      ng-change="changeState()"></select>
-            </form>
-          </div>
-
+          <repo-state options="repoStates" selected-state="selectedState" on-change="changeState($event)"></repo-state>
         </div>
       </div>
     </div>
@@ -160,12 +159,19 @@
     <div class="cor-confirm-dialog"
        dialog-context="deleteRepoInfo"
        dialog-action="deleteRepo(info, callback)"
-       dialog-title="Delete"
-       dialog-action-title="Delete">
-     <div class="co-alert co-alert-danger" style="margin-bottom: 10px;">
-       This action cannot be undone!
-     </div>
+       dialog-title="Delete {{repository.namespace}}/{{repository.name}}"
+       dialog-action-title="Delete"
+       dialog-form="context.deleterepoform"
+       dialog-button-class="btn-danger">
+      <form name="context.deleterepoform" class="co-single-field-dialog">
+        <div class="co-alert co-alert-danger">
+          You are requesting to delete the repository <strong>{{repository.namespace}}/{{repository.name}}</strong>. This action is <strong>non-reversable</strong>.
+        </div>
 
-     Continue with deletion of this <span class="repository-title" repository="repository"></span>?
-  </div>
+        You must type <code>{{repository.namespace}}/{{repository.name}}</code> below to confirm deletion:
+        <input type="text" class="form-control" placeholder="Enter repository here"
+            ng-model="deleteRepoInfo.verification" ng-pattern="deleteRepoInfo.verificationRegex" match="deleteRepoInfo.verificationRegex"
+            required>
+      </form>
+    </div>
 </div>

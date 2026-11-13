@@ -11,11 +11,9 @@
   }]);
 
   function RepoViewCtrl($scope, $routeParams, $rootScope, $timeout, ApiService,
-                        UserService, AngularPollChannel, ImageLoaderService, UtilService) {
+                        UserService, AngularPollChannel, UtilService) {
     $scope.namespace = $routeParams.namespace;
     $scope.name = $routeParams.name;
-
-    var imageLoader = ImageLoaderService.getLoader($scope.namespace, $scope.name);
 
     // Tab-enabled counters.
     $scope.infoShown = 0;
@@ -29,7 +27,6 @@
     $scope.viewScope = {
       'selectedTags': [],
       'repository': null,
-      'imageLoader': imageLoader,
       'builds': null,
       'historyFilter': '',
       'repositoryTags': null,
@@ -68,6 +65,12 @@
         'onlyActiveTags': true
       };
 
+      const urlSearchParams = new URLSearchParams(window.location.search);
+      const urlParams = Object.fromEntries(urlSearchParams.entries());
+      if (urlParams['filter_tag_name']) {
+        params['filter_tag_name'] = urlParams['filter_tag_name'];
+      }
+
       ApiService.listRepoTags(null, params).then(function(resp) {
         var newTags = resp.tags.reduce(function(result, item, index, array) {
           var tag_name = item['name'];
@@ -80,8 +83,8 @@
         if (resp.has_additional) {
           loadPaginatedRepositoryTags(page + 1);
         } else {
-	  $scope.viewScope.tagsLoading = false;
-	}
+          $scope.viewScope.tagsLoading = false;
+        }
       });
     };
 

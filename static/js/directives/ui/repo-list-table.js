@@ -12,13 +12,16 @@ angular.module('quay').directive('repoListTable', function () {
       'repositoriesResources': '=repositoriesResources',
       'namespaces': '=namespaces',
       'starToggled': '&starToggled',
-      'repoKind': '@repoKind'    },
-    controller: function($scope, $element, $filter, TableService, UserService, StateService) {
+      'repoKind': '@repoKind',
+      'repoMirroringEnabled': '=repoMirroringEnabled'
+    },
+    controller: function($scope, $element, $filter, TableService, UserService, StateService, Config) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.repositories = null;
       $scope.orderedRepositories = [];
-      $scope.reposPerPage = 50;
-
+      $scope.reposPerPage = 25;
+      $scope.quotaManagementEnabled = Config.FEATURE_QUOTA_MANAGEMENT && Config.FEATURE_EDIT_QUOTA;
+      $scope.repoMirroringEnabled = Config.FEATURE_REPO_MIRROR;
       $scope.maxPopularity = 0;
       $scope.options = {
         'predicate': 'popularity',
@@ -26,13 +29,20 @@ angular.module('quay').directive('repoListTable', function () {
         'filter': null,
         'page': 0
       };
+      $scope.disk_size_units = {
+        'KiB': 1024,
+        'MiB': 1024**2,
+        'GiB': 1024**3,
+        'TiB': 1024**4,
+      };
+      $scope.quotaUnits = Object.keys($scope.disk_size_units);
 
       var buildOrderedRepositories = function() {
         if (!$scope.repositories) { return; }
 
         $scope.orderedRepositories = TableService.buildOrderedItems($scope.repositories,
             $scope.options,
-            ['namespace', 'name'], ['last_modified_datetime', 'popularity'])
+            ['namespace', 'name', 'state'], ['last_modified_datetime', 'popularity', 'quota_report'])
       };
 
       $scope.tablePredicateClass = function(name, predicate, reverse) {
@@ -51,6 +61,28 @@ angular.module('quay').directive('repoListTable', function () {
 
         $scope.options.reverse = false;
         $scope.options.predicate = predicate;
+      };
+
+      $scope.bytesToHumanReadableString = function(bytes) {
+        let units = Object.keys($scope.disk_size_units).reverse();
+        let result = null;
+        let byte_unit = null;
+        for (const key in units) {
+          byte_unit = units[key];
+          result = (bytes / $scope.disk_size_units[byte_unit]).toFixed(2);
+          if (bytes >= $scope.disk_size_units[byte_unit]) {
+            return result.toString() + " " + byte_unit;
+          }
+        }
+
+        return result.toString() + " " + byte_unit;
+      };
+
+      $scope.quotaPercentConsumed = function(repository) {
+	      if (repository.quota_report && repository.quota_report.configured_quota) {
+	        return Math.round(repository.quota_report.quota_bytes / repository.quota_report.configured_quota * 100);
+	      }
+	      return 0;
       };
 
       $scope.getAvatarData = function(namespace) {

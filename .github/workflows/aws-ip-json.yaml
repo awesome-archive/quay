@@ -1,0 +1,28 @@
+name: Download AWS IP ranges
+
+on:
+  # push:
+  #   paths:
+  #     - .github/workflows/aws-ip-json.yml # run workflow every time this file changes
+  workflow_dispatch:
+  # unschedule for now. we must wait until the flat action can open a PRs,
+  # then set it to do so against master.
+  # this means this workflow needs to run manually against the target branches.
+  # schedule:
+  #   - cron: '0 0 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  scheduled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fetch data
+        uses: githubocto/flat@fc34373cc20b987e89d75d96435a9fecd8fb0807 # v3
+        with:
+          http_url: https://ip-ranges.amazonaws.com/ip-ranges.json
+          downloaded_filename: util/ipresolver/aws-ip-ranges.json

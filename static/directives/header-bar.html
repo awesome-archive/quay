@@ -23,7 +23,6 @@
         <!-- Signed in -->
         <ul class="nav navbar-nav navbar-links" ng-if="!user.anonymous">
           <li ng-if="searchingAllowed"><a ng-href="/search" quay-section="search">Explore</a></li>
-          <li quay-require="['APP_REGISTRY']"><a ng-href="/application/" quay-section="application">Applications</a></li>
           <li><a ng-href="/repository/" quay-section="repository">Repositories</a></li>
           <li><a ng-href="/tutorial/" quay-section="tutorial" ng-if="!inReadOnlyMode">Tutorial</a></li>
         </ul>
@@ -38,13 +37,15 @@
             <a ng-click="signout()">Sign out all sessions</a>
           </li>
           <li ng-switch-default>
-            <a class="user-view" href="/signin/" ng-if="!externalSigninUrl">Sign in</a>
-            <a class="user-view" ng-href="{{ externalSigninUrl }}" ng-if="externalSigninUrl">Sign in</a>
+            <a class="user-view" href="/signin/">Sign in</a>
           </li>
         </ul>
 
         <!-- Normal -->
         <ul class="nav navbar-nav navbar-right hidden-xs" ng-switch on="user.anonymous">
+          <li class="new-ui-toggle" ng-if="shouldShowNewUiToggle() && !user.anonymous && user.prompts && user.prompts.length == 0">
+              <new-ui-toggle></new-ui-toggle>
+          </li>
           <li>
             <span class="navbar-left user-tools"
                   ng-class="{'navbar-anon': user.anonymous, 'navbar-signedin': !user.anonymous}">
@@ -131,8 +132,7 @@
             </ul>
           </li>
           <li ng-switch-default>
-            <a class="user-view" href="/signin/" ng-if="!externalSigninUrl">Sign in</a>
-            <a class="user-view" ng-href="{{ externalSigninUrl }}" ng-if="externalSigninUrl">Sign in</a>
+            <a class="user-view" href="/signin/">Sign in</a>
           </li>
         </ul>
       </div><!-- /.navbar-collapse -->

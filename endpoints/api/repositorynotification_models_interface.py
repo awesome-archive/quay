@@ -1,5 +1,4 @@
 import json
-
 from abc import ABCMeta, abstractmethod
 from collections import namedtuple
 
@@ -7,140 +6,154 @@ from six import add_metaclass
 
 
 class RepositoryNotification(
-    namedtuple('RepositoryNotification', [
-        'uuid',
-        'title',
-        'event_name',
-        'method_name',
-        'config_json',
-        'event_config_json',
-        'number_of_failures',
-    ])):
-  """
-  RepositoryNotification represents a notification for a repository.
-  :type uuid: string
-  :type event: string
-  :type method: string
-  :type config: string
-  :type title: string
-  :type event_config: string
-  :type number_of_failures: int
-  """
+    namedtuple(
+        "RepositoryNotification",
+        [
+            "uuid",
+            "title",
+            "event_name",
+            "method_name",
+            "config_json",
+            "event_config_json",
+            "number_of_failures",
+        ],
+    )
+):
+    """
+    RepositoryNotification represents a notification for a repository.
 
-  def to_dict(self):
-    try:
-      config = json.loads(self.config_json)
-    except ValueError:
-      config = {}
+    :type uuid: string
+    :type event: string
+    :type method: string
+    :type config: string
+    :type title: string
+    :type event_config: string
+    :type number_of_failures: int
+    """
 
-    try:
-      event_config = json.loads(self.event_config_json)
-    except ValueError:
-      event_config = {}
+    def to_dict(self):
+        try:
+            config = json.loads(self.config_json)
+        except ValueError:
+            config = {}
 
-    return {
-      'uuid': self.uuid,
-      'title': self.title,
-      'event': self.event_name,
-      'method': self.method_name,
-      'config': config,
-      'event_config': event_config,
-      'number_of_failures': self.number_of_failures,
-    }
+        try:
+            event_config = json.loads(self.event_config_json)
+        except ValueError:
+            event_config = {}
+
+        return {
+            "uuid": self.uuid,
+            "title": self.title,
+            "event": self.event_name,
+            "method": self.method_name,
+            "config": config,
+            "event_config": event_config,
+            "number_of_failures": self.number_of_failures,
+        }
 
 
 @add_metaclass(ABCMeta)
 class RepoNotificationInterface(object):
-  """
-  Interface that represents all data store interactions required by the RepositoryNotification API
-  """
-
-  @abstractmethod
-  def create_repo_notification(self, namespace_name, repository_name, event_name, method_name,
-                               method_config, event_config, title=None):
+    """
+    Interface that represents all data store interactions required by the RepositoryNotification
+    API.
     """
 
-    Args:
-      namespace_name: namespace of repository
-      repository_name: name of repository
-      event_name: name of event
-      method_name: name of method
-      method_config: method config, json string
-      event_config: event config, json string
-      title: title of the notification
+    @abstractmethod
+    def create_repo_notification(
+        self,
+        namespace_name,
+        repository_name,
+        event_name,
+        method_name,
+        method_config,
+        event_config,
+        title=None,
+    ):
+        """
 
-    Returns:
-      RepositoryNotification object
+        Args:
+          namespace_name: namespace of repository
+          repository_name: name of repository
+          event_name: name of event
+          method_name: name of method
+          method_config: method config, json string
+          event_config: event config, json string
+          title: title of the notification
 
-    """
-    pass
+        Returns:
+          RepositoryNotification object
 
-  @abstractmethod
-  def list_repo_notifications(self, namespace_name, repository_name, event_name=None):
-    """
+        """
+        pass
 
-    Args:
-      namespace_name: namespace of repository
-      repository_name: name of repository
-      event_name: name of event
+    @abstractmethod
+    def list_repo_notifications(self, namespace_name, repository_name, event_name=None):
+        """
 
-    Returns:
-      list(RepositoryNotification)
-    """
-    pass
+        Args:
+          namespace_name: namespace of repository
+          repository_name: name of repository
+          event_name: name of event
 
-  @abstractmethod
-  def get_repo_notification(self, uuid):
-    """
+        Returns:
+          list(RepositoryNotification)
+        """
+        pass
 
-    Args:
-      uuid: uuid of notification
+    @abstractmethod
+    def get_repo_notification(self, uuid):
+        """
 
-    Returns:
-      RepositoryNotification or None
+        Args:
+          uuid: uuid of notification
 
-    """
-    pass
+        Returns:
+          RepositoryNotification or None
 
-  @abstractmethod
-  def delete_repo_notification(self, namespace_name, repository_name, uuid):
-    """
+        """
+        pass
 
-    Args:
-      namespace_name: namespace of repository
-      repository_name: name of repository
-      uuid: uuid of notification
+    @abstractmethod
+    def delete_repo_notification(self, namespace_name, repository_name, uuid):
+        """
 
-    Returns:
-      RepositoryNotification or None
+        Args:
+          namespace_name: namespace of repository
+          repository_name: name of repository
+          uuid: uuid of notification
 
-    """
-    pass
+        Returns:
+          RepositoryNotification or None
 
-  @abstractmethod
-  def reset_notification_number_of_failures(self, namespace_name, repository_name, uuid):
-    """
+        """
+        pass
 
-    Args:
-      namespace_name: namespace of repository
-      repository_name: name of repository
-      uuid: uuid of notification
+    @abstractmethod
+    def reset_notification_number_of_failures(self, namespace_name, repository_name, uuid):
+        """
 
-    Returns:
-      RepositoryNotification
+        Args:
+          namespace_name: namespace of repository
+          repository_name: name of repository
+          uuid: uuid of notification
 
-    """
-    pass
+        Returns:
+          RepositoryNotification
 
-  @abstractmethod
-  def queue_test_notification(self, uuid):
-    """
+        """
+        pass
 
-    Args:
-      uuid: uuid of notification
+    @abstractmethod
+    def queue_test_notification(self, uuid):
+        """
 
-    Returns:
-      RepositoryNotification or None
+        Args:
+          uuid: uuid of notification
 
-    """
-    pass
+        Returns:
+          RepositoryNotification or None
+
+        """
+        pass

@@ -1,778 +1,160 @@
 import os
-import pytest
-import json
-import yaml
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+
 import jinja2
-
-from ..supervisord_conf_create import QUAYCONF_DIR, default_services, limit_services
-
-def render_supervisord_conf(config):
-  with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../supervisord.conf.jnj")) as f:
-    template = jinja2.Template(f.read())
-  return template.render(config=config)
-
-def test_supervisord_conf_create_defaults():
-  config = default_services()
-  limit_services(config, [])
-  rendered = render_supervisord_conf(config)
-
-  expected = """[supervisord]
-nodaemon=true
-
-[unix_http_server]
-file=%(ENV_QUAYCONF)s/supervisord.sock
-user=root
-
-[supervisorctl]
-serverurl=unix:///%(ENV_QUAYCONF)s/supervisord.sock
-
-[rpcinterface:supervisor]
-supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
-
-[eventlistener:stdout]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command = supervisor_stdout
-buffer_size = 1024
-events = PROCESS_LOG
-result_handler = supervisor_stdout:event_handler
-
-;;; Run batch scripts
-[program:blobuploadcleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.blobuploadcleanupworker.blobuploadcleanupworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:buildlogsarchiver]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.buildlogsarchiver.buildlogsarchiver
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:builder]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m buildman.builder
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:chunkcleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.chunkcleanupworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:expiredappspecifictokenworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.expiredappspecifictokenworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:exportactionlogsworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.exportactionlogsworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gcworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.gc.gcworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:globalpromstats]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.globalpromstats.globalpromstats
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:labelbackfillworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.labelbackfillworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:logrotateworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.logrotateworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:namespacegcworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.namespacegcworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:notificationworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.notificationworker.notificationworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:queuecleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.queuecleanupworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:repositoryactioncounter]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.repositoryactioncounter
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:security_notification_worker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.security_notification_worker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:securityworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.securityworker.securityworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:storagereplication]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.storagereplication
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:tagbackfillworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.tagbackfillworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:teamsyncworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.teamsyncworker.teamsyncworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-;;; Run interactive scripts
-[program:dnsmasq]
-command=/usr/sbin/dnsmasq --no-daemon --user=root --listen-address=127.0.0.1 --port=8053
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-registry]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s,
-  DB_CONNECTION_POOLING=%(ENV_DB_CONNECTION_POOLING_REGISTRY)s
-command=nice -n 10 gunicorn -c %(ENV_QUAYCONF)s/gunicorn_registry.py registry:application
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-secscan]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=gunicorn -c %(ENV_QUAYCONF)s/gunicorn_secscan.py secscan:application
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-verbs]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=nice -n 10 gunicorn -c %(ENV_QUAYCONF)s/gunicorn_verbs.py verbs:application
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-web]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=gunicorn -c %(ENV_QUAYCONF)s/gunicorn_web.py web:application
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:jwtproxy]
-command=/usr/local/bin/jwtproxy --config %(ENV_QUAYCONF)s/jwtproxy_conf.yaml
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:memcache]
-command=memcached -u memcached -m 64 -l 127.0.0.1 -p 18080
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:nginx]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=nginx -c %(ENV_QUAYCONF)s/nginx/nginx.conf
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:prometheus-aggregator]
-command=/usr/local/bin/prometheus-aggregator
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:servicekey]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.servicekeyworker.servicekeyworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:repomirrorworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.repomirrorworker.repomirrorworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-# EOF NO NEWLINE"""
-  assert rendered == expected
-
-def test_supervisord_conf_create_all_overrides():
-  config = default_services()
-  limit_services(config, "servicekey,prometheus-aggregator")
-  rendered = render_supervisord_conf(config)
-
-  expected = """[supervisord]
-nodaemon=true
-
-[unix_http_server]
-file=%(ENV_QUAYCONF)s/supervisord.sock
-user=root
-
-[supervisorctl]
-serverurl=unix:///%(ENV_QUAYCONF)s/supervisord.sock
-
-[rpcinterface:supervisor]
-supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
-
-[eventlistener:stdout]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command = supervisor_stdout
-buffer_size = 1024
-events = PROCESS_LOG
-result_handler = supervisor_stdout:event_handler
-
-;;; Run batch scripts
-[program:blobuploadcleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.blobuploadcleanupworker.blobuploadcleanupworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:buildlogsarchiver]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.buildlogsarchiver.buildlogsarchiver
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:builder]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m buildman.builder
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:chunkcleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.chunkcleanupworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:expiredappspecifictokenworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.expiredappspecifictokenworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:exportactionlogsworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.exportactionlogsworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gcworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.gc.gcworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:globalpromstats]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.globalpromstats.globalpromstats
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:labelbackfillworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.labelbackfillworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:logrotateworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.logrotateworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:namespacegcworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.namespacegcworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:notificationworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.notificationworker.notificationworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:queuecleanupworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.queuecleanupworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:repositoryactioncounter]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.repositoryactioncounter
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:security_notification_worker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.security_notification_worker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:securityworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.securityworker.securityworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:storagereplication]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.storagereplication
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:tagbackfillworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.tagbackfillworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:teamsyncworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.teamsyncworker.teamsyncworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-;;; Run interactive scripts
-[program:dnsmasq]
-command=/usr/sbin/dnsmasq --no-daemon --user=root --listen-address=127.0.0.1 --port=8053
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-registry]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s,
-  DB_CONNECTION_POOLING=%(ENV_DB_CONNECTION_POOLING_REGISTRY)s
-command=nice -n 10 gunicorn -c %(ENV_QUAYCONF)s/gunicorn_registry.py registry:application
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-secscan]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=gunicorn -c %(ENV_QUAYCONF)s/gunicorn_secscan.py secscan:application
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-verbs]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=nice -n 10 gunicorn -c %(ENV_QUAYCONF)s/gunicorn_verbs.py verbs:application
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:gunicorn-web]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=gunicorn -c %(ENV_QUAYCONF)s/gunicorn_web.py web:application
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:jwtproxy]
-command=/usr/local/bin/jwtproxy --config %(ENV_QUAYCONF)s/jwtproxy_conf.yaml
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:memcache]
-command=memcached -u memcached -m 64 -l 127.0.0.1 -p 18080
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:nginx]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=nginx -c %(ENV_QUAYCONF)s/nginx/nginx.conf
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:prometheus-aggregator]
-command=/usr/local/bin/prometheus-aggregator
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:servicekey]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.servicekeyworker.servicekeyworker
-autostart = true
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-
-[program:repomirrorworker]
-environment=
-  PYTHONPATH=%(ENV_QUAYDIR)s
-command=python -m workers.repomirrorworker.repomirrorworker
-autostart = false
-stdout_logfile=/dev/stdout
-stdout_logfile_maxbytes=0
-stderr_logfile=/dev/stdout
-stderr_logfile_maxbytes=0
-stdout_events_enabled = true
-stderr_events_enabled = true
-# EOF NO NEWLINE"""
-  assert rendered == expected
+import pytest
+from six import iteritems
+from supervisor.options import ServerOptions
+
+from ..supervisord_conf_create import (
+    MAX_GUNICORN_TIMEOUT,
+    QUAY_OVERRIDE_SERVICES,
+    QUAY_SERVICES,
+    limit_services,
+    override_services,
+    registry_services,
+)
+
+
+@contextmanager
+def environ(**kwargs):
+    original_env = {key: os.getenv(key) for key in kwargs}
+    os.environ.update(**kwargs)
+    try:
+        yield
+    finally:
+        for key, value in iteritems(original_env):
+            if value is None:
+                del os.environ[key]
+            else:
+                os.environ[key] = value
+
+
+def render_supervisord_conf(config, **extra_vars):
+    with open(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../supervisord.conf.jnj")
+    ) as f:
+        template = jinja2.Template(f.read())
+    return template.render(config=config, **extra_vars)
+
+
+def test_supervisord_conf_create_registry():
+    config = registry_services()
+    limit_services(config, [])
+    rendered_config_file = render_supervisord_conf(config)
+
+    with environ(
+        QUAYPATH=".", QUAYDIR="/", QUAYCONF="/conf", DB_CONNECTION_POOLING_REGISTRY="true"
+    ):
+        opts = ServerOptions()
+
+        with tempfile.NamedTemporaryFile(mode="w") as f:
+            f.write(rendered_config_file)
+            f.flush()
+
+            opts.searchpaths = [f.name]
+            assert opts.default_configfile() == f.name
+
+
+class TestGunicornTimeouts:
+    def test_registry_timeout_default(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(config)
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_registry\.py", rendered)
+        assert match is not None, "gunicorn-registry should have --timeout flag"
+        assert match.group(1) == "30"
+
+    def test_registry_timeout_custom(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(config, gunicorn_registry_timeout=300)
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_registry\.py", rendered)
+        assert match is not None
+        assert match.group(1) == "300"
+
+    def test_web_timeout_default(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(config)
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_web\.py", rendered)
+        assert match is not None, "gunicorn-web should have --timeout flag"
+        assert match.group(1) == "30"
+
+    def test_web_timeout_custom(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(config, gunicorn_web_timeout=120)
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_web\.py", rendered)
+        assert match is not None
+        assert match.group(1) == "120"
+
+    def test_web_timeout_hotreload_uses_600(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(config, hotreload=True, gunicorn_web_timeout=120)
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_web\.py", rendered)
+        assert match is not None
+        assert match.group(1) == "600", "hotreload mode should use 600s timeout regardless"
+
+    def test_registry_timeout_clamped_to_max(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(
+            config, gunicorn_registry_timeout=min(7200, MAX_GUNICORN_TIMEOUT)
+        )
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_registry\.py", rendered)
+        assert match is not None
+        assert match.group(1) == str(MAX_GUNICORN_TIMEOUT)
+
+    def test_web_timeout_clamped_to_max(self):
+        config = registry_services()
+        rendered = render_supervisord_conf(
+            config, gunicorn_web_timeout=min(7200, MAX_GUNICORN_TIMEOUT)
+        )
+        match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_web\.py", rendered)
+        assert match is not None
+        assert match.group(1) == str(MAX_GUNICORN_TIMEOUT)
+
+    def test_max_gunicorn_timeout_is_300(self):
+        assert MAX_GUNICORN_TIMEOUT == 300
+
+    def test_config_yaml_reaches_gunicorn_commands(self, tmp_path):
+        """Exercise load_app_config() and the __main__ wiring end-to-end via a real config.yaml."""
+        quay_conf_dir = tmp_path / "conf"
+        (quay_conf_dir / "stack").mkdir(parents=True)
+        (quay_conf_dir / "stack" / "config.yaml").write_text(
+            "GUNICORN_REGISTRY_TIMEOUT: 111\nGUNICORN_WEB_TIMEOUT: 45\n"
+        )
+
+        repo_conf_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../..")
+        shutil.copy(
+            os.path.join(repo_conf_dir, "supervisord.conf.jnj"),
+            quay_conf_dir / "supervisord.conf.jnj",
+        )
+
+        script_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "../supervisord_conf_create.py"
+        )
+
+        env = os.environ.copy()
+        env.update(
+            QUAYDIR=str(tmp_path),
+            QUAYPATH=".",
+            QUAYCONF=str(quay_conf_dir),
+            QUAY_SERVICES="",
+            QUAY_OVERRIDE_SERVICES="",
+            QUAY_LOGGING="stdout",
+            QUAY_HOTRELOAD="false",
+        )
+
+        subprocess.run([sys.executable, script_path], env=env, check=True)
+
+        rendered = (quay_conf_dir / "supervisord.conf").read_text()
+
+        registry_match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_registry\.py", rendered)
+        assert registry_match is not None
+        assert registry_match.group(1) == "111"
+
+        web_match = re.search(r"gunicorn --timeout=(\d+) -c .+gunicorn_web\.py", rendered)
+        assert web_match is not None
+        assert web_match.group(1) == "45"

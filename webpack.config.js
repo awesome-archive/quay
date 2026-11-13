@@ -19,7 +19,7 @@ let config = {
     angular: "angular",
     jquery: "$",
     moment: "moment",
-    "raven-js": "Raven",
+    "@sentry/browser": "Sentry",
   },
   module: {
     rules: [
@@ -42,6 +42,19 @@ let config = {
           'html-loader',
         ]
       },
+      {
+        test: /\.(woff(2)?|ttf|eot|svg)(\?v=\d+\.\d+\.\d+)?$/,
+        use: [
+          {
+            loader: 'file-loader',
+            options: {
+	      // TODO: Workaround for incompatible file-loader + html-loader versions
+	      // https://github.com/webpack-contrib/html-loader/issues/203
+              esModule: false
+            }
+          }
+        ]
+      }
     ]
   },
   optimization: {},
@@ -57,6 +70,10 @@ let config = {
     new webpack.ContextReplacementPlugin(/moment[\/\\]locale$/, /en/),
   ],
   devtool: "cheap-module-source-map",
+  watchOptions: {
+    aggregateTimeout: 200,
+    poll: 1000,
+  },
 };
 
 
@@ -67,7 +84,7 @@ if (process.env.NODE_ENV === 'production') {
   config.optimization.minimizer = [
     new TerserPlugin({
       // Disable mangle to prevent AngularJS errors
-      terserOptions: {mangle: false},
+      terserOptions: {mangle: false, keep_classnames: true, keep_fnames: true},
       sourceMap: true,
     }),
   ];

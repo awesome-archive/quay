@@ -2,11 +2,6 @@
     {
         "format": "Python", 
         "license": "MIT License", 
-        "project": "aiowsgi"
-    }, 
-    {
-        "format": "Python", 
-        "license": "MIT License", 
         "project": "alembic"
     }, 
     {
@@ -193,16 +188,6 @@
         "format": "Python", 
         "license": "Unlicense", 
         "project": "furl"
-    }, 
-    {
-        "format": "Python", 
-        "license": "MIT License", 
-        "project": "future"
-    }, 
-    {
-        "format": "Python", 
-        "license": "PSF License", 
-        "project": "futures"
     }, 
     {
         "format": "Python", 
@@ -456,16 +441,6 @@
     }, 
     {
         "format": "Python", 
-        "license": "BSD 2-Clause License", 
-        "project": "pycryptodome"
-    }, 
-    {
-        "format": "Python", 
-        "license": "BSD 2-Clause License", 
-        "project": "pycryptodomex"
-    }, 
-    {
-        "format": "Python", 
         "license": "LGPL-3.0", 
         "project": "PyGithub"
     }, 
@@ -631,11 +606,6 @@
     }, 
     {
         "format": "Python", 
-        "license": "Apache Software License 2.0", 
-        "project": "trollius"
-    }, 
-    {
-        "format": "Python", 
         "license": "MIT License", 
         "project": "tzlocal"
     }, 
@@ -643,11 +613,6 @@
         "format": "Python", 
         "license": "MIT License", 
         "project": "urllib3"
-    }, 
-    {
-        "format": "Python", 
-        "license": "ZPL 2.1", 
-        "project": "waitress"
     }, 
     {
         "format": "Python", 
@@ -673,11 +638,6 @@
         "format": "Python", 
         "license": "MIT License", 
         "project": "xmltodict"
-    }, 
-    {
-        "format": "Python", 
-        "license": "Apache Software License 2.0", 
-        "project": "yapf"
     }, 
     {
         "format": "JavaScript", 

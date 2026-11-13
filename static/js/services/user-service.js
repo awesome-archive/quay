@@ -1,4 +1,4 @@
-import * as Raven from 'raven-js';
+import * as Sentry from '@sentry/browser';
 
 
 /**
@@ -60,29 +60,9 @@ function(ApiService, CookieService, $rootScope, Config, $location, $timeout) {
           }
         }
 
-        if (Config.MARKETO_MUNCHKIN_ID && userResponse['marketo_user_hash']) {
-          var associateLeadBody = {'Email': userResponse.email};
-          if (window.Munchkin !== undefined) {
-            try {
-              Munchkin.munchkinFunction(
-                'associateLead',
-                associateLeadBody,
-                userResponse['marketo_user_hash']
-              );
-            } catch (e) {
-            }
-          } else {
-            window.__quay_munchkin_queue.push([
-              'associateLead',
-              associateLeadBody,
-              userResponse['marketo_user_hash']
-            ]);
-          }
-        }
-
-        if (window.Raven !== undefined) {
+        if (window.Sentry !== undefined) {
           try {
-            Raven.setUser({
+            Sentry.setUser({
               email: userResponse.email,
               id: userResponse.username
             });
@@ -93,8 +73,8 @@ function(ApiService, CookieService, $rootScope, Config, $location, $timeout) {
 
         CookieService.putPermanent('quay.loggedin', 'true');
       } else {
-        if (window.Raven !== undefined) {
-          Raven.setUser();
+        if (window.Sentry !== undefined) {
+          Sentry.setUser(null);
         }
       }
 

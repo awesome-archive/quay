@@ -1,41 +1,74 @@
 import logging
 from datetime import datetime, timedelta
 
-from app import app, instance_keys, metric_queue
+from prometheus_client import Counter
+
+from app import app, instance_keys
+from workers.gunicorn_worker import GunicornWorker
 from workers.servicekeyworker.models_pre_oci import pre_oci_model as model
 from workers.worker import Worker
 
 logger = logging.getLogger(__name__)
 
 
+instance_key_renewal_self = Counter(
+    "quay_instance_key_renewal_self_total",
+    "number of times a Quay instance renews its own key",
+    labelnames=["success"],
+)
+
+
 class ServiceKeyWorker(Worker):
-  def __init__(self):
-    super(ServiceKeyWorker, self).__init__()
-    self.add_operation(self._refresh_service_key,
-                       app.config.get('INSTANCE_SERVICE_KEY_REFRESH', 60) * 60)
+    def __init__(self):
+        super(ServiceKeyWorker, self).__init__()
+        self.add_operation(
+            self._refresh_service_key, app.config.get("INSTANCE_SERVICE_KEY_REFRESH", 60) * 60
+        )
 
-  def _refresh_service_key(self):
+    def _refresh_service_key(self):
+        """
+        Refreshes the instance's active service key so it doesn't get garbage collected.
+        """
+        expiration_time = timedelta(minutes=instance_keys.service_key_expiration)
+        new_expiration = datetime.utcnow() + expiration_time
+
+        logger.debug(
+            "Starting automatic refresh of service key %s to new expiration %s",
+            instance_keys.local_key_id,
+            new_expiration,
+        )
+        try:
+            model.set_key_expiration(instance_keys.local_key_id, new_expiration)
+        except Exception as ex:
+            logger.exception(
+                "Failure for automatic refresh of service key %s with new expiration %s",
+                instance_keys.local_key_id,
+                new_expiration,
+            )
+            instance_key_renewal_self.labels(False).inc()
+            raise ex
+
+        logger.debug(
+            "Finished automatic refresh of service key %s with new expiration %s",
+            instance_keys.local_key_id,
+            new_expiration,
+        )
+        instance_key_renewal_self.labels(True).inc()
+
+
+def create_gunicorn_worker():
     """
-    Refreshes the instance's active service key so it doesn't get garbage collected.
+    follows the gunicorn application factory pattern, enabling
+    a quay worker to run as a gunicorn worker thread.
+
+    this is useful when utilizing gunicorn's hot reload in local dev.
+
+    utilizing this method will enforce a 1:1 quay worker to gunicorn worker ratio.
     """
-    expiration_time = timedelta(minutes=instance_keys.service_key_expiration)
-    new_expiration = datetime.utcnow() + expiration_time
-
-    logger.debug('Starting automatic refresh of service key %s to new expiration %s',
-                 instance_keys.local_key_id, new_expiration)
-    try:
-      model.set_key_expiration(instance_keys.local_key_id, new_expiration)
-    except Exception as ex:
-      logger.exception('Failure for automatic refresh of service key %s with new expiration %s',
-                       instance_keys.local_key_id, new_expiration)
-      metric_queue.instance_key_renewal_failure.Inc(labelvalues=[instance_keys.local_key_id])
-      raise ex
-
-    logger.debug('Finished automatic refresh of service key %s with new expiration %s',
-                 instance_keys.local_key_id, new_expiration)
-    metric_queue.instance_key_renewal_success.Inc(labelvalues=[instance_keys.local_key_id])
+    worker = GunicornWorker(__name__, app, ServiceKeyWorker(), True)
+    return worker
 
 
 if __name__ == "__main__":
-  worker = ServiceKeyWorker()
-  worker.start()
+    worker = ServiceKeyWorker()
+    worker.start()

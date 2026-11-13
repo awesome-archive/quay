@@ -1,609 +1,1108 @@
+import os.path
+from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
-import os.path
 import requests
 
-from _init import ROOT_DIR, CONF_DIR
+from _init import CONF_DIR, ROOT_DIR
 
 
 def build_requests_session():
-  sess = requests.Session()
-  adapter = requests.adapters.HTTPAdapter(pool_connections=100,
-                                          pool_maxsize=100)
-  sess.mount('http://', adapter)
-  sess.mount('https://', adapter)
-  return sess
+    sess = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=100, pool_maxsize=100)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
 
 
 # The set of configuration key names that will be accessible in the client. Since these
 # values are sent to the frontend, DO NOT PLACE ANY SECRETS OR KEYS in this list.
-CLIENT_WHITELIST = ['SERVER_HOSTNAME', 'PREFERRED_URL_SCHEME', 'MIXPANEL_KEY',
-                    'STRIPE_PUBLISHABLE_KEY', 'ENTERPRISE_LOGO_URL', 'SENTRY_PUBLIC_DSN',
-                    'AUTHENTICATION_TYPE', 'REGISTRY_TITLE', 'REGISTRY_TITLE_SHORT',
-                    'CONTACT_INFO', 'AVATAR_KIND', 'LOCAL_OAUTH_HANDLER',
-                    'SETUP_COMPLETE', 'DEBUG', 'MARKETO_MUNCHKIN_ID',
-                    'STATIC_SITE_BUCKET', 'RECAPTCHA_SITE_KEY', 'CHANNEL_COLORS',
-                    'TAG_EXPIRATION_OPTIONS', 'INTERNAL_OIDC_SERVICE_ID',
-                    'SEARCH_RESULTS_PER_PAGE', 'SEARCH_MAX_RESULT_PAGE_COUNT', 'BRANDING']
+CLIENT_WHITELIST = [
+    "SERVER_HOSTNAME",
+    "PREFERRED_URL_SCHEME",
+    "MIXPANEL_KEY",
+    "STRIPE_PUBLISHABLE_KEY",
+    "ENTERPRISE_LOGO_URL",
+    "ENTERPRISE_LOGO_URL_DARK",
+    "SENTRY_PUBLIC_DSN",
+    "AUTHENTICATION_TYPE",
+    "REGISTRY_TITLE",
+    "REGISTRY_TITLE_SHORT",
+    "CONTACT_INFO",
+    "AVATAR_KIND",
+    "LOCAL_OAUTH_HANDLER",
+    "SETUP_COMPLETE",
+    "DEBUG",
+    "MARKETO_MUNCHKIN_ID",
+    "STATIC_SITE_BUCKET",
+    "RECAPTCHA_SITE_KEY",
+    "CHANNEL_COLORS",
+    "TAG_EXPIRATION_OPTIONS",
+    "INTERNAL_OIDC_SERVICE_ID",
+    "SEARCH_RESULTS_PER_PAGE",
+    "SEARCH_MAX_RESULT_PAGE_COUNT",
+    "BRANDING",
+    "DOCUMENTATION_ROOT",
+    "FEATURE_REPO_MIRROR",
+    "FEATURE_ORG_MIRROR",
+    "FEATURE_QUOTA_MANAGEMENT",
+    "FEATURE_QUOTA_NOTIFICATIONS",
+    "FEATURE_EDIT_QUOTA",
+    "FEATURE_PROXY_CACHE",
+    "QUOTA_BACKFILL",
+    "PERMANENTLY_DELETE_TAGS",
+    "UI_V2_FEEDBACK_FORM",
+    "FOOTER_LINKS",
+    "UI_DELAY_AFTER_WRITE_SECONDS",
+    "FEATURE_ASSIGN_OAUTH_TOKEN",
+    "FEATURE_IMAGE_EXPIRY_TRIGGER",
+    "FEATURE_AUTO_PRUNE",
+    "DEFAULT_NAMESPACE_AUTOPRUNE_POLICY",
+    "DEFAULT_UI",
+    "DISABLE_ANGULAR_UI",
+    "ROBOTS_DISALLOW",
+    "FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE",
+]
 
 
 def frontend_visible_config(config_dict):
-  visible_dict = {}
-  for name in CLIENT_WHITELIST:
-    if name.lower().find('secret') >= 0:
-      raise Exception('Cannot whitelist secrets: %s' % name)
+    visible_dict = {}
+    for name in CLIENT_WHITELIST:
+        if name.lower().find("secret") >= 0:
+            raise Exception("Cannot whitelist secrets: %s" % name)
 
-    if name in config_dict:
-      visible_dict[name] = config_dict.get(name, None)
-    if 'ENTERPRISE_LOGO_URL' in config_dict:
-      visible_dict['BRANDING'] = visible_dict.get('BRANDING', {})
-      visible_dict['BRANDING']['logo'] = config_dict['ENTERPRISE_LOGO_URL']
+        if name in config_dict:
+            visible_dict[name] = config_dict.get(name, None)
+        if "ENTERPRISE_LOGO_URL" in config_dict:
+            visible_dict["BRANDING"] = visible_dict.get("BRANDING", {})
+            visible_dict["BRANDING"]["logo"] = config_dict["ENTERPRISE_LOGO_URL"]
+            if "ENTERPRISE_LOGO_URL_DARK" in config_dict:
+                visible_dict["BRANDING"]["logo_dark"] = config_dict["ENTERPRISE_LOGO_URL_DARK"]
 
-  return visible_dict
+    return visible_dict
 
 
 # Configuration that should not be changed by end users
 class ImmutableConfig(object):
+    # Requests based HTTP client with a large request pool
+    HTTPCLIENT = build_requests_session()
 
-  # Requests based HTTP client with a large request pool
-  HTTPCLIENT = build_requests_session()
+    # Status tag config
+    STATUS_TAGS = {}
+    for tag_name in ["building", "failed", "none", "ready", "cancelled"]:
+        tag_path = os.path.join(ROOT_DIR, "buildstatus", tag_name + ".svg")
+        with open(tag_path) as tag_svg:
+            STATUS_TAGS[tag_name] = tag_svg.read()
 
-  # Status tag config
-  STATUS_TAGS = {}
-  for tag_name in ['building', 'failed', 'none', 'ready', 'cancelled']:
-    tag_path = os.path.join(ROOT_DIR, 'buildstatus', tag_name + '.svg')
-    with open(tag_path) as tag_svg:
-      STATUS_TAGS[tag_name] = tag_svg.read()
+    # Reverse DNS prefixes that are reserved for internal use on labels and should not be allowable
+    # to be set via the API.
+    DEFAULT_LABEL_KEY_RESERVED_PREFIXES = [
+        "com.docker.",
+        "io.docker.",
+        "org.dockerproject.",
+        "org.opencontainers.",
+        "io.cncf.",
+        "io.kubernetes.",
+        "io.k8s.",
+        "io.quay",
+        "com.coreos",
+        "com.tectonic",
+        "internal",
+        "quay",
+    ]
 
-  # Reverse DNS prefixes that are reserved for internal use on labels and should not be allowable
-  # to be set via the API.
-  DEFAULT_LABEL_KEY_RESERVED_PREFIXES = ['com.docker.', 'io.docker.', 'org.dockerproject.',
-                                         'org.opencontainers.', 'io.cncf.',
-                                         'io.kubernetes.', 'io.k8s.',
-                                         'io.quay', 'com.coreos', 'com.tectonic',
-                                         'internal', 'quay']
+    # Colors for local avatars.
+    AVATAR_COLORS = [
+        "#969696",
+        "#aec7e8",
+        "#ff7f0e",
+        "#ffbb78",
+        "#2ca02c",
+        "#98df8a",
+        "#d62728",
+        "#ff9896",
+        "#9467bd",
+        "#c5b0d5",
+        "#8c564b",
+        "#c49c94",
+        "#e377c2",
+        "#f7b6d2",
+        "#7f7f7f",
+        "#c7c7c7",
+        "#bcbd22",
+        "#1f77b4",
+        "#17becf",
+        "#9edae5",
+        "#393b79",
+        "#5254a3",
+        "#6b6ecf",
+        "#9c9ede",
+        "#9ecae1",
+        "#31a354",
+        "#b5cf6b",
+        "#a1d99b",
+        "#8c6d31",
+        "#ad494a",
+        "#e7ba52",
+        "#a55194",
+    ]
 
-  # Colors for local avatars.
-  AVATAR_COLORS = ['#969696', '#aec7e8', '#ff7f0e', '#ffbb78', '#2ca02c', '#98df8a', '#d62728',
-                   '#ff9896', '#9467bd', '#c5b0d5', '#8c564b', '#c49c94', '#e377c2', '#f7b6d2',
-                   '#7f7f7f', '#c7c7c7', '#bcbd22', '#1f77b4', '#17becf', '#9edae5', '#393b79',
-                   '#5254a3', '#6b6ecf', '#9c9ede', '#9ecae1', '#31a354', '#b5cf6b', '#a1d99b',
-                   '#8c6d31', '#ad494a', '#e7ba52', '#a55194']
+    # Colors for channels.
+    CHANNEL_COLORS = [
+        "#969696",
+        "#aec7e8",
+        "#ff7f0e",
+        "#ffbb78",
+        "#2ca02c",
+        "#98df8a",
+        "#d62728",
+        "#ff9896",
+        "#9467bd",
+        "#c5b0d5",
+        "#8c564b",
+        "#c49c94",
+        "#e377c2",
+        "#f7b6d2",
+        "#7f7f7f",
+        "#c7c7c7",
+        "#bcbd22",
+        "#1f77b4",
+        "#17becf",
+        "#9edae5",
+        "#393b79",
+        "#5254a3",
+        "#6b6ecf",
+        "#9c9ede",
+        "#9ecae1",
+        "#31a354",
+        "#b5cf6b",
+        "#a1d99b",
+        "#8c6d31",
+        "#ad494a",
+        "#e7ba52",
+        "#a55194",
+    ]
 
-  # Colors for channels.
-  CHANNEL_COLORS = ['#969696', '#aec7e8', '#ff7f0e', '#ffbb78', '#2ca02c', '#98df8a', '#d62728',
-                    '#ff9896', '#9467bd', '#c5b0d5', '#8c564b', '#c49c94', '#e377c2', '#f7b6d2',
-                    '#7f7f7f', '#c7c7c7', '#bcbd22', '#1f77b4', '#17becf', '#9edae5', '#393b79',
-                    '#5254a3', '#6b6ecf', '#9c9ede', '#9ecae1', '#31a354', '#b5cf6b', '#a1d99b',
-                    '#8c6d31', '#ad494a', '#e7ba52', '#a55194']
-
-  PROPAGATE_EXCEPTIONS = True
+    PROPAGATE_EXCEPTIONS = True
 
 
 class DefaultConfig(ImmutableConfig):
-  # Flask config
-  JSONIFY_PRETTYPRINT_REGULAR = False
-  SESSION_COOKIE_SECURE = False
-
-  SESSION_COOKIE_HTTPONLY = True
-  SESSION_COOKIE_SAMESITE = 'Lax'
-
-  LOGGING_LEVEL = 'DEBUG'
-  SEND_FILE_MAX_AGE_DEFAULT = 0
-  PREFERRED_URL_SCHEME = 'http'
-  SERVER_HOSTNAME = 'localhost:5000'
+    # Flask config
+    JSONIFY_PRETTYPRINT_REGULAR = False
+    SESSION_COOKIE_NAME = "_csrf_token"
+    SESSION_COOKIE_SECURE = False
+
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_TIMEOUT = "31d"
+
+    LOGGING_LEVEL = "DEBUG"
+    SEND_FILE_MAX_AGE_DEFAULT = 0
+    PREFERRED_URL_SCHEME = "http"
+    SERVER_HOSTNAME = "localhost:5000"
+
+    if os.environ.get("RED_HAT_QUAY", False):
+        REGISTRY_TITLE = "Red Hat Quay"
+        REGISTRY_TITLE_SHORT = "Red Hat Quay"
+    else:
+        REGISTRY_TITLE = "Project Quay"
+        REGISTRY_TITLE_SHORT = "Project Quay"
+
+    CONTACT_INFO: List[str] = []
+
+    # Mail config
+    MAIL_SERVER = ""
+    MAIL_USE_TLS = True
+    MAIL_PORT = 587
+    MAIL_USERNAME: Optional[str] = None
+    MAIL_PASSWORD: Optional[str] = None
+    MAIL_DEFAULT_SENDER = "admin@example.com"
+    MAIL_FAIL_SILENTLY = False
+    TESTING = True
+
+    # DB config
+    DB_URI = "sqlite:///test/data/test.db"
+    DB_CONNECTION_ARGS: Optional[Dict[str, Any]] = {
+        "threadlocals": True,
+        "autorollback": True,
+    }
+
+    @staticmethod
+    def create_transaction(db):
+        # This hack is for handling possible MySQL closing idle connections.
+        # Peewee/pymysql's will try to reuse the existing connection after the MySQL server
+        # has already closed it, which will return an InterfaceError.
+        # AFAIK, there isn't a way to actually test for a a stale connection without actually
+        # running a query. Closing the connection before the transaction forces peewee/pymysql
+        # to reopen a new session to MySQL. This should only applies to non-registry workers,
+        # as the registry workers use a pool by default, and shouldn't have this issue.
+        if type(db.obj).__name__ == "ObservableRetryingMySQLDatabase":
+            try:
+                db.close()
+            except:
+                # Only try to close the connection. Otherwise closing connections in a nested transaction
+                # will return an OperationalError. In that case, we can just continue with the normal flow,
+                # as we know the connection is likely in use and not stale.
+                pass
+
+        return db.transaction()
+
+    DB_TRANSACTION_FACTORY = create_transaction
+
+    # If set to 'readonly', the entire registry is placed into read only mode and no write operations
+    # may be performed against it.
+    REGISTRY_STATE = "normal"
+
+    # If set to true, TLS is used, but is terminated by an external service (such as a load balancer).
+    # Note that PREFERRED_URL_SCHEME must be `https` when this flag is set or it can lead to undefined
+    # behavior.
+    EXTERNAL_TLS_TERMINATION = False
+
+    # If true, CDN URLs will be used for our external dependencies, rather than the local
+    # copies.
+    USE_CDN = False
+
+    # Authentication
+    AUTHENTICATION_TYPE = "Database"
+
+    # Build logs
+    BUILDLOGS_REDIS = {"host": "localhost"}
+    BUILDLOGS_OPTIONS: List[Any] = []
+
+    # Real-time user events
+    USER_EVENTS_REDIS = {"host": "localhost"}
+
+    # Pull metrics tracking (uses Redis DB 1)
+    PULL_METRICS_REDIS = {"host": "localhost", "db": 1}
+
+    # Stripe config
+    BILLING_TYPE = "FakeStripe"
+
+    # Analytics
+    ANALYTICS_TYPE = "FakeAnalytics"
+
+    # Build Queue Metrics
+    QUEUE_METRICS_TYPE = "Null"
+    QUEUE_WORKER_METRICS_REFRESH_SECONDS = 300
+
+    # Exception logging
+    EXCEPTION_LOG_TYPE = "FakeSentry"
+    SENTRY_DSN = None
+    SENTRY_PUBLIC_DSN = None
 
-  REGISTRY_TITLE = 'Project Quay'
-  REGISTRY_TITLE_SHORT = 'Project Quay'
+    # Pyroscope continuous profiling (optional)
+    PROFILING_TYPE = ""
+    PYROSCOPE_SERVER_ADDRESS = None
+    PYROSCOPE_APPLICATION_NAME = "quay"
 
-  CONTACT_INFO = []
+    # Github Config
+    GITHUB_LOGIN_CONFIG: Optional[Dict[str, Any]] = None
+    GITHUB_TRIGGER_CONFIG = None
 
-  # Mail config
-  MAIL_SERVER = ''
-  MAIL_USE_TLS = True
-  MAIL_PORT = 587
-  MAIL_USERNAME = None
-  MAIL_PASSWORD = None
-  MAIL_DEFAULT_SENDER = 'example@projectquay.io'
-  MAIL_FAIL_SILENTLY = False
-  TESTING = True
+    # Google Config.
+    GOOGLE_LOGIN_CONFIG: Optional[Dict[str, str]] = None
 
-  # DB config
-  DB_URI = 'sqlite:///test/data/test.db'
-  DB_CONNECTION_ARGS = {
-    'threadlocals': True,
-    'autorollback': True,
-  }
+    # Bitbucket Config.
+    BITBUCKET_TRIGGER_CONFIG: Optional[Dict[str, str]] = None
 
-  @staticmethod
-  def create_transaction(db):
-    return db.transaction()
+    # Gitlab Config.
+    GITLAB_TRIGGER_CONFIG: Optional[Dict[str, str]] = None
 
-  DB_TRANSACTION_FACTORY = create_transaction
+    NOTIFICATION_QUEUE_NAME = "notification"
+    DOCKERFILE_BUILD_QUEUE_NAME = "dockerfilebuild"
+    REPLICATION_QUEUE_NAME = "imagestoragereplication"
+    CHUNK_CLEANUP_QUEUE_NAME = "chunk_cleanup"
+    NAMESPACE_GC_QUEUE_NAME = "namespacegc"
+    REPOSITORY_GC_QUEUE_NAME = "repositorygc"
+    EXPORT_ACTION_LOGS_QUEUE_NAME = "exportactionlogs"
+    SECSCAN_V4_NOTIFICATION_QUEUE_NAME = "secscanv4"
+    PROXY_CACHE_BLOB_QUEUE_NAME = "proxycacheblob"
 
-  # If set to 'readonly', the entire registry is placed into read only mode and no write operations
-  # may be performed against it.
-  REGISTRY_STATE = 'normal'
+    # Super user config. Note: This MUST BE an empty list for the default config.
+    SUPER_USERS: List[str] = []
 
-  # If set to true, TLS is used, but is terminated by an external service (such as a load balancer).
-  # Note that PREFERRED_URL_SCHEME must be `https` when this flag is set or it can lead to undefined
-  # behavior.
-  EXTERNAL_TLS_TERMINATION = False
+    # Global readonly user.
+    # WARNING: THIS WILL GIVE USERS OF THIS LIST READ ACCESS TO ALL REPOS,
+    # REGARDLESS OF WHETHER THEY ARE PUBLIC OR NOT
+    GLOBAL_READONLY_SUPER_USERS: List[str] = []
 
-  # If true, CDN URLs will be used for our external dependencies, rather than the local
-  # copies.
-  USE_CDN = False
+    # Feature Flag: Whether sessions are permanent.
+    FEATURE_PERMANENT_SESSIONS = True
 
-  # Authentication
-  AUTHENTICATION_TYPE = 'Database'
+    # Feature Flag: Whether super users are supported.
+    FEATURE_SUPER_USERS = True
 
-  # Build logs
-  BUILDLOGS_REDIS = {'host': 'localhost'}
-  BUILDLOGS_OPTIONS = []
+    # Feature Flag: Whether to allow anonymous users to browse and pull public repositories.
+    FEATURE_ANONYMOUS_ACCESS = True
 
-  # Real-time user events
-  USER_EVENTS_REDIS = {'host': 'localhost'}
+    # Feature Flag: Whether billing is required.
+    FEATURE_BILLING = False
 
-  # Stripe config
-  BILLING_TYPE = 'FakeStripe'
+    # Feature Flag: Whether user accounts automatically have usage log access.
+    FEATURE_USER_LOG_ACCESS = False
 
-  # Analytics
-  ANALYTICS_TYPE = 'FakeAnalytics'
+    # Feature Flag: Whether GitHub login is supported.
+    FEATURE_GITHUB_LOGIN = False
 
-  # Build Queue Metrics
-  QUEUE_METRICS_TYPE = 'Null'
-  QUEUE_WORKER_METRICS_REFRESH_SECONDS = 300
+    # Feature Flag: Whether Google login is supported.
+    FEATURE_GOOGLE_LOGIN = False
 
-  # Exception logging
-  EXCEPTION_LOG_TYPE = 'FakeSentry'
-  SENTRY_DSN = None
-  SENTRY_PUBLIC_DSN = None
+    # Feature Flag: Whether to support GitHub build triggers.
+    FEATURE_GITHUB_BUILD = False
 
-  # Github Config
-  GITHUB_LOGIN_CONFIG = None
-  GITHUB_TRIGGER_CONFIG = None
+    # Feature Flag: Whether to support Bitbucket build triggers.
+    FEATURE_BITBUCKET_BUILD = False
 
-  # Google Config.
-  GOOGLE_LOGIN_CONFIG = None
+    # Feature Flag: Whether to support GitLab build triggers.
+    FEATURE_GITLAB_BUILD = False
 
-  # Bitbucket Config.
-  BITBUCKET_TRIGGER_CONFIG = None
+    # Feature Flag: Dockerfile build support.
+    FEATURE_BUILD_SUPPORT = True
 
-  # Gitlab Config.
-  GITLAB_TRIGGER_CONFIG = None
+    # Feature Flag: Whether emails are enabled.
+    FEATURE_MAILING = True
 
-  NOTIFICATION_QUEUE_NAME = 'notification'
-  DOCKERFILE_BUILD_QUEUE_NAME = 'dockerfilebuild'
-  REPLICATION_QUEUE_NAME = 'imagestoragereplication'
-  SECSCAN_NOTIFICATION_QUEUE_NAME = 'security_notification'
-  CHUNK_CLEANUP_QUEUE_NAME = 'chunk_cleanup'
-  NAMESPACE_GC_QUEUE_NAME = 'namespacegc'
-  EXPORT_ACTION_LOGS_QUEUE_NAME = 'exportactionlogs'
+    # Feature Flag: Whether organizations can share email addresses with other users/orgs.
+    FEATURE_ORG_SHARED_EMAIL = False
 
-  # Super user config. Note: This MUST BE an empty list for the default config.
-  SUPER_USERS = []
+    # Feature Flag: Whether users can be created (by non-super users).
+    FEATURE_USER_CREATION = True
 
-  # Feature Flag: Whether sessions are permanent.
-  FEATURE_PERMANENT_SESSIONS = True
+    # Feature Flag: Whether users being created must be invited by another user.
+    # If FEATURE_USER_CREATION is off, this flag has no effect.
+    FEATURE_INVITE_ONLY_USER_CREATION = False
 
-  # Feature Flag: Whether super users are supported.
-  FEATURE_SUPER_USERS = True
+    # Feature Flag: Whether users can be renamed
+    FEATURE_USER_RENAME = False
 
-  # Feature Flag: Whether to allow anonymous users to browse and pull public repositories.
-  FEATURE_ANONYMOUS_ACCESS = True
+    # Feature Flag: Whether non-encrypted passwords (as opposed to encrypted tokens) can be used for
+    # basic auth.
+    FEATURE_REQUIRE_ENCRYPTED_BASIC_AUTH = False
 
-  # Feature Flag: Whether billing is required.
-  FEATURE_BILLING = False
+    # Feature Flag: Whether to automatically replicate between storage engines.
+    FEATURE_STORAGE_REPLICATION = False  # Optional[bool]
 
-  # Feature Flag: Whether user accounts automatically have usage log access.
-  FEATURE_USER_LOG_ACCESS = False
+    # Feature Flag: Whether users can directly login to the UI.
+    FEATURE_DIRECT_LOGIN = True
 
-  # Feature Flag: Whether GitHub login is supported.
-  FEATURE_GITHUB_LOGIN = False
+    # Feature Flag: Whether the v2/ endpoint is visible
+    FEATURE_ADVERTISE_V2 = True
 
-  # Feature Flag: Whether Google login is supported.
-  FEATURE_GOOGLE_LOGIN = False
+    # Allow realtime user events to be sent to redis
+    FEATURE_USER_EVENTS = True
 
-  # Feature Flag: Whether to support GitHub build triggers.
-  FEATURE_GITHUB_BUILD = False
+    # Feature Flag: Whether to track and display image pull statistics
+    FEATURE_IMAGE_PULL_STATS = False
 
-  # Feature Flag: Whether to support Bitbucket build triggers.
-  FEATURE_BITBUCKET_BUILD = False
+    # Pull metrics thread pool configuration
+    PULL_METRICS_WORKER_COUNT = 5
 
-  # Feature Flag: Whether to support GitLab build triggers.
-  FEATURE_GITLAB_BUILD = False
+    # Redis flush worker configuration
+    REDIS_FLUSH_INTERVAL_SECONDS = 300  # 5 minutes default
 
-  # Feature Flag: Dockerfile build support.
-  FEATURE_BUILD_SUPPORT = True
+    # Semver spec for which Docker versions we will blacklist
+    # Documentation: http://pythonhosted.org/semantic_version/reference.html#semantic_version.Spec
+    BLACKLIST_V2_SPEC = "<1.6.0"
 
-  # Feature Flag: Whether emails are enabled.
-  FEATURE_MAILING = True
+    # Feature Flag: Whether to restrict V1 pushes to the whitelist.
+    FEATURE_RESTRICTED_V1_PUSH = False
+    V1_PUSH_WHITELIST: Optional[List[str]] = []
 
-  # Feature Flag: Whether users can be created (by non-super users).
-  FEATURE_USER_CREATION = True
+    # Feature Flag: Whether or not to rotate old action logs to storage.
+    FEATURE_ACTION_LOG_ROTATION = False
 
-  # Feature Flag: Whether users being created must be invited by another user.
-  # If FEATURE_USER_CREATION is off, this flag has no effect.
-  FEATURE_INVITE_ONLY_USER_CREATION = False
+    # Feature Flag: Whether to allow for "namespace-less" repositories when pulling and pushing from
+    # Docker.
+    FEATURE_LIBRARY_SUPPORT = True
 
-  # Feature Flag: Whether users can be renamed
-  FEATURE_USER_RENAME = False
+    # Feature Flag: Whether to require invitations when adding a user to a team.
+    FEATURE_REQUIRE_TEAM_INVITE = True
 
-  # Feature Flag: Whether non-encrypted passwords (as opposed to encrypted tokens) can be used for
-  # basic auth.
-  FEATURE_REQUIRE_ENCRYPTED_BASIC_AUTH = False
+    # Feature Flag: Whether to proxy all direct download URLs in storage via the registry's nginx.
+    FEATURE_PROXY_STORAGE = False
 
-  # Feature Flag: Whether to automatically replicate between storage engines.
-  FEATURE_STORAGE_REPLICATION = False
+    # Feature Flag: Whether to collect and support user metadata.
+    FEATURE_USER_METADATA = False
 
-  # Feature Flag: Whether users can directly login to the UI.
-  FEATURE_DIRECT_LOGIN = True
+    # Feature Flag: Whether to support signing
+    FEATURE_SIGNING = False
 
-  # Feature Flag: Whether the v2/ endpoint is visible
-  FEATURE_ADVERTISE_V2 = True
+    # Feature Flag: If set to true, the _catalog endpoint returns public repositories. Otherwise,
+    # only private repositories can be returned.
+    FEATURE_PUBLIC_CATALOG = False
 
-  # Semver spec for which Docker versions we will blacklist
-  # Documentation: http://pythonhosted.org/semantic_version/reference.html#semantic_version.Spec
-  BLACKLIST_V2_SPEC = '<1.6.0'
+    # Feature Flag: If set to true, build logs may be read by those with read access to the repo,
+    # rather than only write access or admin access.
+    FEATURE_READER_BUILD_LOGS = False
 
-  # Feature Flag: Whether to restrict V1 pushes to the whitelist.
-  FEATURE_RESTRICTED_V1_PUSH = False
-  V1_PUSH_WHITELIST = []
+    # Feature Flag: If set to true, autocompletion will apply to partial usernames.
+    FEATURE_PARTIAL_USER_AUTOCOMPLETE = True
 
-  # Feature Flag: Whether or not to rotate old action logs to storage.
-  FEATURE_ACTION_LOG_ROTATION = False
+    # Feature Flag: If set to true, users can confirm (and modify) their initial usernames when
+    # logging in via OIDC or a non-database internal auth provider.
+    FEATURE_USERNAME_CONFIRMATION = True
 
-  # Feature Flag: Whether to enable conversion to ACIs.
-  FEATURE_ACI_CONVERSION = False
+    # Feature Flag: If set to true, Quay will run using FIPS compliant hash functions.
+    FEATURE_FIPS = False
 
-  # Feature Flag: Whether to allow for "namespace-less" repositories when pulling and pushing from
-  # Docker.
-  FEATURE_LIBRARY_SUPPORT = True
+    # If a namespace is defined in the public namespace list, then it will appear on *all*
+    # user's repository list pages, regardless of whether that user is a member of the namespace.
+    # Typically, this is used by an enterprise customer in configuring a set of "well-known"
+    # namespaces.
+    PUBLIC_NAMESPACES: List[str] = []
 
-  # Feature Flag: Whether to require invitations when adding a user to a team.
-  FEATURE_REQUIRE_TEAM_INVITE = True
+    # The namespace to use for library repositories.
+    # Note: This must remain 'library' until Docker removes their hard-coded namespace for libraries.
+    # See: https://github.com/docker/docker/blob/master/registry/session.go#L320
+    LIBRARY_NAMESPACE = "library"
 
-  # Feature Flag: Whether to proxy all direct download URLs in storage via the registry's nginx.
-  FEATURE_PROXY_STORAGE = False
+    BUILD_MANAGER: Tuple[str, Dict[Any, Any]] = ("enterprise", {})
 
-  # Feature Flag: Whether to collect and support user metadata.
-  FEATURE_USER_METADATA = False
+    DISTRIBUTED_STORAGE_CONFIG: Optional[Dict[str, List[Any]]] = {
+        "local_eu": ["LocalStorage", {"storage_path": "test/data/registry/eu"}],
+        "local_us": ["LocalStorage", {"storage_path": "test/data/registry/us"}],
+    }
 
-  # Feature Flag: Whether to support signing
-  FEATURE_SIGNING = False
+    DISTRIBUTED_STORAGE_PREFERENCE = ["local_us"]
+    DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS = ["local_us"]
 
-  # Feature Flag: Whether to enable support for App repositories.
-  FEATURE_APP_REGISTRY = False
+    # Health checker.
+    HEALTH_CHECKER: Tuple[str, Dict[Any, Any]] = ("LocalHealthCheck", {})
 
-  # Feature Flag: Whether app registry is in a read-only mode.
-  FEATURE_READONLY_APP_REGISTRY = False
+    # Userfiles
+    USERFILES_LOCATION = "local_us"
+    USERFILES_PATH = "userfiles/"
 
-  # Feature Flag: If set to true, the _catalog endpoint returns public repositories. Otherwise,
-  # only private repositories can be returned.
-  FEATURE_PUBLIC_CATALOG = False
+    # Build logs archive
+    LOG_ARCHIVE_LOCATION = "local_us"
+    LOG_ARCHIVE_PATH = "logarchive/"
 
-  # Feature Flag: If set to true, build logs may be read by those with read access to the repo,
-  # rather than only write access or admin access.
-  FEATURE_READER_BUILD_LOGS = False
+    # Action logs configuration for advanced events
+    ACTION_LOG_AUDIT_LOGINS = True
 
-  # Feature Flag: If set to true, autocompletion will apply to partial usernames.
-  FEATURE_PARTIAL_USER_AUTOCOMPLETE = True
+    # Action logs configuration for failure tracking
+    ACTION_LOG_AUDIT_LOGIN_FAILURES = False
+    ACTION_LOG_AUDIT_PULL_FAILURES = False
+    ACTION_LOG_AUDIT_PUSH_FAILURES = False
+    ACTION_LOG_AUDIT_DELETE_FAILURES = False
 
-  # Feature Flag: If set to true, users can confirm (and modify) their initial usernames when
-  # logging in via OIDC or a non-database internal auth provider.
-  FEATURE_USERNAME_CONFIRMATION = True
+    # Action logs archive
+    ACTION_LOG_ARCHIVE_LOCATION: Optional[str] = "local_us"
+    ACTION_LOG_ARCHIVE_PATH: Optional[str] = "actionlogarchive/"
+    ACTION_LOG_ROTATION_THRESHOLD = "30d"
 
-  # If a namespace is defined in the public namespace list, then it will appear on *all*
-  # user's repository list pages, regardless of whether that user is a member of the namespace.
-  # Typically, this is used by an enterprise customer in configuring a set of "well-known"
-  # namespaces.
-  PUBLIC_NAMESPACES = []
+    # Allow registry pulls when unable to write to the audit log
+    ALLOW_PULLS_WITHOUT_STRICT_LOGGING = False
 
-  # The namespace to use for library repositories.
-  # Note: This must remain 'library' until Docker removes their hard-coded namespace for libraries.
-  # See: https://github.com/docker/docker/blob/master/registry/session.go#L320
-  LIBRARY_NAMESPACE = 'library'
+    # Allow any registry action when unable to write to the audit log
+    ALLOW_WITHOUT_STRICT_LOGGING = False
 
-  BUILD_MANAGER = ('enterprise', {})
+    # Temporary tag expiration in seconds, this may actually be longer based on GC policy
+    # Increased to 6 hours by default, to protect big multiarch images from not being
+    # GCed while pushes are still in progress
+    PUSH_TEMP_TAG_EXPIRATION_SEC = 6 * 60 * 60  # Six hours per layer
 
-  DISTRIBUTED_STORAGE_CONFIG = {
-    'local_eu': ['LocalStorage', {'storage_path': 'test/data/registry/eu'}],
-    'local_us': ['LocalStorage', {'storage_path': 'test/data/registry/us'}],
-  }
+    # Signed registry grant token expiration in seconds
+    SIGNED_GRANT_EXPIRATION_SEC = 60 * 60 * 24  # One day to complete a push/pull
 
-  DISTRIBUTED_STORAGE_PREFERENCE = ['local_us']
-  DISTRIBUTED_STORAGE_DEFAULT_LOCATIONS = ['local_us']
+    # Registry v2 JWT Auth config
+    REGISTRY_JWT_AUTH_MAX_FRESH_S = (
+        60 * 60 + 60
+    )  # At most signed one hour, accounting for clock skew
 
-  # Health checker.
-  HEALTH_CHECKER = ('LocalHealthCheck', {})
+    # The URL endpoint to which we redirect OAuth when generating a token locally.
+    LOCAL_OAUTH_HANDLER = "/oauth/localapp"
 
-  # Userfiles
-  USERFILES_LOCATION = 'local_us'
-  USERFILES_PATH = 'userfiles/'
+    # The various avatar background colors.
+    AVATAR_KIND = "local"
 
-  # Build logs archive
-  LOG_ARCHIVE_LOCATION = 'local_us'
-  LOG_ARCHIVE_PATH = 'logarchive/'
+    # Custom branding
+    BRANDING: Dict[str, Optional[str]]
+    if os.environ.get("RED_HAT_QUAY", False):
+        BRANDING = {
+            "logo": "/static/img/RH_Logo_Quay_Black_UX-horizontal.svg",
+            "logo_dark": "/static/img/RH_Logo_Quay_White_UX-horizontal.svg",
+            "footer_img": "/static/img/RedHat.svg",
+            "footer_url": "https://access.redhat.com/documentation/en-us/red_hat_quay/3/",
+        }
+    else:
+        BRANDING = {
+            "logo": "/static/img/quay-horizontal-color.svg",
+            "logo_dark": "/static/img/quay-horizontal-whiteblue-nobackground.svg",
+            "footer_img": None,
+            "footer_url": None,
+        }
 
-  # Action logs archive
-  ACTION_LOG_ARCHIVE_LOCATION = 'local_us'
-  ACTION_LOG_ARCHIVE_PATH = 'actionlogarchive/'
-  ACTION_LOG_ROTATION_THRESHOLD = '30d'
+    # How often the Garbage Collection worker runs.
+    GARBAGE_COLLECTION_FREQUENCY = 30  # seconds
 
-  # Allow registry pulls when unable to write to the audit log
-  ALLOW_PULLS_WITHOUT_STRICT_LOGGING = False
+    # Grace period (seconds) before deleted namespaces are permanently purged by GC.
+    # During this window the data remains in the database and can be recovered via
+    # direct DB operations. 0 means immediate purge (current behavior).
+    NAMESPACE_GC_GRACE_PERIOD_SECONDS = 0
 
-  # Temporary tag expiration in seconds, this may actually be longer based on GC policy
-  PUSH_TEMP_TAG_EXPIRATION_SEC = 60 * 60  # One hour per layer
+    # Allowlist of namespace names that receive the grace period. When non-empty,
+    # only namespaces in this list are protected. When empty, no grace period is
+    # applied (current behavior).
+    NAMESPACE_GC_GRACE_PERIOD_ALLOWLIST: list[str] = []
 
-  # Signed registry grant token expiration in seconds
-  SIGNED_GRANT_EXPIRATION_SEC = 60 * 60 * 24  # One day to complete a push/pull
+    # How long notifications will try to send before timing out.
+    NOTIFICATION_SEND_TIMEOUT = 10
 
-  # Registry v2 JWT Auth config
-  REGISTRY_JWT_AUTH_MAX_FRESH_S = 60 * 60 + 60  # At most signed one hour, accounting for clock skew
+    # Security scanner
+    FEATURE_SECURITY_SCANNER = False
+    FEATURE_SECURITY_NOTIFICATIONS = False
 
-  # The URL endpoint to which we redirect OAuth when generating a token locally.
-  LOCAL_OAUTH_HANDLER = '/oauth/localapp'
+    # The endpoint for the V4 security scanner.
+    SECURITY_SCANNER_V4_ENDPOINT: Optional[str] = None
 
-  # The various avatar background colors.
-  AVATAR_KIND = 'local'
+    # Cleanup deleted manifests from the security scanner service.
+    SECURITY_SCANNER_V4_MANIFEST_CLEANUP: Optional[bool] = True
 
-  # Custom branding
-  BRANDING = {
-    'logo': '/static/img/quay-horizontal-color.svg',
-    'footer_img': None,
-    'footer_url': None,
-  }
+    # The number of seconds between indexing intervals in the security scanner
+    SECURITY_SCANNER_INDEXING_INTERVAL = 30
 
-  # How often the Garbage Collection worker runs.
-  GARBAGE_COLLECTION_FREQUENCY = 30 # seconds
+    # Minimum number of seconds before re-indexing a manifest with the security scanner.
+    SECURITY_SCANNER_V4_REINDEX_THRESHOLD = 300
 
-  # How long notifications will try to send before timing out.
-  NOTIFICATION_SEND_TIMEOUT = 10
+    # Maximum number of scan retries per indexer hash before a manifest is skipped.
+    SECURITY_SCANNER_MAX_SCAN_RETRIES = 5
 
-  # Security scanner
-  FEATURE_SECURITY_SCANNER = False
-  FEATURE_SECURITY_NOTIFICATIONS = False
+    # Whether to enable the legacy V4 security scanner indexing operations.
+    SECURITY_SCANNER_V4_INDEXING = True
 
-  # The endpoint for the security scanner.
-  SECURITY_SCANNER_ENDPOINT = 'http://192.168.99.101:6060'
+    # Security scanner V2 worker (lock-free, uses FOR UPDATE SKIP LOCKED)
+    FEATURE_SECURITY_SCANNER_V2 = False
+    SECURITY_SCANNER_V2_INDEXING_INTERVAL = 30
+    SECURITY_SCANNER_V2_BATCH_SIZE = 50
 
-  # The number of seconds between indexing intervals in the security scanner
-  SECURITY_SCANNER_INDEXING_INTERVAL = 30
+    # Maximum layer size allowed for indexing.
+    SECURITY_SCANNER_V4_INDEX_MAX_LAYER_SIZE = None
 
-  # If specified, the security scanner will only index images newer than the provided ID.
-  SECURITY_SCANNER_INDEXING_MIN_ID = None
+    # A base64 encoded string used to sign JWT(s) on Clair V4
+    # requests. If none jwt signing will not occur
+    SECURITY_SCANNER_V4_PSK = None
 
-  # If specified, the endpoint to be used for all POST calls to the security scanner.
-  SECURITY_SCANNER_ENDPOINT_BATCH = None
+    # Repository mirror
+    FEATURE_REPO_MIRROR = False
 
-  # If specified, GET requests that return non-200 will be retried at the following instances.
-  SECURITY_SCANNER_READONLY_FAILOVER_ENDPOINTS = []
+    # Organization-level repository mirror
+    FEATURE_ORG_MIRROR = False
 
-  # The indexing engine version running inside the security scanner.
-  SECURITY_SCANNER_ENGINE_VERSION_TARGET = 3
+    # Hostnames or CIDR ranges allowed to bypass SSRF blocklist for repository mirrors,
+    # organization mirrors, proxy cache registries, and export log callbacks. Use for
+    # enterprise deployments where endpoints run on private networks.
+    SSRF_ALLOWED_HOSTS: List[str] = []
 
-  # The version of the API to use for the security scanner.
-  SECURITY_SCANNER_API_VERSION = 'v1'
+    # The number of seconds between organization mirror worker iterations
+    ORG_MIRROR_INTERVAL = 30
 
-  # API call timeout for the security scanner.
-  SECURITY_SCANNER_API_TIMEOUT_SECONDS = 10
+    # Maximum duration (in seconds) for the org mirror discovery phase claim.
+    # If discovery takes longer than this, the claim expires and the worker retries.
+    # Increase for large source registries with many repositories.
+    ORG_MIRROR_MAX_DISCOVERY_DURATION = 1800  # 30 minutes
 
-  # POST call timeout for the security scanner.
-  SECURITY_SCANNER_API_TIMEOUT_POST_SECONDS = 480
+    # The number of seconds between indexing intervals in the repository mirror
+    REPO_MIRROR_INTERVAL = 30
 
-  # The issuer name for the security scanner.
-  SECURITY_SCANNER_ISSUER_NAME = 'security_scanner'
+    # Require HTTPS and verify certificates of Quay registry during mirror.
+    REPO_MIRROR_TLS_VERIFY = True
 
-  # Repository mirror
-  FEATURE_REPO_MIRROR = False
+    # Replaces the SERVER_HOSTNAME as the destination for mirroring.
+    REPO_MIRROR_SERVER_HOSTNAME: Optional[str] = None
 
-  # The number of seconds between indexing intervals in the repository mirror
-  REPO_MIRROR_INTERVAL = 30
+    # Enables rolling repository back to previous state in the event the mirror fails.
+    # Defaults to false, to allow partial mirroring of upstream repositories.
+    REPO_MIRROR_ROLLBACK = False
 
-  # Require HTTPS and verify certificates of Quay registry during mirror.
-  REPO_MIRROR_TLS_VERIFY = True
+    # Maximum size in bytes of manifest list JSON to parse during mirroring.
+    # Prevents DoS via oversized manifests from malicious registries.
+    REPO_MIRROR_MAX_MANIFEST_LIST_SIZE = 10 * 1024 * 1024  # 10MB
 
-  # Replaces the SERVER_HOSTNAME as the destination for mirroring.
-  REPO_MIRROR_SERVER_HOSTNAME = None
+    # Maximum number of manifest entries to process during architecture-filtered mirroring.
+    # Prevents DoS via manifest lists with excessive entries.
+    REPO_MIRROR_MAX_MANIFEST_ENTRIES = 1000
 
-  # JWTProxy Settings
-  # The address (sans schema) to proxy outgoing requests through the jwtproxy
-  # to be signed
-  JWTPROXY_SIGNER = 'localhost:8081'
+    # "Secret" key for generating encrypted paging tokens. Only needed to be secret to
+    # hide the ID range for production (in which this value is overridden). Should *not*
+    # be relied upon for secure encryption otherwise.
+    # This value is a Fernet key and should be 32bytes URL-safe base64 encoded.
+    PAGE_TOKEN_KEY = "0OYrc16oBuksR8T3JGB-xxYSlZ2-7I_zzqrLzggBJ58="  # gitleaks:allow
 
-  # The audience that jwtproxy should verify on incoming requests
-  # If None, will be calculated off of the SERVER_HOSTNAME (default)
-  JWTPROXY_AUDIENCE = None
+    # The timeout for service key approval.
+    UNAPPROVED_SERVICE_KEY_TTL_SEC = 60 * 60 * 24  # One day
 
-  # Torrent management flags
-  FEATURE_BITTORRENT = False
-  BITTORRENT_PIECE_SIZE = 512 * 1024
-  BITTORRENT_ANNOUNCE_URL = 'https://localhost:6881/announce'
-  BITTORRENT_FILENAME_PEPPER = str(uuid4())
-  BITTORRENT_WEBSEED_LIFETIME = 3600
+    # How long to wait before GCing an expired service key.
+    EXPIRED_SERVICE_KEY_TTL_SEC = 60 * 60 * 24 * 7  # One week
 
-  # "Secret" key for generating encrypted paging tokens. Only needed to be secret to
-  # hide the ID range for production (in which this value is overridden). Should *not*
-  # be relied upon for secure encryption otherwise.
-  # This value is a Fernet key and should be 32bytes URL-safe base64 encoded.
-  PAGE_TOKEN_KEY = '0OYrc16oBuksR8T3JGB-xxYSlZ2-7I_zzqrLzggBJ58='
+    # The ID of the user account in the database to be used for service audit logs. If none, the
+    # lowest user in the database will be used.
+    SERVICE_LOG_ACCOUNT_ID = None
 
-  # The timeout for service key approval.
-  UNAPPROVED_SERVICE_KEY_TTL_SEC = 60 * 60 * 24 # One day
+    # The service key ID for the instance service.
+    INSTANCE_SERVICE_KEY_SERVICE = "quay"
 
-  # How long to wait before GCing an expired service key.
-  EXPIRED_SERVICE_KEY_TTL_SEC = 60 * 60 * 24 * 7 # One week
+    # The location of the key ID file generated for this instance.
+    INSTANCE_SERVICE_KEY_KID_LOCATION = os.path.join(CONF_DIR, "quay.kid")
 
-  # The ID of the user account in the database to be used for service audit logs. If none, the
-  # lowest user in the database will be used.
-  SERVICE_LOG_ACCOUNT_ID = None
+    # The location of the private key generated for this instance.
+    INSTANCE_SERVICE_KEY_LOCATION = os.path.join(CONF_DIR, "quay.pem")
 
-  # The service key ID for the instance service.
-  # NOTE: If changed, jwtproxy_conf.yaml.jnj must also be updated.
-  INSTANCE_SERVICE_KEY_SERVICE = 'quay'
+    # This instance's service key expiration in minutes.
+    INSTANCE_SERVICE_KEY_EXPIRATION = 120
 
-  # The location of the key ID file generated for this instance.
-  INSTANCE_SERVICE_KEY_KID_LOCATION = os.path.join(CONF_DIR, 'quay.kid')
+    # Number of minutes between expiration refresh in minutes. Should be the expiration / 2 minus
+    # some additional window time.
+    INSTANCE_SERVICE_KEY_REFRESH = 55
 
-  # The location of the private key generated for this instance.
-  # NOTE: If changed, jwtproxy_conf.yaml.jnj must also be updated.
-  INSTANCE_SERVICE_KEY_LOCATION = os.path.join(CONF_DIR, 'quay.pem')
+    # If true, import the instance service key from mounted files instead of generating one.
+    INSTANCE_SERVICE_KEY_IMPORT_FROM_FILES = False
 
-  # This instance's service key expiration in minutes.
-  INSTANCE_SERVICE_KEY_EXPIRATION = 120
+    # The whitelist of client IDs for OAuth applications that allow for direct login.
+    DIRECT_OAUTH_CLIENTID_WHITELIST: Optional[List[str]] = []
 
-  # Number of minutes between expiration refresh in minutes. Should be the expiration / 2 minus
-  # some additional window time.
-  INSTANCE_SERVICE_KEY_REFRESH = 55
+    # URL that specifies the location of the prometheus pushgateway.
+    PROMETHEUS_PUSHGATEWAY_URL: Optional[str] = "http://localhost:9091"
 
-  # The whitelist of client IDs for OAuth applications that allow for direct login.
-  DIRECT_OAUTH_CLIENTID_WHITELIST = []
+    # Namespace prefix for all prometheus metrics.
+    PROMETHEUS_NAMESPACE = "quay"
 
-  # URL that specifies the location of the prometheus stats aggregator.
-  PROMETHEUS_AGGREGATOR_URL = 'http://localhost:9092'
+    # Overridable list of reverse DNS prefixes that are reserved for internal use on labels.
+    LABEL_KEY_RESERVED_PREFIXES: Optional[List[str]] = []
 
-  # Namespace prefix for all prometheus metrics.
-  PROMETHEUS_NAMESPACE = 'quay'
+    # Delays workers from starting until a random point in time between 0 and their regular interval.
+    STAGGER_WORKERS = True
 
-  # Overridable list of reverse DNS prefixes that are reserved for internal use on labels.
-  LABEL_KEY_RESERVED_PREFIXES = []
+    # Location of the static marketing site.
+    STATIC_SITE_BUCKET = None
 
-  # Delays workers from starting until a random point in time between 0 and their regular interval.
-  STAGGER_WORKERS = True
+    # Site key and secret key for using recaptcha.
+    FEATURE_RECAPTCHA = False
+    RECAPTCHA_SITE_KEY: Optional[str] = None
+    RECAPTCHA_SECRET_KEY: Optional[str] = None
 
-  # Location of the static marketing site.
-  STATIC_SITE_BUCKET = None
+    # List of users allowed to pass through recaptcha security check to enable org/user creation via API
+    RECAPTCHA_WHITELISTED_USERS: List[str] = []
 
-  # Site key and secret key for using recaptcha.
-  FEATURE_RECAPTCHA = False
-  RECAPTCHA_SITE_KEY = None
-  RECAPTCHA_SECRET_KEY = None
+    # Server where TUF metadata can be found
+    TUF_SERVER = None
 
-  # Server where TUF metadata can be found
-  TUF_SERVER = None
+    # Prefix to add to metadata e.g. <prefix>/<namespace>/<reponame>
+    TUF_GUN_PREFIX = None
 
-  # Prefix to add to metadata e.g. <prefix>/<namespace>/<reponame>
-  TUF_GUN_PREFIX = None
+    # Maximum size allowed for layers in the registry.
+    MAXIMUM_LAYER_SIZE = "20G"
 
-  # Maximum size allowed for layers in the registry.
-  MAXIMUM_LAYER_SIZE = '20G'
+    # Gunicorn worker timeouts (seconds). Workers killed after this duration.
+    GUNICORN_REGISTRY_TIMEOUT = 30
+    GUNICORN_WEB_TIMEOUT = 30
 
-  # Feature Flag: Whether team syncing from the backing auth is enabled.
-  FEATURE_TEAM_SYNCING = False
-  TEAM_RESYNC_STALE_TIME = '30m'
-  TEAM_SYNC_WORKER_FREQUENCY = 60 # seconds
+    # Feature Flag: Whether team syncing from the backing auth is enabled.
+    FEATURE_TEAM_SYNCING = False
+    TEAM_RESYNC_STALE_TIME = "30m"
+    TEAM_SYNC_WORKER_FREQUENCY = 60  # seconds
 
-  # Feature Flag: If enabled, non-superusers can setup team syncing.
-  FEATURE_NONSUPERUSER_TEAM_SYNCING_SETUP = False
+    # Feature Flag: If enabled, non-superusers can setup team syncing.
+    FEATURE_NONSUPERUSER_TEAM_SYNCING_SETUP = False
 
-  # The default configurable tag expiration time for time machine.
-  DEFAULT_TAG_EXPIRATION = '2w'
+    # The default configurable tag expiration time for time machine.
+    DEFAULT_TAG_EXPIRATION = "2w"
 
-  # The options to present in namespace settings for the tag expiration. If empty, no option
-  # will be given and the default will be displayed read-only.
-  TAG_EXPIRATION_OPTIONS = ['0s', '1d', '1w', '2w', '4w']
+    # The options to present in namespace settings for the tag expiration. If empty, no option
+    # will be given and the default will be displayed read-only.
+    TAG_EXPIRATION_OPTIONS = ["0s", "1d", "1w", "2w", "4w"]
 
-  # Feature Flag: Whether users can view and change their tag expiration.
-  FEATURE_CHANGE_TAG_EXPIRATION = True
+    # Feature Flag: Whether users can view and change their tag expiration.
+    FEATURE_CHANGE_TAG_EXPIRATION = True
 
-  # Defines a secret for enabling the health-check endpoint's debug information.
-  ENABLE_HEALTH_DEBUG_SECRET = None
+    # Feature Flag: Whether tag immutability enforcement is enabled.
+    FEATURE_IMMUTABLE_TAGS = False
 
-  # The lifetime for a user recovery token before it becomes invalid.
-  USER_RECOVERY_TOKEN_LIFETIME = '30m'
+    # Feature Flag: Whether immutable tags can have expiration dates set.
+    # When False (default), setting expiration on immutable tags is blocked.
+    FEATURE_IMMUTABLE_TAGS_CAN_EXPIRE = False
 
-  # If specified, when app specific passwords expire by default.
-  APP_SPECIFIC_TOKEN_EXPIRATION = None
+    # Defines a secret for enabling the health-check endpoint's debug information.
+    ENABLE_HEALTH_DEBUG_SECRET = None
 
-  # Feature Flag: If enabled, users can create and use app specific tokens to login via the CLI.
-  FEATURE_APP_SPECIFIC_TOKENS = True
+    # The lifetime for a user recovery token before it becomes invalid.
+    USER_RECOVERY_TOKEN_LIFETIME = "30m"
 
-  # How long expired app specific tokens should remain visible to users before being automatically
-  # deleted. Set to None to turn off garbage collection.
-  EXPIRED_APP_SPECIFIC_TOKEN_GC = '1d'
+    # If specified, when app specific passwords expire by default.
+    APP_SPECIFIC_TOKEN_EXPIRATION = None
 
-  # The size of pages returned by the Docker V2 API.
-  V2_PAGINATION_SIZE = 50
+    # Feature Flag: If enabled, users can create and use app specific tokens to login via the CLI.
+    FEATURE_APP_SPECIFIC_TOKENS = True
 
-  # If enabled, ensures that API calls are made with the X-Requested-With header
-  # when called from a browser.
-  BROWSER_API_CALLS_XHR_ONLY = True
+    # How long expired app specific tokens should remain visible to users before being automatically
+    # deleted. Set to None to turn off garbage collection.
+    EXPIRED_APP_SPECIFIC_TOKEN_GC = "1d"
 
-  # If set to a non-None integer value, the default number of maximum builds for a namespace.
-  DEFAULT_NAMESPACE_MAXIMUM_BUILD_COUNT = None
+    # The size of pages returned by the Docker V2 API.
+    V2_PAGINATION_SIZE = 50
 
-  # If set to a non-None integer value, the default number of maximum builds for a namespace whose
-  # creator IP is deemed a threat.
-  THREAT_NAMESPACE_MAXIMUM_BUILD_COUNT = None
+    # If enabled, ensures that API calls are made with the X-Requested-With header
+    # when called from a browser.
+    BROWSER_API_CALLS_XHR_ONLY = True
 
-  # The API Key to use when requesting IP information.
-  IP_DATA_API_KEY = None
+    # If set to a non-None integer value, the default number of maximum builds for a namespace.
+    DEFAULT_NAMESPACE_MAXIMUM_BUILD_COUNT: Optional[int] = None
 
-  # For Billing Support Only: The number of allowed builds on a namespace that has been billed
-  # successfully.
-  BILLED_NAMESPACE_MAXIMUM_BUILD_COUNT = None
+    # If set to a non-None integer value, the default number of maximum builds for a namespace whose
+    # creator IP is deemed a threat.
+    THREAT_NAMESPACE_MAXIMUM_BUILD_COUNT: Optional[int] = None
 
-  # Configuration for the data model cache.
-  DATA_MODEL_CACHE_CONFIG = {
-    'engine': 'memcached',
-    'endpoint': ('127.0.0.1', 18080),
-  }
+    # The API Key to use when requesting IP information.
+    IP_DATA_API_KEY = None
 
-  # Defines the number of successive failures of a build trigger's build before the trigger is
-  # automatically disabled.
-  SUCCESSIVE_TRIGGER_FAILURE_DISABLE_THRESHOLD = 100
+    # For Billing Support Only: The number of allowed builds on a namespace that has been billed
+    # successfully.
+    BILLED_NAMESPACE_MAXIMUM_BUILD_COUNT: Optional[int] = None
 
-  # Defines the number of successive internal errors of a build trigger's build before the
-  # trigger is automatically disabled.
-  SUCCESSIVE_TRIGGER_INTERNAL_ERROR_DISABLE_THRESHOLD = 5
+    # Configuration for the data model cache.
+    DATA_MODEL_CACHE_CONFIG = {
+        "engine": "memcached",
+        "endpoint": ("127.0.0.1", 18080),
+        "repository_blob_cache_ttl": "60s",
+        "catalog_page_cache_ttl": "60s",
+        "active_repo_tags_cache_ttl": "120s",
+        "value_size_limit": "1MiB",
+    }
 
-  # Defines the delay required (in seconds) before the last_accessed field of a user/robot or access
-  # token will be updated after the previous update.
-  LAST_ACCESSED_UPDATE_THRESHOLD_S = 60
+    # Defines the number of successive failures of a build trigger's build before the trigger is
+    # automatically disabled.
+    SUCCESSIVE_TRIGGER_FAILURE_DISABLE_THRESHOLD = 100
 
-  # Defines the number of results per page used to show search results
-  SEARCH_RESULTS_PER_PAGE = 10
+    # Defines the number of successive internal errors of a build trigger's build before the
+    # trigger is automatically disabled.
+    SUCCESSIVE_TRIGGER_INTERNAL_ERROR_DISABLE_THRESHOLD = 5
 
-  # Defines the maximum number of pages the user can paginate before they are limited
-  SEARCH_MAX_RESULT_PAGE_COUNT = 10
+    # Defines the delay required (in seconds) before the last_accessed field of a user/robot or access
+    # token will be updated after the previous update.
+    LAST_ACCESSED_UPDATE_THRESHOLD_S = 60
 
-  # Feature Flag: Whether to record when users were last accessed.
-  FEATURE_USER_LAST_ACCESSED = True
+    # Defines the delay required (in seconds) before the last_accessed field of an OAuth access
+    # token will be updated after the previous update.
+    OAUTH_TOKEN_LAST_ACCESSED_UPDATE_THRESHOLD_S = 60
 
-  # Feature Flag: Whether to allow users to retrieve aggregated log counts.
-  FEATURE_AGGREGATED_LOG_COUNT_RETRIEVAL = True
+    # Optional maximum number of non-expired OAuth access tokens allowed per OAuth application.
+    # None disables the cap.
+    OAUTH_APPLICATION_MAXIMUM_TOKEN_COUNT: Optional[int] = None
 
-  # Feature Flag: Whether rate limiting is enabled.
-  FEATURE_RATE_LIMITS = False
+    # Maximum number of active Quay-issued API tokens per user or robot.
+    # Set to None to disable the cap.
+    API_TOKEN_MAXIMUM_TOKEN_COUNT: Optional[int] = 20
 
-  # Feature Flag: Whether to support log exporting.
-  FEATURE_LOG_EXPORT = True
+    # Defines the number of results per page used to show search results
+    SEARCH_RESULTS_PER_PAGE = 10
 
-  # Maximum number of action logs pages that can be returned via the API.
-  ACTION_LOG_MAX_PAGE = None
+    # Defines the maximum number of pages the user can paginate before they are limited
+    SEARCH_MAX_RESULT_PAGE_COUNT = 10
 
-  # Log model
-  LOGS_MODEL = 'database'
-  LOGS_MODEL_CONFIG = {}
+    # Feature Flag: Whether to record when users were last accessed.
+    FEATURE_USER_LAST_ACCESSED = True
 
-  # Namespace in which all audit logging is disabled.
-  DISABLED_FOR_AUDIT_LOGS = []
+    # Feature Flag: Whether to allow users to retrieve aggregated log counts.
+    FEATURE_AGGREGATED_LOG_COUNT_RETRIEVAL = True
 
-  # Namespace in which pull audit logging is disabled.
-  DISABLED_FOR_PULL_LOGS = []
+    # Feature Flag: Whether rate limiting is enabled.
+    FEATURE_RATE_LIMITS = False
 
-  # Feature Flag: Whether pull logs are disabled for free namespace.
-  FEATURE_DISABLE_PULL_LOGS_FOR_FREE_NAMESPACES = False
+    # Feature Flag: Whether to support log exporting.
+    FEATURE_LOG_EXPORT = True
 
-  # Feature Flag: If set to true, no account using blacklisted email addresses will be allowed
-  # to be created.
-  FEATURE_BLACKLISTED_EMAILS = False
+    # Maximum number of action logs pages that can be returned via the API.
+    ACTION_LOG_MAX_PAGE = None
 
-  # The list of domains, including subdomains, for which any *new* User with a matching
-  # email address will be denied creation. This option is only used if
-  # FEATURE_BLACKLISTED_EMAILS is enabled.
-  BLACKLISTED_EMAIL_DOMAINS = []
+    # Log model
+    LOGS_MODEL = "database"
+    LOGS_MODEL_CONFIG: Dict[str, Any] = {}
 
-  # Feature Flag: Whether garbage collection is enabled.
-  FEATURE_GARBAGE_COLLECTION = True
+    # Namespace in which all audit logging is disabled.
+    DISABLED_FOR_AUDIT_LOGS: List[str] = []
+
+    # Namespace in which pull audit logging is disabled.
+    DISABLED_FOR_PULL_LOGS: List[str] = []
+
+    # Feature Flag: Whether pull logs are disabled for free namespace.
+    FEATURE_DISABLE_PULL_LOGS_FOR_FREE_NAMESPACES = False
+
+    # Feature Flag: If set to true, no account using blacklisted email addresses will be allowed
+    # to be created.
+    FEATURE_BLACKLISTED_EMAILS = False
+
+    # The list of domains, including subdomains, for which any *new* User with a matching
+    # email address will be denied creation. This option is only used if
+    # FEATURE_BLACKLISTED_EMAILS is enabled.
+    BLACKLISTED_EMAIL_DOMAINS: List[str] = []
+
+    # Feature Flag: Whether garbage collection is enabled.
+    FEATURE_GARBAGE_COLLECTION = True
+
+    # Feature Flags: Whether the workers for GCing deleted namespaces and repositories
+    # are enabled.
+    FEATURE_NAMESPACE_GARBAGE_COLLECTION = True
+    FEATURE_REPOSITORY_GARBAGE_COLLECTION = True
+
+    # When enabled, sets a tracing callback to report greenlet metrics.
+    GREENLET_TRACING = True
+
+    # The timeout after which a fresh login check is required for sensitive operations.
+    FRESH_LOGIN_TIMEOUT = "10m"
+
+    # Feature Flag: Whether to clear expired RepositoryActionCount entries.
+    FEATURE_CLEAR_EXPIRED_RAC_ENTRIES = False
+
+    # Feature Flag: Whether OCI manifest support should be enabled generally.
+    FEATURE_GENERAL_OCI_SUPPORT = True
+    ALLOWED_OCI_ARTIFACT_TYPES = {
+        "application/vnd.oci.image.config.v1+json": [
+            "application/vnd.dev.cosign.simplesigning.v1+json",
+            "application/vnd.dsse.envelope.v1+json",
+            "text/spdx",
+            "text/spdx+xml",
+            "text/spdx+json",
+            "application/vnd.syft+json",
+            "application/vnd.cyclonedx",
+            "application/vnd.cyclonedx+xml",
+            "application/vnd.cyclonedx+json",
+            "application/vnd.in-toto+json",
+        ],
+        "application/vnd.cncf.helm.config.v1+json": [
+            "application/tar+gzip",
+            "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+        ],
+        "application/vnd.oci.source.image.config.v1+json": [
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        ],
+        "application/vnd.unknown.config.v1+json": [
+            "application/vnd.cncf.openpolicyagent.policy.layer.v1+rego",
+            "application/vnd.cncf.openpolicyagent.data.layer.v1+json",
+        ],
+    }
+
+    # Feature Flag: Whether to allow Helm OCI content types.
+    # See: https://helm.sh/docs/topics/registries/
+    FEATURE_HELM_OCI_SUPPORT = True
+
+    FEATURE_REFERRERS_API = True
+
+    # The set of hostnames disallowed from webhooks, beyond localhost (which will
+    # not work due to running inside a container).
+    WEBHOOK_HOSTNAME_BLACKLIST: Optional[List[str]] = []
+
+    # The root URL for documentation.
+    if os.environ.get("RED_HAT_QUAY", False):
+        DOCUMENTATION_ROOT = "https://access.redhat.com/documentation/en-us/red_hat_quay/3/"
+    else:
+        DOCUMENTATION_ROOT = "https://docs.projectquay.io/"
+
+    # Feature Flag: Whether the repository action count worker is enabled.
+    FEATURE_REPOSITORY_ACTION_COUNTER = True
+
+    # TEMP FEATURE: Backfill the sizes and subjects of manifests.
+    FEATURE_MANIFEST_SIZE_BACKFILL = True
+    FEATURE_MANIFEST_SUBJECT_BACKFILL = True
+
+    # Repos created by push default to private visibility
+    CREATE_PRIVATE_REPO_ON_PUSH = True
+
+    # Create organization on push if it does not exist
+    CREATE_NAMESPACE_ON_PUSH = False
+
+    # Account recovery mode
+    ACCOUNT_RECOVERY_MODE = False
+
+    # Feature Flag: If set to true, the first User account may be created via API /api/v1/user/initialize
+    FEATURE_USER_INITIALIZE = False
+
+    # Feature Flag: Controls programmatic bootstrap token provisioning.
+    FEATURE_PROGRAMMATIC_BOOTSTRAP = False
+
+    # Feature Flags: Control robot Management API tokens and federated token exchange.
+    FEATURE_ROBOT_API_TOKENS = False
+    FEATURE_ROBOT_API_TOKEN_EXCHANGE = False
+    BOOTSTRAP_TOKEN_OWNER: Optional[str] = None
+    BOOTSTRAP_TOKEN_PATH = "/var/lib/quay/quay-machine-token.json"
+    PROGRAMMATIC_TOKEN_K8S_SECRET: Optional[str] = None
+    PROGRAMMATIC_TOKEN_K8S_KEY = "token.json"
+    PROGRAMMATIC_TOKEN_K8S_NAMESPACE: Optional[str] = None
+    BOOTSTRAP_TOKEN_EXPIRATION = 3600  # 60 minutes in seconds
+    BOOTSTRAP_TOKEN_SCOPE = (
+        "org:admin repo:admin repo:create repo:read repo:write super:user user:admin user:read"
+    )
+
+    # Allows "/" in repository names
+    FEATURE_EXTENDED_REPOSITORY_NAMES = True
+
+    # Automatically clean stale blobs leftover in the uploads storage folder from cancelled uploads
+    CLEAN_BLOB_UPLOAD_FOLDER = True
+
+    # Add quota management configuration, caching, and validation
+    FEATURE_QUOTA_MANAGEMENT = False
+
+    FEATURE_EDIT_QUOTA = True
+
+    # Enables quota verfication on image push
+    FEATURE_VERIFY_QUOTA = True
+
+    # Catches and suppresses quota failures during image push and garbage collection
+    FEATURE_QUOTA_SUPPRESS_FAILURES = False
+
+    # Enables external notification channels (email, Slack, webhook) for quota threshold alerts
+    FEATURE_QUOTA_NOTIFICATIONS = False
+
+    # Cooldown period (in seconds) before re-sending a quota notification for the same threshold
+    QUOTA_NOTIFICATION_COOLDOWN_SECONDS = 86400
+
+    # default value for all organizations to reject by default. 0 = no configuration
+    DEFAULT_SYSTEM_REJECT_QUOTA_BYTES = 0
+    # Time delay for starting the quota backfill. Rolling deployments can cause incorrect
+    # totals, so this field should be set to a time longer than it takes for the rolling
+    # deployment to complete. Defaults to 30m.
+    QUOTA_TOTAL_DELAY_SECONDS = 60 * 30
+
+    # Enables the quota backfill worker
+    QUOTA_BACKFILL = True
+
+    # Enables exposing quota metrics for the registry, organizations and repositories.
+    # Beware of high cardinality if there are many organizations and repositories.
+    # Per-tenant series use namespace/repository names as labels (needed for
+    # dashboards); renames create new series until Prometheus drops stale ones.
+    QUOTA_METRICS = False
+
+    # Maximum number of repositories to report per-repository quota metrics for.
+    # Hard ceiling is 100000 (enforced in schema and at runtime).
+    QUOTA_METRICS_REPOS_LIMIT = 10000
+
+    # Maximum number of namespaces to report per-namespace quota metrics for.
+    # Hard ceiling is 100000 (enforced in schema and at runtime).
+    QUOTA_METRICS_NAMESPACES_LIMIT = 10000
+
+    # Feature Flag: Enables Quay to act as a pull through cache for upstream registries
+    FEATURE_PROXY_CACHE = False
+
+    # Feature Flag: Extended action logging for ESS Events of Interest compliance
+    # When enabled, logs include request URL, HTTP method, auth type, user agent, etc.
+    # This increases log volume by ~2.5-3x. Defaults to False (opt-in).
+    FEATURE_EXTENDED_ACTION_LOGGING = False
+
+    # Feature Flag: Enable a background worker to check and download missing placeholder blobs
+    FEATURE_PROXY_CACHE_BLOB_DOWNLOAD = True
+
+    # Feature Flag: Use Red Hat Export Compliance Service during Red Hat SSO (only used in Quay.io)
+    FEATURE_EXPORT_COMPLIANCE = False
+
+    # Feature Flag: Enables user to try the beta UI Environment
+    FEATURE_UI_V2 = True
+    FEATURE_UI_MODELCARD = True
+    UI_MODELCARD_ARTIFACT_TYPE = "application/x-mlmodel"
+    UI_MODELCARD_ANNOTATION: Optional[Dict[str, str]] = {}
+    UI_MODELCARD_LAYER_ANNOTATION: Optional[Dict[str, str]] = {
+        "org.opencontainers.image.title": "README.md"
+    }
+
+    # User feedback form for UI-V2
+    UI_V2_FEEDBACK_FORM = None
+
+    # Default to new UI
+    DEFAULT_UI = "react"
+    # If true, disables legacy Angular UI pages and redirects
+    DISABLE_ANGULAR_UI = False
+
+    # Export Compliance Endpoint
+    EXPORT_COMPLIANCE_ENDPOINT = ""
+
+    # Origin to allow for CORS requests
+    CORS_ORIGIN = "*"
+
+    # Feature Flag: Enables notifications about vulnerabilities to be sent for new pushes
+    FEATURE_SECURITY_SCANNER_NOTIFY_ON_NEW_INDEX = True
+
+    # Set minimal security level for new notifications on detected vulnerabilities. Avoids
+    # creation of large number of notifications after first index. If not defined, defaults to "High".
+    NOTIFICATION_MIN_SEVERITY_ON_NEW_INDEX = "High"
+
+    FEATURE_SUPERUSERS_FULL_ACCESS = False
+    FEATURE_SUPERUSERS_ORG_CREATION_ONLY = False
+
+    FEATURE_RESTRICTED_USERS = False
+    RESTRICTED_USERS_WHITELIST: Optional[List[str]] = None
+
+    QUOTA_INVALIDATE_TOTALS = True
+    RESET_CHILD_MANIFEST_EXPIRATION = False
+    PERMANENTLY_DELETE_TAGS = False
+
+    # Feature Flag: Enables reconciler for RH marketplace
+    FEATURE_ENTITLEMENT_RECONCILIATION = False
+    # Endpoints for marketplace compatibility
+    ENTITLEMENT_RECONCILIATION_USER_ENDPOINT = ""
+    ENTITLEMENT_RECONCILIATION_MARKETPLACE_ENDPOINT = ""
+
+    FEATURE_RH_MARKETPLACE = False
+
+    # Set up custom footer links for on-premise installations
+    FOOTER_LINKS: Optional[Dict[str, str]] = {}
+
+    FEATURE_AUTO_PRUNE = False
+    # delay after a write operation is made to the DB. This
+    # is useful if quay is using a different DB for reads and
+    # there is a delay in replication
+
+    FEATURE_UI_DELAY_AFTER_WRITE = False
+    UI_DELAY_AFTER_WRITE_SECONDS = 3
+
+    # whitelist for ROBOTS_DISALLOW to grant access/usage for mirroring
+    ROBOTS_WHITELIST: Optional[List[str]] = []
+
+    FEATURE_ASSIGN_OAUTH_TOKEN = True
+    DEFAULT_NAMESPACE_AUTOPRUNE_POLICY: Optional[Dict[str, str]] = None
+
+    # Allows users to set up notifications on image expiry, can remove flag once feature is tested
+    FEATURE_IMAGE_EXPIRY_TRIGGER = False
+
+    # Disable pushes while allowing other registry operations.
+    # Defaults to "False".
+    DISABLE_PUSHES = False
+
+    # Feature Flag: Enables repository-description spam detection at API ingress.
+    FEATURE_SPAM_DETECTION = False
+
+    # Evaluates repository descriptions without rejecting create/update requests.
+    SPAM_DETECTION_DRY_RUN = True
+
+    # Allows repository create/update requests if the local classifier cannot be evaluated.
+    SPAM_DETECTION_FAIL_OPEN = True
+
+    # In-image Bayesian classifier artifact used by Quay ingress. Generated by
+    # quay-service-tool and baked into the Quay image; Quay must not call
+    # quay-service-tool on the request path.
+    SPAM_DETECTION_CLASSIFIER_PATH = "/conf/spam-detection/classifier.json"
+    SPAM_DETECTION_CLASSIFIER_VERSION = None
+    SPAM_DETECTION_CLASSIFIER_SHA256 = None
+
+    # Specific namespaces that be exceptions to the s3-cloudflare optimization
+    # used for registry-proxy namespaces
+    CDN_SPECIFIC_NAMESPACES: Optional[List[str]] = []
+
+    # Enabled superuser API to dump config,env,schema and drifts(unknown like typos)
+    FEATURE_SUPERUSER_CONFIGDUMP = False
+
+    # OTEL CONFIG
+    FEATURE_OTEL_TRACING = False
+    OTEL_TRACING_EXCLUDED_URLS = None
+
+    # Metrics tracking namespaces
+    # Supports two formats:
+    # 1. List format: ["namespace1", "namespace2"] - each namespace gets its own label
+    # 2. Dict format: {"bucket_name": ["namespace1", "namespace2"]} - multiple namespaces share a bucket
+    # Example: {"critical": ["redhat", "internal"], "customers": ["customer1", "customer2"]}
+    TRACKED_NAMESPACES: Union[List[str], Dict[str, Union[List[str], str]]] = []
+
+    # Feature Flag: Whether to allow sparse manifest indexes where not all architectures are required.
+    # When enabled, manifests for missing architectures will be skipped instead of raising errors.
+    FEATURE_SPARSE_INDEX = False
+
+    # Feature flag: Enables cleanup of stale multipart uploads on the backend bucket. This feature flag
+    # is only applicable to S3 storage engines.
+    FEATURE_ENABLE_STALE_MPU_CLEANUP = True

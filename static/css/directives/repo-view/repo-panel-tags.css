@@ -127,8 +127,7 @@
   text-decoration: none !important
 }
 
-.repo-panel-tags-element .security-scan-col .has-vulns.Critical .highest-vuln,
-.repo-panel-tags-element .security-scan-col .has-vulns.Defcon1 .highest-vuln {
+.repo-panel-tags-element .security-scan-col .has-vulns.Critical .highest-vuln {
 }
 
 .repo-panel-tags-element .security-scan-col .has-vulns {
@@ -164,6 +163,27 @@
 
 .repo-panel-tags-element .image-id-row:before {
     content: "\f1c5";
+    font-family: FontAwesome;
+    position: absolute;
+    left: -22px;
+    top: 0px;
+    font-size: 15px;
+    color: #888;
+}
+
+.repo-panel-tags-element .signing-valid .tooltip-inner {
+  max-width: 250px;
+}
+
+.repo-panel-tags-element .cosign-signature-row {
+  margin-top: 10px;
+  margin-bottom: 6px;
+  padding-left: 6px;
+  position: relative;
+}
+
+.repo-panel-tags-element .cosign-signature-row:before {
+    content: "\f040";
     font-family: FontAwesome;
     position: absolute;
     left: -22px;

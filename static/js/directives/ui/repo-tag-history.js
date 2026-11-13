@@ -13,12 +13,16 @@ angular.module('quay').directive('repoTagHistory', function () {
       'repositoryTags': '=repositoryTags',
       'filter': '=filter',
       'isEnabled': '=isEnabled',
-      'imageLoader': '=imageLoader'
     },
-    controller: function($scope, $element, ApiService, StateService) {
+    controller: function($scope, $element, Config, ApiService, StateService) {
       $scope.inReadOnlyMode = StateService.inReadOnlyMode();
       $scope.tagHistoryData = null;
       $scope.tagHistoryLeaves = {};
+      $scope.Config = Config;
+
+      $scope.options = {
+        'showFuture': false
+      };
 
       // A delete followed by a create of a tag within this threshold is considered a move.
       var MOVE_THRESHOLD = 2;
@@ -31,12 +35,17 @@ angular.module('quay').directive('repoTagHistory', function () {
         };
 
         ApiService.listRepoTags(null, params).then(function(resp) {
+          $scope.cachedFullTags = resp.tags;
           processTags(resp.tags);
         });
       };
 
       $scope.$watch('isEnabled', loadTimeline);
       $scope.$watch('repositoryTags', loadTimeline);
+      $scope.$watch('options.showFuture', function() {
+        if (!$scope.cachedFullTags) { return; }
+        processTags($scope.cachedFullTags);
+      });
 
       var processTags = function(tags) {
         var entries = [];
@@ -44,8 +53,14 @@ angular.module('quay').directive('repoTagHistory', function () {
 
         // For each tag, turn the tag into create, move, delete, restore, etc entries.
         tags.forEach(function(tag) {
+          // NOTE: We identify permanently deleted tags when their start time is 
+          // greater than their end time. This assumption may change in the future.
+          // If tag has been permanently deleted, prevent it from being shown in 
+          // tag history.
+          if(tag.start_ts > tag.end_ts){
+            return
+          }
           var tagName = tag.name;
-          var dockerImageId = tag.docker_image_id;
           var manifestDigest = tag.manifest_digest;
 
           if (!tagEntries[tagName]) {
@@ -57,8 +72,7 @@ angular.module('quay').directive('repoTagHistory', function () {
             tagEntries[entry.tag_name].splice(tagEntries[entry.tag_name].indexOf(entry), 1);
           };
 
-          var addEntry = function(action, time, opt_docker_id, opt_old_docker_id,
-                                  opt_manifest_digest, opt_old_manifest_digest) {
+          var addEntry = function(action, time, opt_manifest_digest, opt_old_manifest_digest) {
             var entry = {
               'tag': tag,
               'tag_name': tagName,
@@ -67,11 +81,13 @@ angular.module('quay').directive('repoTagHistory', function () {
               'end_ts': tag.end_ts,
               'reversion': tag.reversion,
               'time': time * 1000, // JS expects ms, not s since epoch.
-              'docker_image_id': opt_docker_id || dockerImageId,
-              'old_docker_image_id': opt_old_docker_id || '',
               'manifest_digest': opt_manifest_digest || manifestDigest,
               'old_manifest_digest': opt_old_manifest_digest || null
             };
+
+            if (!$scope.options.showFuture && time && (time * 1000) >= new Date().getTime()) {
+              return;
+            }
 
             tagEntries[tagName].push(entry);
             entries.push(entry);
@@ -87,7 +103,7 @@ angular.module('quay').directive('repoTagHistory', function () {
             if (futureEntry.start_ts - tag.end_ts <= MOVE_THRESHOLD) {
               removeEntry(futureEntry);
               addEntry(futureEntry.reversion ? 'revert': 'move', tag.end_ts,
-                       futureEntry.docker_image_id, dockerImageId, futureEntry.manifest_digest,
+                       futureEntry.manifest_digest,
                        manifestDigest);
             } else {
               addEntry('delete', tag.end_ts)
@@ -144,10 +160,27 @@ angular.module('quay').directive('repoTagHistory', function () {
 
       $scope.askRestoreTag = function(entity, use_current_id) {
         if ($scope.repository.can_write) {
-          var docker_id = use_current_id ? entity.docker_image_id : entity.old_docker_image_id;
           var digest = use_current_id ? entity.manifest_digest : entity.old_manifest_digest;
-          $scope.tagActionHandler.askRestoreTag(entity.tag, docker_id, digest);
+          $scope.tagActionHandler.askRestoreTag(entity.tag, digest);
         }
+      };
+
+      $scope.askPermanentlyDeleteTag = function(entity) {
+        if ($scope.repository.can_write) {
+          var manifest_digest = null;
+          if(entity.action == "delete"){
+            manifest_digest = entity.manifest_digest
+          }
+          else if(entity.action == "move" || entity.action == "revert"){
+            manifest_digest = entity.old_manifest_digest
+          }
+          $scope.tagActionHandler.askPermanentlyDeleteTag(entity.tag, manifest_digest);
+        }
+      };
+
+      $scope.isFuture = function(entry) {
+        if (!entry) { return false; }
+        return entry.time >= new Date().getTime();
       };
 
       $scope.getEntryClasses = function(entry, historyFilter) {
@@ -158,6 +191,10 @@ angular.module('quay').directive('repoTagHistory', function () {
           classes += ' current ';
         }
 
+        if ($scope.isFuture(entry)) {
+          classes += ' future ';
+        }
+
         if (!historyFilter || !entry.action) {
           return classes;
         }
@@ -166,8 +203,6 @@ angular.module('quay').directive('repoTagHistory', function () {
         var isMatch = parts.some(function(part) {
           if (part && entry.tag_name) {
             isMatch = entry.tag_name.indexOf(part) >= 0;
-            isMatch = isMatch || entry.docker_image_id.indexOf(part) >= 0;
-            isMatch = isMatch || entry.old_docker_image_id.indexOf(part) >= 0;
             return isMatch;
           }
         });

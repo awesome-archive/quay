@@ -1,52 +1,161 @@
 import logging
 import logging.config
-
-from datetime import timedelta
+import time
+from datetime import datetime, timedelta
 
 from app import app, storage
 from data.database import UseThenDisconnect
-from workers.blobuploadcleanupworker.models_pre_oci import pre_oci_model as model
-from workers.worker import Worker
+from util.locking import GlobalLock, LockNotAcquiredException
 from util.log import logfile_path
+from workers.blobuploadcleanupworker.models_pre_oci import pre_oci_model as model
+from workers.gunicorn_worker import GunicornWorker
+from workers.worker import Worker
 
 logger = logging.getLogger(__name__)
 
-DELETION_DATE_THRESHOLD = timedelta(days=2)
-BLOBUPLOAD_CLEANUP_FREQUENCY = app.config.get('BLOBUPLOAD_CLEANUP_FREQUENCY', 60 * 60)
+threshold = app.config.get("BLOBUPLOAD_DELETION_DATE_THRESHOLD", 60 * 48)  # 2 days
+DELETION_DATE_THRESHOLD = timedelta(minutes=threshold)
+BLOBUPLOAD_CLEANUP_FREQUENCY = app.config.get("BLOBUPLOAD_CLEANUP_FREQUENCY", 60 * 60)
+LOCK_TTL = 60 * 20  # 20 minutes
+
+# Sets MPU deletion date threshold to 1 day
+# The TTL is explicitly chosen not to be configurable by the client: if the threshold is set too low,
+# then MPUs still in progress might be deleted causing push failures.
+MPU_CLEANUP_TTL = 60 * 60 * 24  # 1 day
+MPU_DELETION_DATE_THRESHOLD = timedelta(seconds=MPU_CLEANUP_TTL)
+# check if there are any stale MPUs every 6 hours
+MPU_CLEANUP_FREQUENCY = 6 * 60 * 60
 
 
 class BlobUploadCleanupWorker(Worker):
-  def __init__(self):
-    super(BlobUploadCleanupWorker, self).__init__()
-    self.add_operation(self._cleanup_uploads, BLOBUPLOAD_CLEANUP_FREQUENCY)
+    def __init__(self):
+        super(BlobUploadCleanupWorker, self).__init__()
+        self.add_operation(self._try_cleanup_uploads, BLOBUPLOAD_CLEANUP_FREQUENCY)
+        if app.config.get("FEATURE_ENABLE_STALE_MPU_CLEANUP", False):
+            self.add_operation(self._try_clean_stale_multipart_uploads, MPU_CLEANUP_FREQUENCY)
+        else:
+            logger.debug("Cleanup of stale multipart uploads not enabled, skipping...")
 
-  def _cleanup_uploads(self):
-    """ Performs garbage collection on the blobupload table. """
-    while True:
-      # Find all blob uploads older than the threshold (typically a week) and delete them.
-      with UseThenDisconnect(app.config):
-        stale_upload = model.get_stale_blob_upload(DELETION_DATE_THRESHOLD)
-        if stale_upload is None:
-          logger.debug('No additional stale blob uploads found')
-          return
+    def _try_cleanup_uploads(self):
+        """
+        Performs garbage collection on the blobupload table.
+        Will also perform garbage collection on the uploads folder in the S3 bucket,
+        if applicable.
+        """
+        try:
+            with GlobalLock("BLOB_CLEANUP", lock_ttl=LOCK_TTL):
+                self._cleanup_uploads()
+                if app.config.get("CLEAN_BLOB_UPLOAD_FOLDER", False):
+                    self._try_clean_partial_uploads()
+        except LockNotAcquiredException:
+            logger.debug("Could not acquire global lock for blob upload cleanup worker")
 
-      # Remove the stale upload from storage.
-      logger.debug('Removing stale blob upload %s', stale_upload.uuid)
-      try:
-        storage.cancel_chunked_upload([stale_upload.location_name], stale_upload.uuid,
-                                      stale_upload.storage_metadata)
-      except Exception as ex:
-        logger.debug('Got error when trying to cancel chunked upload %s: %s', stale_upload.uuid,
-                     ex.message)
+    def _try_clean_partial_uploads(self):
+        """
+        Uploads cancelled before completion leaves the possibility of untracked blobs being
+        leftover in the uploads storage folder.
+        This function cleans those blobs older than DELETION_DATE_THRESHOLD
+        """
+        if not storage.preferred_locations:
+            logger.debug("No preferred storage locations defined, aborting cleanup of stale blobs")
+            return
 
-      # Delete the stale upload's row.
-      with UseThenDisconnect(app.config):
-        model.delete_blob_upload(stale_upload)
+        try:
+            storage.clean_partial_uploads(storage.preferred_locations, DELETION_DATE_THRESHOLD)
+        except NotImplementedError:
+            logger.debug(
+                'Cleaning partial uploads not applicable to storage location "%s"',
+                storage.preferred_locations[0],
+            )
 
-      logger.debug('Removed stale blob upload %s', stale_upload.uuid)
+    def _try_clean_stale_multipart_uploads(self):
+        """
+        Attempts to clean up stale multipart uploads on the storage side. Stale uploads can happen if
+        the upload thread was terminated prematurely and MPU was not cancelled or committed properly,
+        consuming storage needlessly. This function cleans all MPUs older than MPU_DELETION_DATE_THRESHOLD.
+        """
+        deleted = 0
+        if not storage.preferred_locations:
+            logger.debug(
+                "No preferred storage locations defined, aborting cleanup of stale multipart uploads"
+            )
+            return
+
+        logger.debug("Performing cleanup of stale multipart uploads")
+        try:
+            with GlobalLock("STALE_MPU_CLEANUP", lock_ttl=LOCK_TTL):
+                try:
+                    deleted = storage.clean_orphaned_multipart_uploads(
+                        storage.preferred_locations, MPU_DELETION_DATE_THRESHOLD
+                    )
+                    if deleted == 0:
+                        logger.debug("No stale multipart uploads found")
+                except NotImplementedError:
+                    logger.debug(
+                        "Deletion of stale multipart uploads is not applicable to storage location %s",
+                        storage.preferred_locations[0],
+                    )
+        except LockNotAcquiredException:
+            logger.debug(
+                "Could not acquire global lock for stale multipart upload cleanup, skipping..."
+            )
+
+    def _cleanup_uploads(self):
+        """
+        Performs cleanup on the blobupload table.
+        """
+        logger.debug("Performing blob upload cleanup")
+
+        while True:
+            # Find all blob uploads older than the threshold (typically a week) and delete them.
+            with UseThenDisconnect(app.config):
+                stale_upload = model.get_stale_blob_upload(DELETION_DATE_THRESHOLD)
+                if stale_upload is None:
+                    logger.debug("No additional stale blob uploads found")
+                    return
+
+            # Remove the stale upload from storage.
+            logger.debug("Removing stale blob upload %s", stale_upload.uuid)
+            assert stale_upload.created <= (datetime.utcnow() - DELETION_DATE_THRESHOLD)
+
+            try:
+                storage.cancel_chunked_upload(
+                    [stale_upload.location_name], stale_upload.uuid, stale_upload.storage_metadata
+                )
+            except Exception as ex:
+                logger.debug(
+                    "Got error when trying to cancel chunked upload %s: %s",
+                    stale_upload.uuid,
+                    str(ex),
+                )
+
+            # Delete the stale upload's row.
+            with UseThenDisconnect(app.config):
+                model.delete_blob_upload(stale_upload)
+
+            logger.debug("Removed stale blob upload %s", stale_upload.uuid)
+
+
+def create_gunicorn_worker():
+    """
+    follows the gunicorn application factory pattern, enabling
+    a quay worker to run as a gunicorn worker thread.
+
+    this is useful when utilizing gunicorn's hot reload in local dev.
+
+    utilizing this method will enforce a 1:1 quay worker to gunicorn worker ratio.
+    """
+    worker = GunicornWorker(__name__, app, BlobUploadCleanupWorker(), True)
+    return worker
 
 
 if __name__ == "__main__":
-  logging.config.fileConfig(logfile_path(debug=False), disable_existing_loggers=False)
-  worker = BlobUploadCleanupWorker()
-  worker.start()
+    if app.config.get("ACCOUNT_RECOVERY_MODE", False):
+        logger.debug("Quay running in account recovery mode")
+        while True:
+            time.sleep(100000)
+
+    logging.config.fileConfig(logfile_path(debug=False), disable_existing_loggers=False)
+    GlobalLock.configure(app.config)
+    worker = BlobUploadCleanupWorker()
+    worker.start()

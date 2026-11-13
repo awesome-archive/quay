@@ -1,397 +1,757 @@
 # -*- coding: utf-8 -*-
 import logging
-
-from email.utils import parsedate_tz, mktime_tz
 from datetime import datetime
+from email.utils import mktime_tz, parsedate_tz
 
-from jsonschema import ValidationError
 from flask import request
+from jsonschema import ValidationError
 
 import features
-
-from auth.auth_context import get_authenticated_user
+from app import app
 from data import model
-from endpoints.api import (RepositoryParamResource, nickname, path_param, require_repo_admin,
-                           resource, validate_json_request, define_json_response, show_if,
-                           format_date)
-from endpoints.exception import NotFound
+from data.database import RepoMirrorRuleType
+from data.encryption import DecryptionFailureException
+from endpoints.api import (
+    RepositoryParamResource,
+    allow_if_global_readonly_superuser,
+    define_json_response,
+    format_date,
+    nickname,
+    path_param,
+    require_repo_admin,
+    resource,
+    show_if,
+    validate_json_request,
+)
+from endpoints.exception import InvalidRequest, NotFound
 from util.audit import track_and_log, wrap_repository
 from util.names import parse_robot_username
+from util.security.ssrf import (
+    SSRFBlockedError,
+    resolve_proxy_config_for_ssrf,
+    validate_external_registry_reference,
+)
+
+SSRF_GENERIC_ERROR = "The provided registry location is not allowed"
+
+
+def _get_ssrf_allowed_hosts():
+    return app.config.get("SSRF_ALLOWED_HOSTS", [])
+
+
+_PROXY_KEYS = ("http_proxy", "https_proxy", "no_proxy", "all_proxy")
+
+
+def _effective_proxy_config(stored_registry_config, submitted_registry_config):
+    """
+    Build the proxy mapping that will be active after a field-wise config update.
+
+    Persistence overlays only submitted proxy keys onto the stored mapping. SSRF
+    validation must use that same effective mapping so the validated route matches
+    the runtime route.
+    """
+    stored = dict((stored_registry_config or {}).get("proxy") or {})
+    if submitted_registry_config is None or "proxy" not in submitted_registry_config:
+        return stored or None
+
+    merged = dict(stored)
+    submitted_proxy = submitted_registry_config.get("proxy") or {}
+    for key in _PROXY_KEYS:
+        if key in submitted_proxy:
+            merged[key] = submitted_proxy[key]
+    return merged or None
+
+
+def _validate_external_reference(reference, proxy_config=None):
+    """Validate a repository mirror source and normalize SSRF errors."""
+    try:
+        validate_external_registry_reference(
+            reference,
+            allowed_hosts=_get_ssrf_allowed_hosts(),
+            proxy_config=resolve_proxy_config_for_ssrf(proxy_config),
+        )
+    except SSRFBlockedError:
+        raise InvalidRequest(SSRF_GENERIC_ERROR)
+    except ValueError as e:
+        raise InvalidRequest(str(e))
 
 
 common_properties = {
-  'is_enabled': {
-    'type': 'boolean',
-    'description': 'Used to enable or disable synchronizations.',
-  },
-  'external_reference': {
-    'type': 'string',
-    'description': 'Location of the external repository.'
-  },
-  'external_registry_username': {
-    'type': ['string', 'null'],
-    'description': 'Username used to authenticate with external registry.',
-  },
-  'external_registry_password': {
-    'type': ['string', 'null'],
-    'description': 'Password used to authenticate with external registry.',
-  },
-  'sync_start_date': {
-    'type': 'string',
-    'description': 'Determines the next time this repository is ready for synchronization.',
-  },
-  'sync_interval': {
-    'type': 'integer',
-    'minimum': 0,
-    'description': 'Number of seconds after next_start_date to begin synchronizing.'
-  },
-  'robot_username': {
-    'type': 'string',
-    'description': 'Username of robot which will be used for image pushes.'
-  },
-  'root_rule': {
-    'type': 'object',
-    'description': 'Tag mirror rule',
-    'required': [
-      'rule_type',
-      'rule_value'
-    ],
-    'properties': {
-      'rule_type': {
-        'type': 'string',
-        'description': 'Rule type must be "TAG_GLOB_CSV"'
-      },
-      'rule_value': {
-        'type': 'array',
-        'description': 'Array of tag patterns',
-        'items': {
-          'type': 'string'
-        }
-      }
+    "is_enabled": {
+        "type": "boolean",
+        "description": "Used to enable or disable synchronizations.",
     },
-    'description': 'A list of glob-patterns used to determine which tags should be synchronized.'
-  },
-  'external_registry_config': {
-    'type': 'object',
-    'properties': {
-      'verify_tls': {
-        'type': 'boolean',
-        'description': (
-          'Determines whether HTTPs is required and the certificate is verified when '
-          'communicating with the external repository.'
+    "external_reference": {"type": "string", "description": "Location of the external repository."},
+    "external_registry_username": {
+        "type": ["string", "null"],
+        "description": "Username used to authenticate with external registry.",
+    },
+    "external_registry_password": {
+        "type": ["string", "null"],
+        "description": "Password used to authenticate with external registry.",
+    },
+    "sync_start_date": {
+        "type": "string",
+        "description": "Determines the next time this repository is ready for synchronization.",
+    },
+    "sync_interval": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Number of seconds after next_start_date to begin synchronizing.",
+    },
+    "robot_username": {
+        "type": "string",
+        "description": "Username of robot which will be used for image pushes.",
+    },
+    "root_rule": {
+        "type": "object",
+        "required": ["rule_kind", "rule_value"],
+        "properties": {
+            "rule_kind": {
+                "type": "string",
+                "description": "The kind of rule type",
+                "enum": ["tag_glob_csv"],
+            },
+            "rule_value": {
+                "type": "array",
+                "description": "Array of tag patterns",
+                "items": {"type": "string"},
+            },
+        },
+        "description": "A list of glob-patterns used to determine which tags should be synchronized.",
+    },
+    "external_registry_config": {
+        "type": "object",
+        "properties": {
+            "verify_tls": {
+                "type": "boolean",
+                "description": (
+                    "Determines whether HTTPs is required and the certificate is verified when "
+                    "communicating with the external repository."
+                ),
+            },
+            "unsigned_images": {
+                "type": "boolean",
+                "description": (
+                    "Determines whether the image signature will be verified when pulling from "
+                    "the external repository."
+                ),
+            },
+            "proxy": {
+                "type": "object",
+                "description": "Proxy configuration for use during synchronization.",
+                "properties": {
+                    "https_proxy": {
+                        "type": ["string", "null"],
+                        "description": "Value for HTTPS_PROXY environment variable during sync.",
+                    },
+                    "http_proxy": {
+                        "type": ["string", "null"],
+                        "description": "Value for HTTP_PROXY environment variable during sync.",
+                    },
+                    "no_proxy": {
+                        "type": ["string", "null"],
+                        "description": "Value for NO_PROXY environment variable during sync.",
+                    },
+                },
+            },
+        },
+    },
+    "skopeo_timeout_interval": {
+        "type": "integer",
+        "minimum": 300,
+        "description": "Number of seconds mirroring job will run before timing out.",
+    },
+    "architecture_filter": {
+        "type": ["array", "null"],
+        "items": {"type": "string"},
+        "description": (
+            "List of architectures to mirror from multi-arch images. "
+            "Empty array or null means mirror all architectures. "
+            "Valid values: amd64, arm64, ppc64le, s390x."
         ),
-      },
-      'proxy': {
-        'type': 'object',
-        'description': 'Proxy configuration for use during synchronization.',
-        'properties': {
-          'https_proxy': {
-            'type': ['string', 'null'],
-            'description': 'Value for HTTPS_PROXY environment variable during sync.'
-          },
-          'http_proxy': {
-            'type': ['string', 'null'],
-            'description': 'Value for HTTP_PROXY environment variable during sync.'
-          },
-          'no_proxy': {
-            'type': ['string', 'null'],
-            'description': 'Value for NO_PROXY environment variable during sync.'
-          }
-        }
-      }
-    }
-  }
+    },
 }
 
 
-@resource('/v1/repository/<apirepopath:repository>/mirror/sync-now')
-@path_param('repository', 'The full path of the repository. e.g. namespace/name')
+@resource("/v1/repository/<apirepopath:repository>/mirror/sync-now")
+@path_param("repository", "The full path of the repository. e.g. namespace/name")
 @show_if(features.REPO_MIRROR)
 class RepoMirrorSyncNowResource(RepositoryParamResource):
-  """ A resource for managing RepoMirrorConfig.sync_status """
+    """
+    A resource for managing RepoMirrorConfig.sync_status.
+    """
 
-  @require_repo_admin
-  @nickname('syncNow')
-  def post(self, namespace_name, repository_name):
-    """ Update the sync_status for a given Repository's mirroring configuration. """
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
+    @require_repo_admin(allow_for_superuser=True)
+    @nickname("syncNow")
+    def post(self, namespace_name, repository_name):
+        """
+        Update the sync_status for a given Repository's mirroring configuration.
+        """
+        repo = model.repository.get_repository(namespace_name, repository_name)
+        if not repo:
+            raise NotFound()
 
-    mirror = model.repo_mirror.get_mirror(repository=repo)
-    if not mirror:
-      raise NotFound()
+        mirror = model.repo_mirror.get_mirror(repository=repo)
+        if not mirror:
+            raise NotFound()
 
-    if mirror and model.repo_mirror.update_sync_status_to_sync_now(mirror):
-      track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed="sync_status", to="SYNC_NOW")
-      return '', 204
+        if mirror and model.repo_mirror.update_sync_status_to_sync_now(mirror):
+            track_and_log(
+                "repo_mirror_config_changed",
+                wrap_repository(repo),
+                changed="sync_status",
+                to="SYNC_NOW",
+            )
+            return "", 204
 
-    raise NotFound()
+        raise NotFound()
 
 
-@resource('/v1/repository/<apirepopath:repository>/mirror/sync-cancel')
-@path_param('repository', 'The full path of the repository. e.g. namespace/name')
+@resource("/v1/repository/<apirepopath:repository>/mirror/sync-cancel")
+@path_param("repository", "The full path of the repository. e.g. namespace/name")
 @show_if(features.REPO_MIRROR)
 class RepoMirrorSyncCancelResource(RepositoryParamResource):
-  """ A resource for managing RepoMirrorConfig.sync_status """
+    """
+    A resource for managing RepoMirrorConfig.sync_status.
+    """
 
-  @require_repo_admin
-  @nickname('syncCancel')
-  def post(self, namespace_name, repository_name):
-    """ Update the sync_status for a given Repository's mirroring configuration. """
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
+    @require_repo_admin(allow_for_superuser=True)
+    @nickname("syncCancel")
+    def post(self, namespace_name, repository_name):
+        """
+        Update the sync_status for a given Repository's mirroring configuration.
+        """
+        repo = model.repository.get_repository(namespace_name, repository_name)
+        if not repo:
+            raise NotFound()
 
-    mirror = model.repo_mirror.get_mirror(repository=repo)
-    if not mirror:
-      raise NotFound()
+        mirror = model.repo_mirror.get_mirror(repository=repo)
+        if not mirror:
+            raise NotFound()
 
-    if mirror and model.repo_mirror.update_sync_status_to_cancel(mirror):
-      track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed="sync_status", to="SYNC_CANCEL")
-      return '', 204
+        if mirror and model.repo_mirror.update_sync_status_to_cancel(mirror):
+            track_and_log(
+                "repo_mirror_config_changed",
+                wrap_repository(repo),
+                changed="sync_status",
+                to="SYNC_CANCEL",
+            )
+            return "", 204
 
-    raise NotFound()
+        raise NotFound()
 
 
-@resource('/v1/repository/<apirepopath:repository>/mirror')
-@path_param('repository', 'The full path of the repository. e.g. namespace/name')
+@resource("/v1/repository/<apirepopath:repository>/mirror")
+@path_param("repository", "The full path of the repository. e.g. namespace/name")
 @show_if(features.REPO_MIRROR)
 class RepoMirrorResource(RepositoryParamResource):
-  """
-  Resource for managing repository mirroring.
-  """
-  schemas = {
-    'CreateMirrorConfig': {
-      'description': 'Create the repository mirroring configuration.',
-      'type': 'object',
-      'required': [
-        'external_reference',
-        'sync_interval',
-        'sync_start_date',
-        'root_rule'
-      ],
-      'properties': common_properties
-    },
-    'UpdateMirrorConfig': {
-      'description': 'Update the repository mirroring configuration.',
-      'type': 'object',
-      'properties': common_properties
-    },
-    'ViewMirrorConfig': {
-      'description': 'View the repository mirroring configuration.',
-      'type': 'object',
-      'required': [
-        'is_enabled',
-        'mirror_type',
-        'external_reference',
-        'external_registry_username',
-        'external_registry_config',
-        'sync_interval',
-        'sync_start_date',
-        'sync_expiration_date',
-        'sync_retries_remaining',
-        'sync_status',
-        'root_rule',
-        'robot_username',
-      ],
-      'properties': common_properties
-    }
-  }
-
-  @require_repo_admin
-  @define_json_response('ViewMirrorConfig')
-  @nickname('getRepoMirrorConfig')
-  def get(self, namespace_name, repository_name):
-    """ Return the Mirror configuration for a given Repository. """
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
-
-    mirror = model.repo_mirror.get_mirror(repo)
-    if not mirror:
-      raise NotFound()
-
-    # Transformations
-    rules = mirror.root_rule.rule_value
-    username = self._decrypt_username(mirror.external_registry_username)
-    sync_start_date = self._dt_to_string(mirror.sync_start_date)
-    sync_expiration_date = self._dt_to_string(mirror.sync_expiration_date)
-    robot = mirror.internal_robot.username if mirror.internal_robot is not None else None
-
-    return {
-      'is_enabled': mirror.is_enabled,
-      'mirror_type': mirror.mirror_type.name,
-      'external_reference': mirror.external_reference,
-      'external_registry_username': username,
-      'external_registry_config': mirror.external_registry_config or {},
-      'sync_interval': mirror.sync_interval,
-      'sync_start_date': sync_start_date,
-      'sync_expiration_date': sync_expiration_date,
-      'sync_retries_remaining': mirror.sync_retries_remaining,
-      'sync_status': mirror.sync_status.name,
-      'root_rule': {
-        'rule_type': 'TAG_GLOB_CSV',
-        'rule_value': rules
-      },
-      'robot_username': robot,
-    }
-
-  @require_repo_admin
-  @nickname('createRepoMirrorConfig')
-  @validate_json_request('CreateMirrorConfig')
-  def post(self, namespace_name, repository_name):
-    """ Create a RepoMirrorConfig for a given Repository. """
-    # TODO: Tidy up this function
-    # TODO: Specify only the data we want to pass on when creating the RepoMirrorConfig. Avoid
-    #       the possibility of data injection.
-
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
-
-    if model.repo_mirror.get_mirror(repo):
-      return {'detail': 'Mirror configuration already exits for repository %s/%s' % (
-        namespace_name, repository_name)}, 409
-
-    data = request.get_json()
-
-    data['sync_start_date'] = self._string_to_dt(data['sync_start_date'])
-
-    rule = model.repo_mirror.create_rule(repo, data['root_rule']['rule_value'])
-    del data['root_rule']
-
-    # Verify the robot is part of the Repository's namespace
-    robot = self._setup_robot_for_mirroring(namespace_name, repository_name, data['robot_username'])
-    del data['robot_username']
-
-    mirror = model.repo_mirror.enable_mirroring_for_repository(repo, root_rule=rule,
-                                                               internal_robot=robot, **data)
-    if mirror:
-      track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_reference', to=data['external_reference'])
-      return '', 201
-    else:
-      # TODO: Determine appropriate Response
-      return {'detail': 'RepoMirrorConfig already exists for this repository.'}, 409
-
-  @require_repo_admin
-  @validate_json_request('UpdateMirrorConfig')
-  @nickname('changeRepoMirrorConfig')
-  def put(self, namespace_name, repository_name):
-    """ Allow users to modifying the repository's mirroring configuration. """
-    values = request.get_json()
-
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
-
-    mirror = model.repo_mirror.get_mirror(repo)
-    if not mirror:
-      raise NotFound()
-
-    if 'is_enabled' in values:
-      if values['is_enabled'] == True:
-        if model.repo_mirror.enable_mirror(repo):
-          track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='is_enabled', to=True)
-      if values['is_enabled'] == False:
-        if model.repo_mirror.disable_mirror(repo):
-          track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='is_enabled', to=False)
-
-    if 'external_reference' in values:
-      if values['external_reference'] == '':
-        return {'detail': 'Empty string is an invalid repository location.'}, 400
-      if model.repo_mirror.change_remote(repo, values['external_reference']):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_reference', to=values['external_reference'])
-
-    if 'robot_username' in values:
-      robot_username = values['robot_username']
-      robot = self._setup_robot_for_mirroring(namespace_name, repository_name, robot_username)
-      if model.repo_mirror.set_mirroring_robot(repo, robot):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='robot_username', to=robot_username)
-
-    if 'sync_start_date' in values:
-      try:
-        sync_start_date = self._string_to_dt(values['sync_start_date'])
-      except ValueError as e:
-        return {'detail': 'Incorrect DateTime format for sync_start_date.'}, 400
-      if model.repo_mirror.change_sync_start_date(repo, sync_start_date):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='sync_start_date', to=sync_start_date)
-
-    if 'sync_interval' in values:
-      if model.repo_mirror.change_sync_interval(repo, values['sync_interval']):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='sync_interval', to=values['sync_interval'])
-
-    if 'external_registry_username' in values and 'external_registry_password' in values:
-      username = values['external_registry_username']
-      password = values['external_registry_password']
-      if username is None and password is not None:
-        return {'detail': 'Unable to delete username while setting a password.'}, 400
-      if model.repo_mirror.change_credentials(repo, username, password):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_registry_username', to=username)
-        if password is None:
-          track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_registry_password', to=None)
-        else:
-          track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_registry_password', to="********")
-
-    elif 'external_registry_username' in values:
-      username = values['external_registry_username']
-      if model.repo_mirror.change_username(repo, username):
-        track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='external_registry_username', to=username)
-
-    # Do not allow specifying a password without setting a username
-    if 'external_registry_password' in values and 'external_registry_username' not in values:
-      return {'detail': 'Unable to set a new password without also specifying a username.'}, 400
-
-    if 'external_registry_config' in values:
-      external_registry_config = values.get('external_registry_config', {})
-
-      if 'verify_tls' in external_registry_config:
-        updates = {'verify_tls': external_registry_config['verify_tls']}
-        if model.repo_mirror.change_external_registry_config(repo, updates):
-          track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='verify_tls', to=external_registry_config['verify_tls'])
-
-      if 'proxy' in external_registry_config:
-          proxy_values = external_registry_config.get('proxy', {})
-
-          if 'http_proxy' in proxy_values:
-            updates = {'proxy': {'http_proxy': proxy_values['http_proxy']}}
-            if model.repo_mirror.change_external_registry_config(repo, updates):
-              track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='http_proxy', to=proxy_values['http_proxy'])
-
-          if 'https_proxy' in proxy_values:
-            updates = {'proxy': {'https_proxy': proxy_values['https_proxy']}}
-            if model.repo_mirror.change_external_registry_config(repo, updates):
-              track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='https_proxy', to=proxy_values['https_proxy'])
-
-          if 'no_proxy' in proxy_values:
-            updates = {'proxy': {'no_proxy': proxy_values['no_proxy']}}
-            if model.repo_mirror.change_external_registry_config(repo, updates):
-              track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed='no_proxy', to=proxy_values['no_proxy'])
-
-    return '', 201
-
-  def _setup_robot_for_mirroring(self, namespace_name, repo_name, robot_username):
-    """ Validate robot exists and give write permissions. """
-    robot = model.user.lookup_robot(robot_username)
-    assert robot.robot
-
-    namespace, _ = parse_robot_username(robot_username)
-    if namespace != namespace_name:
-      raise model.DataModelException('Invalid robot')
-
-    # Ensure the robot specified has access to the repository. If not, grant it.
-    permissions = model.permission.get_user_repository_permissions(robot, namespace_name, repo_name)
-    if not permissions or permissions[0].role.name == 'read':
-      model.permission.set_user_repo_permission(robot.username, namespace_name, repo_name, 'write')
-
-    return robot
-
-  def _string_to_dt(self, string):
-    """ Convert String to correct DateTime format. """
-    if string is None:
-      return None
-
     """
+    Resource for managing repository mirroring.
+    """
+
+    schemas = {
+        "CreateMirrorConfig": {
+            "description": "Create the repository mirroring configuration.",
+            "type": "object",
+            "required": [
+                "external_reference",
+                "sync_interval",
+                "sync_start_date",
+                "root_rule",
+                "skopeo_timeout_interval",
+            ],
+            "properties": common_properties,
+        },
+        "UpdateMirrorConfig": {
+            "description": "Update the repository mirroring configuration.",
+            "type": "object",
+            "properties": common_properties,
+        },
+        "ViewMirrorConfig": {
+            "description": "View the repository mirroring configuration.",
+            "type": "object",
+            "required": [
+                "is_enabled",
+                "mirror_type",
+                "external_reference",
+                "external_registry_username",
+                "external_registry_config",
+                "sync_interval",
+                "skopeo_timeout_interval",
+                "sync_start_date",
+                "sync_expiration_date",
+                "sync_retries_remaining",
+                "sync_status",
+                "root_rule",
+                "robot_username",
+                "architecture_filter",
+            ],
+            "properties": common_properties,
+        },
+    }
+
+    @require_repo_admin(allow_for_global_readonly_superuser=True, allow_for_superuser=True)
+    @define_json_response("ViewMirrorConfig")
+    @nickname("getRepoMirrorConfig")
+    def get(self, namespace_name, repository_name):
+        """
+        Return the Mirror configuration for a given Repository.
+        """
+        repo = model.repository.get_repository(namespace_name, repository_name)
+        if not repo:
+            raise NotFound()
+
+        mirror = model.repo_mirror.get_mirror(repo)
+        if not mirror:
+            raise NotFound()
+
+        try:
+            username = self._decrypt_username(mirror.external_registry_username)
+        except DecryptionFailureException as dfe:
+            logger.warning(
+                "Failed to decrypt username for repository %s/%s: %s",
+                namespace_name,
+                repository_name,
+                dfe,
+            )
+            username = "(invalid. please re-enter)"
+
+        # Transformations
+        rules = mirror.root_rule.rule_value
+        sync_start_date = self._dt_to_string(mirror.sync_start_date)
+        sync_expiration_date = self._dt_to_string(mirror.sync_expiration_date)
+        robot = mirror.internal_robot.username if mirror.internal_robot is not None else None
+        timeout = mirror.skopeo_timeout
+
+        is_readonly = allow_if_global_readonly_superuser()
+
+        return {
+            "is_enabled": mirror.is_enabled,
+            "mirror_type": mirror.mirror_type.name,
+            "external_reference": mirror.external_reference,
+            "external_registry_username": None if is_readonly else username,
+            "external_registry_config": (
+                {} if is_readonly else (mirror.external_registry_config or {})
+            ),
+            "sync_interval": mirror.sync_interval,
+            "sync_start_date": sync_start_date,
+            "sync_expiration_date": sync_expiration_date,
+            "sync_retries_remaining": mirror.sync_retries_remaining,
+            "sync_status": mirror.sync_status.name,
+            "root_rule": {"rule_kind": "tag_glob_csv", "rule_value": rules},
+            "robot_username": robot,
+            "skopeo_timeout_interval": timeout,
+            "architecture_filter": mirror.architecture_filter or [],
+        }
+
+    @require_repo_admin(allow_for_superuser=True)
+    @nickname("createRepoMirrorConfig")
+    @validate_json_request("CreateMirrorConfig")
+    def post(self, namespace_name, repository_name):
+        """
+        Create a RepoMirrorConfig for a given Repository.
+        """
+        # TODO: Tidy up this function
+        # TODO: Specify only the data we want to pass on when creating the RepoMirrorConfig. Avoid
+        #       the possibility of data injection.
+
+        repo = model.repository.get_repository(namespace_name, repository_name)
+        if not repo:
+            raise NotFound()
+
+        self._reject_if_org_mirror_configured(namespace_name)
+
+        if model.repo_mirror.get_mirror(repo):
+            return (
+                {
+                    "detail": "Mirror configuration already exits for repository %s/%s"
+                    % (namespace_name, repository_name)
+                },
+                409,
+            )
+
+        data = request.get_json()
+
+        # Validate the complete request before creating rules or changing permissions.
+        registry_config = data.get("external_registry_config") or {}
+        _validate_external_reference(
+            data["external_reference"],
+            proxy_config=registry_config.get("proxy"),
+        )
+
+        arch_filter = data.get("architecture_filter")
+        if arch_filter and not app.config.get("FEATURE_SPARSE_INDEX", False):
+            return {
+                "detail": "Architecture filtering requires FEATURE_SPARSE_INDEX to be enabled."
+            }, 400
+        try:
+            model.repo_mirror.validate_architecture_filter(arch_filter)
+        except ValidationError as e:
+            return {"detail": str(e)}, 400
+
+        if data["skopeo_timeout_interval"] < 300:
+            return (
+                {"detail": "Skopeo timeout interval cannot be less than 300 seconds"},
+                400,
+            )
+
+        try:
+            data["sync_start_date"] = self._string_to_dt(data["sync_start_date"])
+        except ValueError:
+            return {"detail": "Incorrect DateTime format for sync_start_date."}, 400
+
+        rule = model.repo_mirror.create_rule(repo, data["root_rule"]["rule_value"])
+        del data["root_rule"]
+
+        # Verify the robot is part of the Repository's namespace
+        robot = self._setup_robot_for_mirroring(
+            namespace_name, repository_name, data["robot_username"]
+        )
+        del data["robot_username"]
+
+        # Extract architecture_filter before passing data to enable_mirroring_for_repository
+        arch_filter = data.pop("architecture_filter", None)
+
+        mirror = model.repo_mirror.enable_mirroring_for_repository(
+            repo,
+            root_rule=rule,
+            internal_robot=robot,
+            allowed_hosts=_get_ssrf_allowed_hosts(),
+            **data,
+        )
+        if mirror:
+            if arch_filter is not None:
+                model.repo_mirror.set_architecture_filter(repo, arch_filter)
+
+            track_and_log(
+                "repo_mirror_config_changed",
+                wrap_repository(repo),
+                changed="external_reference",
+                to=data["external_reference"],
+            )
+            return "", 201
+        else:
+            # TODO: Determine appropriate Response
+            return {"detail": "RepoMirrorConfig already exists for this repository."}, 409
+
+    @require_repo_admin(allow_for_superuser=True)
+    @validate_json_request("UpdateMirrorConfig")
+    @nickname("changeRepoMirrorConfig")
+    def put(self, namespace_name, repository_name):
+        """
+        Allow users to modifying the repository's mirroring configuration.
+        """
+        values = request.get_json()
+
+        repo = model.repository.get_repository(namespace_name, repository_name)
+        if not repo:
+            raise NotFound()
+
+        self._reject_if_org_mirror_configured(namespace_name)
+
+        mirror = model.repo_mirror.get_mirror(repo)
+        if not mirror:
+            raise NotFound()
+
+        # Validate and normalize every requested change before applying any update.
+        if "external_reference" in values:
+            _validate_external_reference(
+                values["external_reference"],
+                proxy_config=_effective_proxy_config(
+                    mirror.external_registry_config,
+                    values.get("external_registry_config"),
+                ),
+            )
+
+        if "sync_start_date" in values:
+            try:
+                values["sync_start_date"] = self._string_to_dt(values["sync_start_date"])
+            except ValueError:
+                return {"detail": "Incorrect DateTime format for sync_start_date."}, 400
+
+        if "skopeo_timeout_interval" in values and values["skopeo_timeout_interval"] < 300:
+            return ({"detail": "Skopeo timeout interval cannot be less than 300 seconds."}, 400)
+
+        if "architecture_filter" in values:
+            arch_filter = values["architecture_filter"]
+            if arch_filter and not app.config.get("FEATURE_SPARSE_INDEX", False):
+                return {
+                    "detail": "Architecture filtering requires FEATURE_SPARSE_INDEX to be enabled."
+                }, 400
+            try:
+                model.repo_mirror.validate_architecture_filter(arch_filter)
+            except ValidationError as e:
+                return {"detail": str(e)}, 400
+
+        if "external_registry_password" in values and "external_registry_username" not in values:
+            return (
+                {"detail": "Unable to set a new password without also specifying a username."},
+                400,
+            )
+        if (
+            "external_registry_username" in values
+            and "external_registry_password" in values
+            and values["external_registry_username"] is None
+            and values["external_registry_password"] is not None
+        ):
+            return {"detail": "Unable to delete username while setting a password."}, 400
+
+        if "root_rule" in values:
+            model.repo_mirror.validate_rule(
+                RepoMirrorRuleType.TAG_GLOB_CSV,
+                values["root_rule"]["rule_value"],
+            )
+
+        validated_robot = None
+        if "robot_username" in values:
+            validated_robot = self._validate_robot_for_mirroring(
+                namespace_name, values["robot_username"]
+            )
+
+        if "is_enabled" in values:
+            if values["is_enabled"] == True:
+                if model.repo_mirror.enable_mirror(repo):
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="is_enabled",
+                        to=True,
+                    )
+            if values["is_enabled"] == False:
+                if model.repo_mirror.disable_mirror(repo):
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="is_enabled",
+                        to=False,
+                    )
+
+        if "external_reference" in values:
+            if model.repo_mirror.change_remote(
+                repo,
+                values["external_reference"],
+                allowed_hosts=_get_ssrf_allowed_hosts(),
+            ):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="external_reference",
+                    to=values["external_reference"],
+                )
+
+        if "robot_username" in values:
+            robot_username = values["robot_username"]
+            robot = self._setup_robot_for_mirroring(
+                namespace_name,
+                repository_name,
+                robot_username,
+                validated_robot=validated_robot,
+            )
+            if model.repo_mirror.set_mirroring_robot(repo, robot):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="robot_username",
+                    to=robot_username,
+                )
+
+        if "sync_start_date" in values:
+            if model.repo_mirror.change_sync_start_date(repo, values["sync_start_date"]):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="sync_start_date",
+                    to=values["sync_start_date"],
+                )
+
+        if "sync_interval" in values:
+            if model.repo_mirror.change_sync_interval(repo, values["sync_interval"]):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="sync_interval",
+                    to=values["sync_interval"],
+                )
+
+        if "skopeo_timeout_interval" in values:
+            if model.repo_mirror.change_skopeo_timeout_interval(
+                repo, values["skopeo_timeout_interval"]
+            ):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="skopeo_timeout_interval",
+                    to=values["skopeo_timeout_interval"],
+                )
+
+        if "architecture_filter" in values:
+            arch_filter = values["architecture_filter"]
+            if model.repo_mirror.set_architecture_filter(repo, arch_filter or []):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="architecture_filter",
+                    to=arch_filter,
+                )
+
+        if "external_registry_username" in values and "external_registry_password" in values:
+            username = values["external_registry_username"]
+            password = values["external_registry_password"]
+            if model.repo_mirror.change_credentials(repo, username, password):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="external_registry_username",
+                    to=username,
+                )
+                if password is None:
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="external_registry_password",
+                        to=None,
+                    )
+                else:
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="external_registry_password",
+                        to="********",
+                    )
+
+        elif "external_registry_username" in values:
+            username = values["external_registry_username"]
+            if model.repo_mirror.change_username(repo, username):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="external_registry_username",
+                    to=username,
+                )
+
+        if "external_registry_config" in values:
+            external_registry_config = values.get("external_registry_config", {})
+
+            if "verify_tls" in external_registry_config:
+                updates = {"verify_tls": external_registry_config["verify_tls"]}
+                if model.repo_mirror.change_external_registry_config(repo, updates):
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="verify_tls",
+                        to=external_registry_config["verify_tls"],
+                    )
+
+            if "unsigned_images" in external_registry_config:
+                updates = {"unsigned_images": external_registry_config["unsigned_images"]}
+                if model.repo_mirror.change_external_registry_config(repo, updates):
+                    track_and_log(
+                        "repo_mirror_config_changed",
+                        wrap_repository(repo),
+                        changed="unsigned_images",
+                        to=external_registry_config["unsigned_images"],
+                    )
+
+            if "proxy" in external_registry_config:
+                proxy_values = external_registry_config.get("proxy", {})
+
+                if "http_proxy" in proxy_values:
+                    updates = {"proxy": {"http_proxy": proxy_values["http_proxy"]}}
+                    if model.repo_mirror.change_external_registry_config(repo, updates):
+                        track_and_log(
+                            "repo_mirror_config_changed",
+                            wrap_repository(repo),
+                            changed="http_proxy",
+                            to=proxy_values["http_proxy"],
+                        )
+
+                if "https_proxy" in proxy_values:
+                    updates = {"proxy": {"https_proxy": proxy_values["https_proxy"]}}
+                    if model.repo_mirror.change_external_registry_config(repo, updates):
+                        track_and_log(
+                            "repo_mirror_config_changed",
+                            wrap_repository(repo),
+                            changed="https_proxy",
+                            to=proxy_values["https_proxy"],
+                        )
+
+                if "no_proxy" in proxy_values:
+                    updates = {"proxy": {"no_proxy": proxy_values["no_proxy"]}}
+                    if model.repo_mirror.change_external_registry_config(repo, updates):
+                        track_and_log(
+                            "repo_mirror_config_changed",
+                            wrap_repository(repo),
+                            changed="no_proxy",
+                            to=proxy_values["no_proxy"],
+                        )
+
+        if "root_rule" in values:
+            if model.repo_mirror.change_rule(
+                repo, RepoMirrorRuleType.TAG_GLOB_CSV, values["root_rule"]["rule_value"]
+            ):
+                track_and_log(
+                    "repo_mirror_config_changed",
+                    wrap_repository(repo),
+                    changed="mirror_rule",
+                    to=values["root_rule"]["rule_value"],
+                )
+
+        return "", 201
+
+    def _reject_if_org_mirror_configured(self, namespace_name):
+        """Raise InvalidRequest if the namespace has an org-level mirror config."""
+        namespace_user = model.user.get_namespace_user(namespace_name)
+        if namespace_user and namespace_user.organization:
+            if model.org_mirror.get_org_mirror_config(namespace_user):
+                raise InvalidRequest(
+                    "Repository mirror configuration cannot be managed when "
+                    "organization-level mirroring is configured"
+                )
+
+    def _validate_robot_for_mirroring(self, namespace_name, robot_username):
+        robot = model.user.lookup_robot(robot_username)
+        assert robot.robot
+
+        parsed_username = parse_robot_username(robot_username)
+        if parsed_username is None:
+            raise model.DataModelException("Invalid robot")
+
+        namespace, _ = parsed_username
+        if namespace != namespace_name:
+            raise model.DataModelException("Invalid robot")
+        return robot
+
+    def _setup_robot_for_mirroring(
+        self, namespace_name, repo_name, robot_username, validated_robot=None
+    ):
+        """Validate the robot and grant write permission when required."""
+        robot = validated_robot or self._validate_robot_for_mirroring(
+            namespace_name, robot_username
+        )
+
+        # Ensure the robot specified has access to the repository. If not, grant it.
+        permissions = model.permission.get_user_repository_permissions(
+            robot, namespace_name, repo_name
+        )
+
+        permission = next(iter(permissions), None)
+
+        if not permission or permission.role.name == "read":
+            model.permission.set_user_repo_permission(
+                robot.username, namespace_name, repo_name, "write"
+            )
+
+        return robot
+
+    def _string_to_dt(self, string):
+        """
+        Convert String to correct DateTime format.
+        """
+        if string is None:
+            return None
+
+        """
     # TODO: Use RFC2822. This doesn't work consistently.
     # TODO: Move this to same module as `format_date` once fixed.
     tup = parsedate_tz(string)
@@ -401,67 +761,27 @@ class RepoMirrorResource(RepositoryParamResource):
     dt = datetime.fromtimestamp(ts, pytz.UTC)
     return dt
     """
-    assert isinstance(string, (str, unicode))
-    dt = datetime.strptime(string, "%Y-%m-%dT%H:%M:%SZ")
-    return dt
+        assert isinstance(string, str)
+        dt = datetime.strptime(string, "%Y-%m-%dT%H:%M:%SZ")
+        return dt
 
-  def _dt_to_string(self, dt):
-    """ Convert DateTime to correctly formatted String."""
-    if dt is None:
-      return None
+    def _dt_to_string(self, dt):
+        """
+        Convert DateTime to correctly formatted String.
+        """
+        if dt is None:
+            return None
 
-    """
+        """
     # TODO: Use RFC2822. Need to make it work bi-directionally.
     return format_date(dt)
     """
 
-    assert isinstance(dt, datetime)
-    string = dt.isoformat() + 'Z'
-    return string
+        assert isinstance(dt, datetime)
+        string = dt.isoformat() + "Z"
+        return string
 
-  def _decrypt_username(self, username):
-    if username is None:
-      return None
-    return username.decrypt()
-
-
-@resource('/v1/repository/<apirepopath:repository>/mirror/rules')
-@show_if(features.REPO_MIRROR)
-class ManageRepoMirrorRule(RepositoryParamResource):
-  """
-  Operations to manage a single Repository Mirroring Rule.
-  TODO: At the moment, we are only dealing with a single rule associated with the mirror.
-        This should change to update the rule and address it using its UUID.
-  """
-  schemas = {
-    'MirrorRule': {
-      'type': 'object',
-      'description': 'A rule used to define how a repository is mirrored.',
-      'required': ['root_rule'],
-      'properties': {
-        'root_rule': common_properties['root_rule']
-      }
-    }
-  }
-
-  @require_repo_admin
-  @nickname('changeRepoMirrorRule')
-  @validate_json_request('MirrorRule')
-  def put(self, namespace_name, repository_name):
-    """
-    Update an existing RepoMirrorRule
-    """
-    repo = model.repository.get_repository(namespace_name, repository_name)
-    if not repo:
-      raise NotFound()
-
-    rule = model.repo_mirror.get_root_rule(repo)
-    if not rule:
-      return {'detail': 'The rule appears to be missing.'}, 400
-
-    data = request.get_json()
-    if model.repo_mirror.change_rule_value(rule, data['root_rule']['rule_value']):
-      track_and_log('repo_mirror_config_changed', wrap_repository(repo), changed="mirror_rule", to=data['root_rule']['rule_value'])
-      return 200
-    else:
-      return {'detail': 'Unable to update rule.'}, 400
+    def _decrypt_username(self, username):
+        if username is None:
+            return None
+        return username.decrypt()

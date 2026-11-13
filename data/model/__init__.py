@@ -2,122 +2,244 @@ from data.database import db, db_transaction
 
 
 class DataModelException(Exception):
-  pass
+    pass
 
 
 class InvalidLabelKeyException(DataModelException):
-  pass
+    pass
 
 
 class InvalidMediaTypeException(DataModelException):
-  pass
+    pass
 
 
 class BlobDoesNotExist(DataModelException):
-  pass
-
-
-class TorrentInfoDoesNotExist(DataModelException):
-  pass
+    pass
 
 
 class InvalidBlobUpload(DataModelException):
-  pass
+    pass
 
 
 class InvalidEmailAddressException(DataModelException):
-  pass
+    pass
 
 
 class InvalidOrganizationException(DataModelException):
-  pass
+    pass
+
+
+class InvalidProxyCacheConfigException(DataModelException):
+    pass
 
 
 class InvalidPasswordException(DataModelException):
-  pass
+    pass
 
 
 class InvalidRobotException(DataModelException):
-  pass
+    pass
+
+
+class DeactivatedRobotOwnerException(InvalidRobotException):
+    pass
+
+
+class InvalidRobotCredentialException(InvalidRobotException):
+    pass
+
+
+class InvalidRobotOwnerException(InvalidRobotException):
+    pass
 
 
 class InvalidUsernameException(DataModelException):
-  pass
+    pass
+
+
+class RepositoryDoesNotExist(DataModelException):
+    pass
 
 
 class InvalidRepositoryBuildException(DataModelException):
-  pass
+    pass
 
 
 class InvalidBuildTriggerException(DataModelException):
-  pass
+    pass
 
 
 class InvalidTokenException(DataModelException):
-  pass
+    pass
 
 
 class InvalidNotificationException(DataModelException):
-  pass
+    pass
 
 
 class InvalidImageException(DataModelException):
-  pass
+    pass
 
 
 class UserAlreadyInTeam(DataModelException):
-  pass
+    pass
 
 
 class InvalidTeamException(DataModelException):
-  pass
+    pass
 
 
 class InvalidTeamMemberException(DataModelException):
-  pass
+    pass
 
 
 class InvalidManifestException(DataModelException):
-  pass
+    pass
+
+
+class ManifestDoesNotExist(DataModelException):
+    pass
 
 
 class ServiceKeyDoesNotExist(DataModelException):
-  pass
+    pass
 
 
 class ServiceKeyAlreadyApproved(DataModelException):
-  pass
+    pass
 
 
 class ServiceNameInvalid(DataModelException):
-  pass
+    pass
+
+
+class TagDoesNotExist(DataModelException):
+    pass
 
 
 class TagAlreadyCreatedException(DataModelException):
-  pass
+    pass
+
 
 class StaleTagException(DataModelException):
-  pass
+    pass
+
+
+class ImmutableTagException(DataModelException):
+    """Exception raised when an operation is attempted on an immutable tag."""
+
+    def __init__(self, tag_name: str, operation: str, repository_id: int | None = None) -> None:
+        self.tag_name = tag_name
+        self.operation = operation
+        self.repository_id = repository_id
+        msg = f"Cannot {operation} immutable tag '{tag_name}'"
+        super().__init__(msg)
+
+
+class InvalidSystemQuotaConfig(Exception):
+    pass
+
+
+class QuotaExceededException(DataModelException):
+    pass
+
+
+class InvalidNamespaceQuota(DataModelException):
+    pass
+
+
+class InvalidNamespaceQuotaLimit(DataModelException):
+    pass
+
+
+class InvalidNamespaceQuotaType(DataModelException):
+    pass
+
+
+class UnsupportedQuotaSize(DataModelException):
+    pass
+
+
+class OrgSubscriptionBindingAlreadyExists(DataModelException):
+    pass
+
+
+class NamespaceAutoPrunePolicyAlreadyExists(DataModelException):
+    pass
+
+
+class NamespaceAutoPrunePolicyDoesNotExist(DataModelException):
+    pass
+
+
+class InvalidNamespaceAutoPrunePolicy(DataModelException):
+    pass
+
+
+class InvalidNamespaceAutoPruneMethod(DataModelException):
+    pass
+
+
+class InvalidNamespaceException(DataModelException):
+    pass
+
+
+class RepositoryAutoPrunePolicyAlreadyExists(DataModelException):
+    pass
+
+
+class RepositoryAutoPrunePolicyDoesNotExist(DataModelException):
+    pass
+
+
+class InvalidRepositoryAutoPrunePolicy(DataModelException):
+    pass
+
+
+class InvalidRepositoryAutoPruneMethod(DataModelException):
+    pass
+
+
+class InvalidRepositoryException(DataModelException):
+    pass
+
+
+class ImmutabilityPolicyDoesNotExist(DataModelException):
+    pass
+
+
+class InvalidImmutabilityPolicy(DataModelException):
+    pass
+
+
+class DuplicateImmutabilityPolicy(DataModelException):
+    pass
+
+
+class PushesDisabledException(Exception):
+    pass
 
 
 class TooManyLoginAttemptsException(Exception):
-  def __init__(self, message, retry_after):
-    super(TooManyLoginAttemptsException, self).__init__(message)
-    self.retry_after = retry_after
+    def __init__(self, message, retry_after):
+        super(TooManyLoginAttemptsException, self).__init__(message)
+        self.retry_after = retry_after
 
 
 class Config(object):
-  def __init__(self):
-    self.app_config = None
-    self.store = None
-    self.image_cleanup_callbacks = []
-    self.repo_cleanup_callbacks = []
+    def __init__(self):
+        self.app_config = None
+        self.store = None
+        self.image_cleanup_callbacks = []
+        self.repo_cleanup_callbacks = []
 
-  def register_image_cleanup_callback(self, callback):
-    self.image_cleanup_callbacks.append(callback)
-    
-  def register_repo_cleanup_callback(self, callback):
-    self.repo_cleanup_callbacks.append(callback)
+    def register_image_cleanup_callback(self, callback):
+        self.image_cleanup_callbacks.append(callback)
+        return lambda: self.image_cleanup_callbacks.remove(callback)
+
+    def register_repo_cleanup_callback(self, callback):
+        self.repo_cleanup_callbacks.append(callback)
+        return lambda: self.repo_cleanup_callbacks.remove(callback)
 
 
 config = Config()
@@ -126,28 +248,33 @@ config = Config()
 # There MUST NOT be any circular dependencies between these subsections. If there are fix it by
 # moving the minimal number of things to _basequery
 from data.model import (
-  appspecifictoken,
-  blob,
-  build,
-  gc,
-  image,
-  label,
-  log,
-  message,
-  modelutil,
-  notification,
-  oauth,
-  organization,
-  permission,
-  repositoryactioncount,
-  repo_mirror,
-  release,
-  repo_mirror,
-  repository,
-  service_keys,
-  storage,
-  tag,
-  team,
-  token,
-  user,
+    appspecifictoken,
+    autoprune,
+    blob,
+    build,
+    entitlements,
+    gc,
+    immutability,
+    label,
+    log,
+    message,
+    modelutil,
+    namespacequota,
+    notification,
+    oauth,
+    org_mirror,
+    organization,
+    organization_skus,
+    permission,
+    proxy_cache,
+    pull_statistics,
+    release,
+    repo_mirror,
+    repository,
+    repositoryactioncount,
+    service_keys,
+    storage,
+    team,
+    token,
+    user,
 )

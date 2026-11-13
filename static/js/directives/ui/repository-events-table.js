@@ -14,10 +14,15 @@ angular.module('quay').directive('repositoryEventsTable', function () {
       'isEnabled': '=isEnabled'
     },
     controller: function($scope, $element, $timeout, ApiService, Restangular, UtilService,
-                         ExternalNotificationData, $location, StateService) {
-      $scope.inReadOnlyMode = StateService.inReadOnlyMode();
+                         ExternalNotificationData, $location, StateService, DocumentationService, $sanitize) {
+      $scope.canCreateNotification = function() {
+        return StateService.inReadOnlyMode()
+          ? false
+          : $scope.repository.state === 'MIRROR' || $scope.repository.can_write;
+      };
       $scope.showNewNotificationCounter = 0;
       $scope.newNotificationData = {};
+      $scope.DocumentationService = DocumentationService;
 
       var loadNotifications = function() {
         if (!$scope.repository || !$scope.isEnabled) { return; }
@@ -117,7 +122,7 @@ angular.module('quay').directive('repositoryEventsTable', function () {
         dom.setAttribute('readonly', 'readonly');
 
         bootbox.dialog({
-          'title': (notification.title || 'Notification') + ' ' + field,
+          'title': ($sanitize(notification.title) || 'Notification') + ' ' + field,
           'message': dom.outerHTML,
           'buttons': {
             "Done": {
@@ -130,7 +135,9 @@ angular.module('quay').directive('repositoryEventsTable', function () {
 
       $scope.showWebhookInfo = function(notification) {
         var eventId = notification.event;
-        document.location = 'http://docs.quay.io/guides/notifications.html#webhook_' + eventId;
+        document.location = $scope.DocumentationService.getUrl('notifications.webhook', {
+          'event': eventId
+        });
       };
 
       $scope.testNotification = function(notification) {

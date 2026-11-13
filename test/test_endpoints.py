@@ -1,701 +1,1592 @@
 # coding=utf-8
 
+import base64
 import json as py_json
 import time
 import unittest
-import base64
 import zlib
-
-from mock import patch
-from io import BytesIO
-from urllib import urlencode
-from urlparse import urlparse, urlunparse, parse_qs
 from datetime import datetime, timedelta
+from io import BytesIO
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import jwt
-
-from Crypto.PublicKey import RSA
+from authlib.jose import JsonWebKey
+from cryptography.hazmat.primitives import serialization
 from flask import url_for
-from jwkest.jwk import RSAKey
+from mock import patch
+from parameterized import parameterized, parameterized_class
 
 from app import app
 from data import model
-from data.database import ServiceKeyApprovalType
+from data.database import NotificationKind, ServiceKeyApprovalType
+from data.model.notification import list_notifications
+from data.model.oauth import create_user_access_token
+from data.model.organization import create_organization, get_organization
+from data.model.user import get_user
 from endpoints import keyserver
 from endpoints.api import api, api_bp
 from endpoints.api.user import Signin
-from endpoints.keyserver import jwk_with_kid
 from endpoints.csrf import OAUTH_CSRF_TOKEN_NAME
+from endpoints.keyserver import jwk_with_kid
+from endpoints.test.shared import gen_basic_auth, toggle_feature
+from endpoints.v2 import v2_bp
 from endpoints.web import web as web_bp
 from endpoints.webhooks import webhooks as webhooks_bp
-from initdb import setup_database_for_testing, finished_database_for_testing
+from initdb import finished_database_for_testing, setup_database_for_testing
 from test.helpers import assert_action_logged
-from util.security.token import encode_public_private_token
 from util.registry.gzipinputstream import WINDOW_BUFFER_SIZE
+from util.security.token import encode_public_private_token
 
 try:
-  app.register_blueprint(web_bp, url_prefix='')
+    app.register_blueprint(web_bp, url_prefix="")
 except ValueError:
-  # This blueprint was already registered
-  pass
+    # This blueprint was already registered
+    pass
 
 try:
-  app.register_blueprint(webhooks_bp, url_prefix='/webhooks')
+    app.register_blueprint(webhooks_bp, url_prefix="/webhooks")
 except ValueError:
-  # This blueprint was already registered
-  pass
+    # This blueprint was already registered
+    pass
 
 try:
-  app.register_blueprint(keyserver.key_server, url_prefix='')
+    app.register_blueprint(keyserver.key_server, url_prefix="")
 except ValueError:
-  # This blueprint was already registered
-  pass
+    # This blueprint was already registered
+    pass
 
 try:
-  app.register_blueprint(api_bp, url_prefix='/api')
+    app.register_blueprint(api_bp, url_prefix="/api")
 except ValueError:
-  # This blueprint was already registered
-  pass
+    # This blueprint was already registered
+    pass
 
+try:
+    app.register_blueprint(v2_bp, url_prefix="/v2")
+except ValueError:
+    # This blueprint was already registered
+    pass
 
-CSRF_TOKEN_KEY = '_csrf_token'
-CSRF_TOKEN = '123csrfforme'
+CSRF_TOKEN_KEY = "_csrf_token"
+CSRF_TOKEN = "123csrfforme"
 
 
 class EndpointTestCase(unittest.TestCase):
-  maxDiff = None
+    maxDiff = None
 
-  def _add_csrf(self, without_csrf):
-    parts = urlparse(without_csrf)
-    query = parse_qs(parts[4])
+    def _add_csrf(self, without_csrf):
+        parts = urlparse(without_csrf)
 
-    self._set_csrf()
-    query[CSRF_TOKEN_KEY] = CSRF_TOKEN
-    return urlunparse(list(parts[0:4]) + [urlencode(query)] + list(parts[5:]))
+        query = parse_qs(parts[4])
+        for k, v in query.items():
+            query[k] = v[0]
 
-  def _set_csrf(self):
-    with self.app.session_transaction() as sess:
-      sess[CSRF_TOKEN_KEY] = CSRF_TOKEN
-      sess[OAUTH_CSRF_TOKEN_NAME] = 'someoauthtoken'
+        self._set_csrf()
+        query[CSRF_TOKEN_KEY] = CSRF_TOKEN
+        url = urlunparse(list(parts[0:4]) + [urlencode(query)] + list(parts[5:]))
+        return url
 
-  def setUp(self):
-    setup_database_for_testing(self)
-    self.app = app.test_client()
-    self.ctx = app.test_request_context()
-    self.ctx.__enter__()
+    def _set_csrf(self):
+        with self.app.session_transaction() as sess:
+            sess[CSRF_TOKEN_KEY] = CSRF_TOKEN
+            sess[OAUTH_CSRF_TOKEN_NAME] = "someoauthtoken"
 
-  def tearDown(self):
-    finished_database_for_testing(self)
-    self.ctx.__exit__(True, None, None)
+    def setUp(self):
+        setup_database_for_testing(self)
+        self.app = app.test_client()
+        self.ctx = app.test_request_context()
+        self.ctx.__enter__()
 
-  def getResponse(self, resource_name, expected_code=200, **kwargs):
-    rv = self.app.get(url_for(resource_name, **kwargs))
-    self.assertEquals(rv.status_code, expected_code)
-    return rv.data
+    def tearDown(self):
+        finished_database_for_testing(self)
+        self.ctx.__exit__(True, None, None)
 
-  def deleteResponse(self, resource_name, headers=None, expected_code=200, **kwargs):
-    headers = headers or {}
-    rv = self.app.delete(url_for(resource_name, **kwargs), headers=headers)
-    self.assertEquals(rv.status_code, expected_code)
-    return rv.data
+    def getResponse(self, resource_name, expected_code=200, **kwargs):
+        rv = self.app.get(url_for(resource_name, **kwargs))
+        self.assertEqual(rv.status_code, expected_code)
+        return rv.data
 
-  def deleteEmptyResponse(self, resource_name, headers=None, expected_code=204, **kwargs):
-    headers = headers or {}
-    rv = self.app.delete(url_for(resource_name, **kwargs), headers=headers)
-    self.assertEquals(rv.status_code, expected_code)
-    self.assertEquals(rv.data, '') # ensure response body empty
-    return
+    def deleteResponse(self, resource_name, headers=None, expected_code=200, **kwargs):
+        headers = headers or {}
+        rv = self.app.delete(url_for(resource_name, **kwargs), headers=headers)
+        self.assertEqual(rv.status_code, expected_code)
+        return rv.data
 
-  def putResponse(self, resource_name, headers=None, data=None, expected_code=200, **kwargs):
-    headers = headers or {}
-    data = data or {}
-    rv = self.app.put(url_for(resource_name, **kwargs), headers=headers, data=py_json.dumps(data))
-    self.assertEquals(rv.status_code, expected_code)
-    return rv.data
+    def deleteEmptyResponse(self, resource_name, headers=None, expected_code=204, **kwargs):
+        headers = headers or {}
+        rv = self.app.delete(url_for(resource_name, **kwargs), headers=headers)
+        self.assertEqual(rv.status_code, expected_code)
+        self.assertEqual(rv.data, b"")  # ensure response body empty
+        return
 
-  def postResponse(self, resource_name, headers=None, data=None, form=None, with_csrf=True, expected_code=200, **kwargs):
-    headers = headers or {}
-    form = form or {}
-    url = url_for(resource_name, **kwargs)
-    if with_csrf:
-      url = self._add_csrf(url)
+    def putResponse(self, resource_name, headers=None, data=None, expected_code=200, **kwargs):
+        headers = headers or {}
+        data = data or {}
+        rv = self.app.put(
+            url_for(resource_name, **kwargs), headers=headers, data=py_json.dumps(data)
+        )
+        self.assertEqual(rv.status_code, expected_code)
+        return rv.data
 
-    post_data = None
-    if form:
-      post_data = form
-    elif data:
-      post_data = py_json.dumps(data)
+    def postResponse(
+        self,
+        resource_name,
+        headers=None,
+        data=None,
+        form=None,
+        with_csrf=True,
+        expected_code=200,
+        **kwargs,
+    ):
+        headers = headers or {}
+        form = form or {}
+        url = url_for(resource_name, **kwargs)
+        if with_csrf:
+            url = self._add_csrf(url)
+        post_data = None
+        if form:
+            post_data = form
+        elif data:
+            post_data = py_json.dumps(data)
 
-    rv = self.app.post(url, headers=headers, data=post_data)
-    if expected_code is not None:
-      self.assertEquals(rv.status_code, expected_code)
+        rv = self.app.post(url, headers=headers, data=post_data)
+        if expected_code is not None:
+            self.assertEqual(rv.status_code, expected_code)
 
-    return rv
+        return rv
 
-  def login(self, username, password):
-    rv = self.app.post(self._add_csrf(api.url_for(Signin)),
-                       data=py_json.dumps(dict(username=username, password=password)),
-                       headers={"Content-Type": "application/json"})
-    self.assertEquals(rv.status_code, 200)
+    def login(self, username, password):
+        rv = self.app.post(
+            self._add_csrf(api.url_for(Signin)),
+            data=py_json.dumps(dict(username=username, password=password)),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(rv.status_code, 200)
+
 
 class BuildLogsTestCase(EndpointTestCase):
-  build_uuid = 'deadpork-dead-pork-dead-porkdeadpork'
+    build_uuid = "deadpork-dead-pork-dead-porkdeadpork"
 
-  def test_buildlogs_invalid_build_uuid(self):
-    self.login('public', 'password')
-    self.getResponse('web.buildlogs', build_uuid='bad_build_uuid', expected_code=400)
+    def test_buildlogs_invalid_build_uuid(self):
+        self.login("public", "password")
+        self.getResponse("web.buildlogs", build_uuid="bad_build_uuid", expected_code=400)
 
-  def test_buildlogs_not_logged_in(self):
-    self.getResponse('web.buildlogs', build_uuid=self.build_uuid, expected_code=403)
+    def test_buildlogs_not_logged_in(self):
+        self.getResponse("web.buildlogs", build_uuid=self.build_uuid, expected_code=403)
 
-  def test_buildlogs_unauthorized(self):
-    self.login('reader', 'password')
-    self.getResponse('web.buildlogs', build_uuid=self.build_uuid, expected_code=403)
+    def test_buildlogs_unauthorized(self):
+        self.login("reader", "password")
+        self.getResponse("web.buildlogs", build_uuid=self.build_uuid, expected_code=403)
 
-  def test_buildlogs_logsarchived(self):
-    self.login('public', 'password')
-    with patch('data.model.build.RepositoryBuild', logs_archived=True):
-      self.getResponse('web.buildlogs', build_uuid=self.build_uuid, expected_code=403)
+    def test_buildlogs_logsarchived(self):
+        self.login("public", "password")
+        with patch("data.model.build.RepositoryBuild", logs_archived=True):
+            self.getResponse("web.buildlogs", build_uuid=self.build_uuid, expected_code=403)
 
-  def test_buildlogs_successful(self):
-    self.login('public', 'password')
-    logs = ['log1', 'log2']
-    with patch('endpoints.web.build_logs.get_log_entries', return_value=(None, logs) ):
-      resp = self.getResponse('web.buildlogs', build_uuid=self.build_uuid, expected_code=200)
-      self.assertEquals({"logs": logs}, py_json.loads(resp))
+    def test_buildlogs_successful(self):
+        self.login("public", "password")
+        logs = ["log1", "log2"]
+        with patch("endpoints.web.build_logs.get_log_entries", return_value=(None, logs)):
+            resp = self.getResponse("web.buildlogs", build_uuid=self.build_uuid, expected_code=200)
+            self.assertEqual({"logs": logs}, py_json.loads(resp))
+
 
 class ArchivedLogsTestCase(EndpointTestCase):
-  build_uuid = 'deadpork-dead-pork-dead-porkdeadpork'
+    build_uuid = "deadpork-dead-pork-dead-porkdeadpork"
 
-  def test_logarchive_invalid_build_uuid(self):
-    self.login('public', 'password')
-    self.getResponse('web.logarchive', file_id='bad_build_uuid', expected_code=403)
+    def test_logarchive_invalid_build_uuid(self):
+        self.login("public", "password")
+        self.getResponse("web.logarchive", file_id="bad_build_uuid", expected_code=403)
 
-  def test_logarchive_not_logged_in(self):
-    self.getResponse('web.logarchive', file_id=self.build_uuid, expected_code=403)
+    def test_logarchive_not_logged_in(self):
+        self.getResponse("web.logarchive", file_id=self.build_uuid, expected_code=403)
 
-  def test_logarchive_unauthorized(self):
-    self.login('reader', 'password')
-    self.getResponse('web.logarchive', file_id=self.build_uuid, expected_code=403)
+    def test_logarchive_unauthorized(self):
+        self.login("reader", "password")
+        self.getResponse("web.logarchive", file_id=self.build_uuid, expected_code=403)
 
-  def test_logarchive_file_not_found(self):
-    self.login('public', 'password')
-    self.getResponse('web.logarchive', file_id=self.build_uuid, expected_code=403)
+    def test_logarchive_file_not_found(self):
+        self.login("public", "password")
+        self.getResponse("web.logarchive", file_id=self.build_uuid, expected_code=403)
 
-  def test_logarchive_successful(self):
-    self.login('public', 'password')
-    data = b"my_file_stream"
-    mock_file = BytesIO(zlib.compressobj(-1, zlib.DEFLATED, WINDOW_BUFFER_SIZE).compress(data))
-    with patch('endpoints.web.log_archive._storage.stream_read_file', return_value=mock_file):
-      self.getResponse('web.logarchive', file_id=self.build_uuid, expected_code=200)
+    def test_logarchive_successful(self):
+        self.login("public", "password")
+        data = b"my_file_stream"
+        mock_file = BytesIO(zlib.compressobj(-1, zlib.DEFLATED, WINDOW_BUFFER_SIZE).compress(data))
+        with patch("endpoints.web.log_archive._storage.stream_read_file", return_value=mock_file):
+            self.getResponse("web.logarchive", file_id=self.build_uuid, expected_code=200)
+
+    def test_logarchive_transcoded(self):
+        # Storage backends such as GCS decode Content-Encoding: gzip objects
+        # before serving them, so the stream may already be plain JSON.
+        self.login("public", "password")
+        data = b'{"logs": []}'
+        with patch(
+            "endpoints.web.log_archive._storage.stream_read_file", return_value=BytesIO(data)
+        ):
+            with self.assertLogs("endpoints.web", level="WARNING") as logs:
+                resp = self.getResponse(
+                    "web.logarchive", file_id=self.build_uuid, expected_code=200
+                )
+            self.assertEqual(data, resp)
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(self.build_uuid, logs.records[0].getMessage())
+        self.assertIn("already decoded", logs.records[0].getMessage())
+
+    def test_logarchive_unrecognized(self):
+        # Neither gzip nor JSON: controlled JSON 500 before any body bytes go
+        # out, with the build uuid and the leading bytes logged.
+        self.login("public", "password")
+        data = b"<html>not an archive</html>"
+        with patch(
+            "endpoints.web.log_archive._storage.stream_read_file", return_value=BytesIO(data)
+        ):
+            with self.assertLogs("endpoints.web", level="ERROR") as logs:
+                resp = self.getResponse(
+                    "web.logarchive", file_id=self.build_uuid, expected_code=500
+                )
+            self.assertEqual(py_json.loads(resp), {"error": "Archived logs are unreadable"})
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(self.build_uuid, logs.records[0].getMessage())
+        self.assertIn(data[:32].hex(), logs.records[0].getMessage())
 
 
 class WebhookEndpointTestCase(EndpointTestCase):
-  def test_invalid_build_trigger_webhook(self):
-    self.postResponse('webhooks.build_trigger_webhook', trigger_uuid='invalidtrigger',
-                      expected_code=404)
+    def test_invalid_build_trigger_webhook(self):
+        self.postResponse(
+            "webhooks.build_trigger_webhook", trigger_uuid="invalidtrigger", expected_code=404
+        )
 
-  def test_valid_build_trigger_webhook_invalid_auth(self):
-    trigger = list(model.build.list_build_triggers('devtable', 'building'))[0]
-    self.postResponse('webhooks.build_trigger_webhook', trigger_uuid=trigger.uuid,
-                      expected_code=403)
+    def test_oversized_multipart_field_does_not_break_request_logging(self):
+        # A multipart text field over MAX_FORM_MEMORY_SIZE must not raise from the
+        # after_request logging hook.
+        rv = self.app.post(
+            url_for("webhooks.build_trigger_webhook", trigger_uuid="invalidtrigger"),
+            data={"field": "a" * 600_000, "file": (BytesIO(b"x"), "f.txt")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(rv.status_code, 404)
 
-  def test_valid_build_trigger_webhook_cookie_auth(self):
-    self.login('devtable', 'password')
+    def test_valid_build_trigger_webhook_invalid_auth(self):
+        trigger = list(model.build.list_build_triggers("devtable", "building"))[0]
+        self.postResponse(
+            "webhooks.build_trigger_webhook", trigger_uuid=trigger.uuid, expected_code=403
+        )
 
-    # Cookie auth is not supported, so this should 403
-    trigger = list(model.build.list_build_triggers('devtable', 'building'))[0]
-    self.postResponse('webhooks.build_trigger_webhook', trigger_uuid=trigger.uuid,
-                      expected_code=403)
+    def test_valid_build_trigger_webhook_cookie_auth(self):
+        self.login("devtable", "password")
 
-  def test_valid_build_trigger_webhook_missing_payload(self):
-    auth_header = 'Basic %s' % (base64.b64encode('devtable:password'))
-    trigger = list(model.build.list_build_triggers('devtable', 'building'))[0]
-    self.postResponse('webhooks.build_trigger_webhook', trigger_uuid=trigger.uuid,
-                      expected_code=400, headers={'Authorization': auth_header})
+        # Cookie auth is not supported, so this should 403
+        trigger = list(model.build.list_build_triggers("devtable", "building"))[0]
+        self.postResponse(
+            "webhooks.build_trigger_webhook", trigger_uuid=trigger.uuid, expected_code=403
+        )
 
-  def test_valid_build_trigger_webhook_invalid_payload(self):
-    auth_header = 'Basic %s' % (base64.b64encode('devtable:password'))
-    trigger = list(model.build.list_build_triggers('devtable', 'building'))[0]
-    self.postResponse('webhooks.build_trigger_webhook', trigger_uuid=trigger.uuid,
-                      expected_code=400,
-                      headers={'Authorization': auth_header, 'Content-Type': 'application/json'},
-                      data={'invalid': 'payload'})
+    def test_valid_build_trigger_webhook_missing_payload(self):
+        auth_header = gen_basic_auth("devtable", "password")
+        trigger = list(model.build.list_build_triggers("devtable", "building"))[0]
+        self.postResponse(
+            "webhooks.build_trigger_webhook",
+            trigger_uuid=trigger.uuid,
+            expected_code=400,
+            headers={"Authorization": auth_header, "Content-Type": "application/json"},
+            data={},
+        )
+
+    def test_valid_build_trigger_webhook_invalid_payload(self):
+        auth_header = gen_basic_auth("devtable", "password")
+        trigger = list(model.build.list_build_triggers("devtable", "building"))[0]
+        self.postResponse(
+            "webhooks.build_trigger_webhook",
+            trigger_uuid=trigger.uuid,
+            expected_code=400,
+            headers={"Authorization": auth_header, "Content-Type": "application/json"},
+            data={"invalid": "payload"},
+        )
+
 
 class WebEndpointTestCase(EndpointTestCase):
-  def test_index(self):
-    self.getResponse('web.index')
+    def test_index(self):
+        self.getResponse("web.index")
 
-  def test_robots(self):
-    self.getResponse('web.robots')
+    def test_robots(self):
+        self.getResponse("web.robots")
 
-  def test_repo_view(self):
-    self.getResponse('web.repository', path='devtable/simple')
+    def test_repo_view(self):
+        self.getResponse("web.repository", path="devtable/simple")
 
-  def test_unicode_repo_view(self):
-    self.getResponse('web.repository', path='%E2%80%8Bcoreos/hyperkube%E2%80%8B')
+    def test_unicode_repo_view(self):
+        self.getResponse("web.repository", path="%E2%80%8Bcoreos/hyperkube%E2%80%8B")
 
-  def test_org_view(self):
-    self.getResponse('web.org_view', path='buynlarge')
+    def test_org_view(self):
+        self.getResponse("web.org_view", path="buynlarge")
 
-  def test_user_view(self):
-    self.getResponse('web.user_view', path='devtable')
+    def test_user_view(self):
+        self.getResponse("web.user_view", path="devtable")
 
-  def test_confirm_repo_email(self):
-    code = model.repository.create_email_authorization_for_repo('devtable', 'simple', 'foo@bar.com')
-    self.getResponse('web.confirm_repo_email', code=code.code)
+    def test_confirm_repo_email(self):
+        code = model.repository.create_email_authorization_for_repo(
+            "devtable", "simple", "foo@bar.com"
+        )
+        self.getResponse("web.confirm_repo_email", code=code.code)
 
-    found = model.repository.get_email_authorized_for_repo('devtable', 'simple', 'foo@bar.com')
-    self.assertTrue(found.confirmed)
+        found = model.repository.get_email_authorized_for_repo("devtable", "simple", "foo@bar.com")
+        self.assertTrue(found.confirmed)
 
-  def test_confirm_email(self):
-    user = model.user.get_user('devtable')
-    self.assertNotEquals(user.email, 'foo@bar.com')
+    def test_confirm_email(self):
+        user = model.user.get_user("devtable")
+        self.assertNotEqual(user.email, "foo@bar.com")
 
-    confirmation_code = model.user.create_confirm_email_code(user, 'foo@bar.com')
-    self.getResponse('web.confirm_email', code=confirmation_code, expected_code=302)
+        confirmation_code = model.user.create_confirm_email_code(user, "foo@bar.com")
+        self.getResponse("web.confirm_email", code=confirmation_code, expected_code=302)
 
-    user = model.user.get_user('devtable')
-    self.assertEquals(user.email, 'foo@bar.com')
+        user = model.user.get_user("devtable")
+        self.assertEqual(user.email, "foo@bar.com")
 
-  def test_confirm_recovery(self):
-    # Try for an invalid code.
-    self.getResponse('web.confirm_recovery', code='someinvalidcode', expected_code=200)
+    def test_confirm_recovery(self):
+        # Try for an invalid code.
+        self.getResponse("web.confirm_recovery", code="someinvalidcode", expected_code=200)
 
-    # Create a valid code and try.
-    user = model.user.get_user('devtable')
-    confirmation_code = model.user.create_reset_password_email_code(user.email)
-    self.getResponse('web.confirm_recovery', code=confirmation_code, expected_code=302)
+        # Create a valid code and try.
+        user = model.user.get_user("devtable")
+        confirmation_code = model.user.create_reset_password_email_code(user.email)
+        self.getResponse("web.confirm_recovery", code=confirmation_code, expected_code=302)
 
-  def test_confirm_recovery_verified(self):
-    # Create a valid code and try.
-    user = model.user.get_user('devtable')
-    user.verified = False
-    user.save()
+    def test_confirm_recovery_verified(self):
+        # Create a valid code and try.
+        user = model.user.get_user("devtable")
+        user.verified = False
+        user.save()
 
-    confirmation_code = model.user.create_reset_password_email_code(user.email)
-    self.getResponse('web.confirm_recovery', code=confirmation_code, expected_code=302)
+        confirmation_code = model.user.create_reset_password_email_code(user.email)
+        self.getResponse("web.confirm_recovery", code=confirmation_code, expected_code=302)
 
-    # Ensure the current user is the expected user and that they are verified.
-    user = model.user.get_user('devtable')
-    self.assertTrue(user.verified)
+        # Ensure the current user is the expected user and that they are verified.
+        user = model.user.get_user("devtable")
+        self.assertTrue(user.verified)
 
-    self.getResponse('web.receipt', expected_code=404) # Will 401 if no user.
+        self.getResponse("web.receipt", expected_code=404)  # Will 401 if no user.
 
-  def test_request_authorization_code(self):
-    # Try for an invalid client.
-    self.getResponse('web.request_authorization_code', client_id='foo', redirect_uri='bar',
-                     scope='baz', expected_code=404)
+    def test_request_authorization_code(self):
+        self.login("devtable", "password")
 
-    # Try for a valid client.
-    org = model.organization.get_organization('buynlarge')
-    assert org
+        # Try for an invalid client.
+        self.getResponse(
+            "web.request_authorization_code",
+            client_id="foo",
+            redirect_uri="bar",
+            scope="baz",
+            expected_code=404,
+        )
 
-    app = model.oauth.create_application(org, 'test', 'http://foo/bar', 'http://foo/bar/baz')
-    self.getResponse('web.request_authorization_code',
-                     client_id=app.client_id,
-                     redirect_uri=app.redirect_uri,
-                     scope='repo:read',
-                     expected_code=200)
+        # Try for a valid client.
+        org = model.organization.get_organization("buynlarge")
+        assert org
 
-  def test_build_status_badge(self):
-    # Try for an invalid repository.
-    self.getResponse('web.build_status_badge', repository='foo/bar', expected_code=404)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.getResponse(
+            "web.request_authorization_code",
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="repo:read",
+            expected_code=200,
+        )
 
-    # Try for a public repository.
-    self.getResponse('web.build_status_badge', repository='public/publicrepo')
+    def test_request_authorization_code_assignment_id_with_code(self):
+        self.login("devtable", "password")
 
-    # Try for an private repository.
-    self.getResponse('web.build_status_badge', repository='devtable/simple',
-                     expected_code=404)
+        org = model.organization.get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.getResponse(
+            "web.request_authorization_code",
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="repo:read",
+            assignment_uuid="assignmentid",
+            response_type="code",
+            expected_code=400,
+        )
 
-    # Try for an private repository with an invalid token.
-    self.getResponse('web.build_status_badge', repository='devtable/simple',
-                     token='sometoken', expected_code=404)
+    def test_request_authorization_code_not_org_admin(self):
+        self.login("devtable", "password")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.getResponse(
+            "web.request_authorization_code",
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="repo:read",
+            expected_code=403,
+        )
 
-    # Try for an private repository with a valid token.
-    repository = model.repository.get_repository('devtable', 'simple')
-    self.getResponse('web.build_status_badge', repository='devtable/simple',
-                     token=repository.badge_token)
+    def test_request_authorization_code_assigned_authorization(self):
+        self.login("devtable", "password")
+        devtable = get_user("devtable")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assignment = model.oauth.assign_token_to_user(
+            app, devtable, app.redirect_uri, "repo:read", "token"
+        )
+        response = self.getResponse(
+            "web.request_authorization_code",
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="repo:read",
+            assignment_uuid=assignment.uuid,
+            response_type="token",
+            expected_code=200,
+        )
+        assert "Are you sure you want to authorize this application?" in str(response)
 
-  def test_attach_custom_build_trigger(self):
-    self.getResponse('web.attach_custom_build_trigger', repository='foo/bar', expected_code=401)
-    self.getResponse('web.attach_custom_build_trigger', repository='devtable/simple', expected_code=401)
+    def test_request_authorization_code_assigned_authorization_disabled(self):
+        self.login("devtable", "password")
+        devtable = get_user("devtable")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assignment = model.oauth.assign_token_to_user(
+            app, devtable, app.redirect_uri, "repo:read", "token"
+        )
+        with toggle_feature("ASSIGN_OAUTH_TOKEN", False):
+            self.getResponse(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                assignment_uuid=assignment.uuid,
+                response_type="token",
+                expected_code=400,
+            )
 
-    self.login('freshuser', 'password')
-    self.getResponse('web.attach_custom_build_trigger', repository='devtable/simple', expected_code=403)
+    def test_request_authorization_code_assigned_authorization_with_existing_scopes(self):
+        self.login("devtable", "password")
+        devtable = get_user("devtable")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assignment = model.oauth.assign_token_to_user(
+            app, devtable, app.redirect_uri, "repo:read", "token"
+        )
+        create_user_access_token(devtable, app.client_id, "repo:read")
+        oauth_tokens = list(model.oauth.list_access_tokens_for_user(devtable))
+        filtered_tokens = [token for token in oauth_tokens if token.application == app]
+        assert len(filtered_tokens) == 1
+        self.getResponse(
+            "web.request_authorization_code",
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="repo:read",
+            assignment_uuid=assignment.uuid,
+            response_type="token",
+            expected_code=302,
+        )
+        assert model.oauth.get_assigned_authorization_for_user(devtable, assignment.uuid) is None
+        oauth_tokens = list(model.oauth.list_access_tokens_for_user(devtable))
+        filtered_tokens = [token for token in oauth_tokens if token.application == app]
+        assert len(filtered_tokens) == 2
 
-    self.login('devtable', 'password')
-    self.getResponse('web.attach_custom_build_trigger', repository='devtable/simple', expected_code=302)
+    def test_build_status_badge(self):
+        # Try for an invalid repository.
+        self.getResponse("web.build_status_badge", repository="foo/bar", expected_code=404)
 
-  def test_redirect_to_repository(self):
-    self.getResponse('web.redirect_to_repository', repository='foo/bar', expected_code=404)
-    self.getResponse('web.redirect_to_repository', repository='public/publicrepo', expected_code=302)
-    self.getResponse('web.redirect_to_repository', repository='devtable/simple', expected_code=403)
+        # Try for a public repository.
+        self.getResponse("web.build_status_badge", repository="public/publicrepo")
 
-    self.login('devtable', 'password')
-    self.getResponse('web.redirect_to_repository', repository='devtable/simple', expected_code=302)
+        # Try for an private repository.
+        self.getResponse("web.build_status_badge", repository="devtable/simple", expected_code=404)
 
-  def test_redirect_to_namespace(self):
-    self.getResponse('web.redirect_to_namespace', namespace='unknown', expected_code=404)
-    self.getResponse('web.redirect_to_namespace', namespace='devtable', expected_code=302)
-    self.getResponse('web.redirect_to_namespace', namespace='buynlarge', expected_code=302)
+        # Try for an private repository with an invalid token.
+        self.getResponse(
+            "web.build_status_badge",
+            repository="devtable/simple",
+            token="sometoken",
+            expected_code=404,
+        )
+
+        # Try for an private repository with a valid token.
+        repository = model.repository.get_repository("devtable", "simple")
+        self.getResponse(
+            "web.build_status_badge", repository="devtable/simple", token=repository.badge_token
+        )
+
+    def test_attach_custom_build_trigger(self):
+        self.getResponse("web.attach_custom_build_trigger", repository="foo/bar", expected_code=401)
+        self.getResponse(
+            "web.attach_custom_build_trigger", repository="devtable/simple", expected_code=401
+        )
+
+        self.login("freshuser", "password")
+        self.getResponse(
+            "web.attach_custom_build_trigger", repository="devtable/simple", expected_code=403
+        )
+
+        self.login("devtable", "password")
+        self.getResponse(
+            "web.attach_custom_build_trigger", repository="devtable/simple", expected_code=302
+        )
+
+    def test_redirect_to_repository(self):
+        self.getResponse("web.redirect_to_repository", repository="foo/bar", expected_code=404)
+        self.getResponse(
+            "web.redirect_to_repository", repository="public/publicrepo", expected_code=302
+        )
+        self.getResponse(
+            "web.redirect_to_repository", repository="devtable/simple", expected_code=403
+        )
+
+        self.login("devtable", "password")
+        self.getResponse(
+            "web.redirect_to_repository", repository="devtable/simple", expected_code=302
+        )
+
+    def test_redirect_to_namespace(self):
+        self.getResponse("web.redirect_to_namespace", namespace="unknown", expected_code=404)
+        self.getResponse("web.redirect_to_namespace", namespace="devtable", expected_code=302)
+        self.getResponse("web.redirect_to_namespace", namespace="buynlarge", expected_code=302)
+
+    def test_config_with_billing_disabled(self):
+        with toggle_feature("BILLING", False):
+            resp = self.getResponse("web.config", expected_code=200)
+            data = py_json.loads(resp)
+            self.assertIn("version_number", data)
+            self.assertTrue(data["version_number"].startswith("Quay "))
+
+    def test_config_with_billing_enabled(self):
+        with toggle_feature("BILLING", True):
+            resp = self.getResponse("web.config", expected_code=200)
+            data = py_json.loads(resp)
+            self.assertIn("version_number", data)
+            self.assertEqual(data["version_number"], "")
 
 
 class OAuthTestCase(EndpointTestCase):
-  def test_authorize_nologin(self):
-    form = {
-      'client_id': 'someclient',
-      'redirect_uri': 'http://localhost:5000/foobar',
-      'scope': 'user:admin',
-    }
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nologin(self, response_type):
+        form = {
+            "client_id": "someclient",
+            "redirect_uri": "http://localhost:5000/foobar",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    self.postResponse('web.authorize_application', form=form, with_csrf=True, expected_code=401)
+        self.postResponse("web.authorize_application", form=form, with_csrf=True, expected_code=401)
 
-  def test_authorize_invalidclient(self):
-    self.login('devtable', 'password')
+    @parameterized.expand(["token", "code"])
+    def test_authorize_invalidclient(self, response_type):
+        self.login("devtable", "password")
 
-    form = {
-      'client_id': 'someclient',
-      'redirect_uri': 'http://localhost:5000/foobar',
-      'scope': 'user:admin',
-    }
+        form = {
+            "client_id": "someclient",
+            "redirect_uri": "http://localhost:5000/foobar",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    resp = self.postResponse('web.authorize_application', form=form, with_csrf=True, expected_code=302)
-    self.assertEquals('http://localhost:5000/foobar?error=unauthorized_client', resp.headers['Location'])
+        resp = self.postResponse(
+            "web.authorize_application", form=form, with_csrf=True, expected_code=302
+        )
+        self.assertEqual(
+            "http://localhost:5000/foobar?error=unauthorized_client", resp.headers["Location"]
+        )
 
-  def test_authorize_invalidscope(self):
-    self.login('devtable', 'password')
+    @parameterized.expand(["token", "code"])
+    def test_authorize_invalidscope(self, response_type):
+        self.login("devtable", "password")
 
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'invalid:scope',
-    }
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "invalid:scope",
+            "response_type": response_type,
+        }
 
-    resp = self.postResponse('web.authorize_application', form=form, with_csrf=True, expected_code=302)
-    self.assertEquals('http://localhost:8000/o2c.html?error=invalid_scope', resp.headers['Location'])
+        resp = self.postResponse(
+            "web.authorize_application", form=form, with_csrf=True, expected_code=302
+        )
+        self.assertEqual(
+            "http://localhost:8000/o2c.html?error=invalid_scope", resp.headers["Location"]
+        )
 
-  def test_authorize_invalidredirecturi(self):
-    self.login('devtable', 'password')
+    @parameterized.expand(["token", "code"])
+    def test_authorize_invalidredirecturi(self, response_type):
+        self.login("devtable", "password")
 
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://some/invalid/uri',
-      'scope': 'user:admin',
-    }
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://some/invalid/uri",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    self.postResponse('web.authorize_application', form=form, with_csrf=True, expected_code=400)
+        self.postResponse("web.authorize_application", form=form, with_csrf=True, expected_code=400)
 
-  def test_authorize_success(self):
-    self.login('devtable', 'password')
+    @parameterized.expand(["token", "code"])
+    def test_authorize_success(self, response_type):
+        self.login("devtable", "password")
 
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    resp = self.postResponse('web.authorize_application', form=form, with_csrf=True, expected_code=302)
-    self.assertTrue('access_token=' in resp.headers['Location'])
+        resp = self.postResponse(
+            "web.authorize_application", form=form, with_csrf=True, expected_code=302
+        )
+        expected_value = "access_token=" if response_type == "token" else "code="
+        self.assertTrue(expected_value in resp.headers["Location"])
 
-  def test_authorize_nocsrf(self):
-    self.login('devtable', 'password')
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nocsrf(self, response_type):
+        self.login("devtable", "password")
 
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    self.postResponse('web.authorize_application', form=form, with_csrf=False, expected_code=403)
+        self.postResponse(
+            "web.authorize_application", form=form, with_csrf=False, expected_code=403
+        )
 
-  def test_authorize_nocsrf_withinvalidheader(self):
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nocsrf_withinvalidheader(self, response_type):
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    headers = dict(authorization='Some random header')
-    self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False, expected_code=401)
+        headers = dict(authorization="Some random header")
+        self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=False,
+            expected_code=401,
+        )
 
-  def test_authorize_nocsrf_withbadheader(self):
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nocsrf_withbadheader(self, response_type):
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
 
-    headers = dict(authorization='Basic ' + base64.b64encode('devtable:invalidpassword'))
-    self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False,
-                      expected_code=401)
+        headers = dict(authorization=gen_basic_auth("devtable", "invalidpassword"))
+        self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=False,
+            expected_code=401,
+        )
 
-  def test_authorize_nocsrf_correctheader(self):
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+    def test_authorize_application_assignment_id_with_code(self):
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "assignment_uuid": "assignmentid",
+            "response_type": "code",
+        }
 
-    # Try without the client id being in the whitelist.
-    headers = dict(authorization='Basic ' + base64.b64encode('devtable:password'))
-    self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False,
-                      expected_code=403)
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=True,
+            expected_code=400,
+        )
 
-    # Add the client ID to the whitelist and try again.
-    app.config['DIRECT_OAUTH_CLIENTID_WHITELIST'] = ['deadbeef']
+    def test_authorize_application_not_org_admin(self):
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        form = {
+            "client_id": app.client_id,
+            "redirect_uri": app.redirect_uri,
+            "scope": "user:admin",
+            "assignment_uuid": "assignmentid",
+            "response_type": "token",
+        }
 
-    headers = dict(authorization='Basic ' + base64.b64encode('devtable:password'))
-    resp = self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False, expected_code=302)
-    self.assertTrue('access_token=' in resp.headers['Location'])
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        response = self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=True,
+            expected_code=302,
+        )
+        assert "unauthorized_client" in response.headers["Location"]
 
-  def test_authorize_nocsrf_ratelimiting(self):
-    # Note: Defined in initdb.py
-    form = {
-      'client_id': 'deadbeef',
-      'redirect_uri': 'http://localhost:8000/o2c.html',
-      'scope': 'user:admin',
-    }
+    def test_authorize_application_assigned_authorization(self):
+        devtable = get_user("devtable")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assignment = model.oauth.assign_token_to_user(
+            app, devtable, app.redirect_uri, "repo:read", "token"
+        )
+        tokens = list(model.oauth.list_access_tokens_for_user(devtable))
+        assert len(tokens) == 1
+        form = {
+            "client_id": app.client_id,
+            "redirect_uri": app.redirect_uri,
+            "scope": "user:admin",
+            "assignment_uuid": assignment.uuid,
+            "response_type": "token",
+        }
 
-    # Try without the client id being in the whitelist a few times, making sure we eventually get rate limited.
-    headers = dict(authorization='Basic ' + base64.b64encode('devtable:invalidpassword'))
-    self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False, expected_code=401)
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        response = self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=True,
+            expected_code=302,
+        )
+        assert len(list(model.oauth.list_access_tokens_for_user(devtable))) == 2
+        assert model.oauth.get_assigned_authorization_for_user(devtable, assignment.uuid) is None
 
-    counter = 0
-    while True:
-      r = self.postResponse('web.authorize_application', headers=headers, form=form, with_csrf=False, expected_code=None)
-      self.assertNotEquals(200, r.status_code)
-      counter = counter + 1
-      if counter > 5:
-        self.fail('Exponential backoff did not fire')
+    def test_authorize_application_assigned_authorization_disabled(self):
+        devtable = get_user("devtable")
+        user = get_user("randomuser")
+        org = model.organization.create_organization("testorg", "testorg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assignment = model.oauth.assign_token_to_user(
+            app, devtable, app.redirect_uri, "repo:read", "token"
+        )
+        form = {
+            "client_id": app.client_id,
+            "redirect_uri": app.redirect_uri,
+            "scope": "user:admin",
+            "assignment_uuid": assignment.uuid,
+            "response_type": "token",
+        }
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        with toggle_feature("ASSIGN_OAUTH_TOKEN", False):
+            self.postResponse(
+                "web.authorize_application",
+                headers=headers,
+                form=form,
+                with_csrf=True,
+                expected_code=400,
+            )
 
-      if r.status_code == 429:
-        break
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nocsrf_correctheader(self, response_type):
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
+
+        # Try without the client id being in the whitelist.
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=False,
+            expected_code=403,
+        )
+
+        # Add the client ID to the whitelist and try again.
+        app.config["DIRECT_OAUTH_CLIENTID_WHITELIST"] = ["deadbeef"]
+
+        headers = dict(authorization=gen_basic_auth("devtable", "password"))
+        resp = self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=False,
+            expected_code=302,
+        )
+
+        # Reset app config
+        app.config["DIRECT_OAUTH_CLIENTID_WHITELIST"] = []
+
+        expected_value = "access_token=" if response_type == "token" else "code="
+        self.assertTrue(expected_value in resp.headers["Location"])
+
+    @parameterized.expand(["token", "code"])
+    def test_authorize_nocsrf_ratelimiting(self, response_type):
+        # Note: Defined in initdb.py
+        form = {
+            "client_id": "deadbeef",
+            "redirect_uri": "http://localhost:8000/o2c.html",
+            "scope": "user:admin",
+            "response_type": response_type,
+        }
+
+        # Try without the client id being in the whitelist a few times, making sure we eventually get rate limited.
+        headers = dict(authorization=gen_basic_auth("devtable", "invalidpassword"))
+        self.postResponse(
+            "web.authorize_application",
+            headers=headers,
+            form=form,
+            with_csrf=False,
+            expected_code=401,
+        )
+
+        counter = 0
+        while True:
+            r = self.postResponse(
+                "web.authorize_application",
+                headers=headers,
+                form=form,
+                with_csrf=False,
+                expected_code=None,
+            )
+            self.assertNotEqual(200, r.status_code)
+            counter = counter + 1
+            if counter > 5:
+                self.fail("Exponential backoff did not fire")
+
+            if r.status_code == 429:
+                break
+
+    def test_request_authorization_code_basic_auth(self):
+        """
+        Verifies that request authorization code does not raise a 500 anymore when basic
+        auth is provided.
+        """
+        org = model.organization.get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/bah")
+
+        auth_header = gen_basic_auth("devtable", "password")
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 200)
+
+    def test_request_authorization_code_basic_auth_invalid_credentials(self):
+        """
+        Verifies that when we have improper credentials that a proper 401 is returned back instead of a 500.
+        """
+        org = model.organization.get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/bah")
+
+        auth_header = gen_basic_auth("randomuserwithoutaccess", "password")
+
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 401)
+
+        auth_header = gen_basic_auth("devtable", "completelywrongpassword")
+
+        rv = self.app.get(
+            url_for(
+                "web.request_authorization_code",
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="repo:read",
+                response_type="token",
+            ),
+            headers={"Authorization": auth_header},
+        )
+
+        self.assertEqual(rv.status_code, 401)
 
 
 class KeyServerTestCase(EndpointTestCase):
-  def _get_test_jwt_payload(self):
-    return {
-      'iss': 'sample_service',
-      'aud': keyserver.JWT_AUDIENCE,
-      'exp': int(time.time()) + 60,
-      'iat': int(time.time()),
-      'nbf': int(time.time()),
-    }
+    def _get_test_jwt_payload(self):
+        return {
+            "iss": "sample_service",
+            "aud": keyserver.JWT_AUDIENCE,
+            "exp": int(time.time()) + 60,
+            "iat": int(time.time()),
+            "nbf": int(time.time()),
+        }
 
-  def test_list_service_keys(self):
-    # Retrieve all the keys.
-    all_keys = model.service_keys.list_all_keys()
-    visible_jwks = [jwk_with_kid(key) for key in model.service_keys.list_service_keys('sample_service')]
+    def test_list_service_keys(self):
+        # Retrieve all the keys.
+        all_keys = model.service_keys.list_all_keys()
+        visible_jwks = [
+            jwk_with_kid(key) for key in model.service_keys.list_service_keys("sample_service")
+        ]
 
-    invisible_jwks = []
-    for key in all_keys:
-      is_expired = key.expiration_date and key.expiration_date <= datetime.utcnow()
-      if key.service != 'sample_service' or key.approval is None or is_expired:
-        invisible_jwks.append(key.jwk)
+        invisible_jwks = []
+        for key in all_keys:
+            is_expired = key.expiration_date and key.expiration_date <= datetime.utcnow()
+            if key.service != "sample_service" or key.approval is None or is_expired:
+                invisible_jwks.append(key.jwk)
 
-    rv = self.getResponse('key_server.list_service_keys', service='sample_service')
-    jwkset = py_json.loads(rv)
+        rv = self.getResponse("key_server.list_service_keys", service="sample_service")
+        jwkset = py_json.loads(rv)
 
-    # Make sure the hidden keys are not returned and the visible ones are returned.
-    self.assertTrue(len(visible_jwks) > 0)
-    self.assertTrue(len(invisible_jwks) > 0)
-    self.assertEquals(len(visible_jwks), len(jwkset['keys']))
+        # Make sure the hidden keys are not returned and the visible ones are returned.
+        self.assertTrue(len(visible_jwks) > 0)
+        self.assertTrue(len(invisible_jwks) > 0)
+        self.assertEqual(len(visible_jwks), len(jwkset["keys"]))
 
-    for jwk in jwkset['keys']:
-      self.assertIn(jwk, visible_jwks)
-      self.assertNotIn(jwk, invisible_jwks)
+        for jwk in jwkset["keys"]:
+            self.assertIn(jwk, visible_jwks)
+            self.assertNotIn(jwk, invisible_jwks)
+
+    def test_get_service_key(self):
+        # 200 for an approved key
+        self.getResponse("key_server.get_service_key", service="sample_service", kid="kid1")
+
+        # 409 for an unapproved key
+        self.getResponse(
+            "key_server.get_service_key", service="sample_service", kid="kid3", expected_code=409
+        )
+
+        # 404 for a non-existant key
+        self.getResponse(
+            "key_server.get_service_key", service="sample_service", kid="kid9999", expected_code=404
+        )
+
+        # 403 for an approved but expired key that is inside of the 2 week window.
+        self.getResponse(
+            "key_server.get_service_key", service="sample_service", kid="kid6", expected_code=403
+        )
+
+        # 404 for an approved, expired key that is outside of the 2 week window.
+        self.getResponse(
+            "key_server.get_service_key", service="sample_service", kid="kid7", expected_code=404
+        )
+
+    def test_put_service_key(self):
+        # No Authorization header should yield a 400
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="kid420",
+            headers={
+                "Content-Type": "application/json",
+            },
+            data={},
+            expected_code=400,
+        )
+
+        # Mint a JWT with our test payload
+        jwk = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+        private_pem = jwk.get_private_key().private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        payload = self._get_test_jwt_payload()
+        token = jwt.encode(payload, private_pem, "RS256")
+
+        # Invalid service name should yield a 400.
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample service",
+            kid="kid420",
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=jwk.as_dict(),
+            expected_code=400,
+        )
+
+        # Keys created over HTTP must always expire.
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="kid420",
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=jwk.as_dict(),
+            expected_code=400,
+        )
+
+        # Publish a new key.
+        signer_expiration = int(time.time()) + 600
+        with assert_action_logged("service_key_create"):
+            self.putResponse(
+                "key_server.put_service_key",
+                service="sample_service",
+                kid="kid420",
+                expiration=signer_expiration,
+                headers={
+                    "Authorization": "Bearer %s" % token,
+                    "Content-Type": "application/json",
+                },
+                data=jwk.as_dict(),
+                expected_code=202,
+            )
+
+        # Ensure that the key exists but is unapproved.
+        self.getResponse(
+            "key_server.get_service_key", service="sample_service", kid="kid420", expected_code=409
+        )
+
+        # Attempt to rotate the key. Since not approved, it will fail.
+        token = jwt.encode(payload, private_pem, "RS256", headers={"kid": "kid420"})
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="kid6969",
+            expiration=int(time.time()) + 300,
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=jwk.as_dict(),
+            expected_code=403,
+        )
+
+        # Approve the key.
+        model.service_keys.approve_service_key(
+            "kid420", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+
+        # Rotate that new key. The expiration is clamped to the signer's expiration.
+        with assert_action_logged("service_key_rotate"):
+            rotation_payload = dict(payload)
+            rotation_payload[keyserver.KEY_ROTATION_CLAIM] = "kid6969"
+            token = jwt.encode(
+                rotation_payload, private_pem, "RS256", headers={"kid": "kid420"}
+            )
+            self.putResponse(
+                "key_server.put_service_key",
+                service="sample_service",
+                kid="kid6969",
+                expiration=int(time.time()) + 1200,
+                headers={
+                    "Authorization": "Bearer %s" % token,
+                    "Content-Type": "application/json",
+                },
+                data=jwk.as_dict(),
+                expected_code=200,
+            )
+
+        self.getResponse(
+            "key_server.get_service_key",
+            service="sample_service",
+            kid="kid420",
+            expected_code=404,
+        )
+        rotated_key = model.service_keys.get_service_key("kid6969", service="sample_service")
+        self.assertEqual(
+            rotated_key.expiration_date, datetime.utcfromtimestamp(signer_expiration)
+        )
+
+        # Rotation should only work when signed by the previous key.
+        jwk = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+        private_pem = jwk.get_private_key().private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+
+        token = jwt.encode(rotation_payload, private_pem, "RS256", headers={"kid": "kid420"})
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="kid6969",
+            expiration=int(time.time()) + 300,
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=jwk.as_dict(),
+            expected_code=403,
+        )
+
+    def test_registry_jwt_cannot_rotate_or_delete_service_keys(self):
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", datetime.utcnow() + timedelta(minutes=10), kid="approved-signer"
+        )
+        model.service_keys.approve_service_key(
+            "approved-signer", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+        proposed_key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+
+        payload = self._get_test_jwt_payload()
+        payload.update(
+            {
+                "access": [],
+                "context": {},
+                keyserver.KEY_ROTATION_CLAIM: "proposed-key",
+            }
+        )
+        token = jwt.encode(
+            payload,
+            private_key,
+            "RS256",
+            headers={"kid": "approved-signer"},
+        )
+        headers = {
+            "Authorization": "Bearer %s" % token,
+            "Content-Type": "application/json",
+        }
+
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="proposed-key",
+            expiration=int(time.time()) + 300,
+            headers=headers,
+            data=proposed_key.as_dict(),
+            expected_code=403,
+        )
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            service="sample_service",
+            kid="approved-signer",
+            headers=headers,
+            expected_code=403,
+        )
+
+    def test_v2_auth_token_cannot_install_service_key(self):
+        auth_response = self.app.get(
+            url_for(
+                "v2.generate_registry_jwt",
+                service=keyserver.JWT_AUDIENCE,
+                scope="repository:public/publicrepo:pull",
+            )
+        )
+        self.assertEqual(auth_response.status_code, 200)
+        token = auth_response.get_json()["token"]
+        proposed_key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+
+        self.putResponse(
+            "key_server.put_service_key",
+            service=app.config["INSTANCE_SERVICE_KEY_SERVICE"],
+            kid="attacker-key",
+            expiration=int(time.time()) + 300,
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=proposed_key.as_dict(),
+            expected_code=400,
+        )
+        self.getResponse(
+            "key_server.get_service_key",
+            service=app.config["INSTANCE_SERVICE_KEY_SERVICE"],
+            kid="attacker-key",
+            expected_code=404,
+        )
+
+    def test_rotation_requires_bound_short_lived_credential(self):
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", datetime.utcnow() + timedelta(minutes=10), kid="rotation-signer"
+        )
+        model.service_keys.approve_service_key(
+            "rotation-signer", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+        proposed_key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+        headers = {"kid": "rotation-signer"}
+
+        for rotation_claim, expected_code in ((None, 403), ("different-key", 403)):
+            payload = self._get_test_jwt_payload()
+            if rotation_claim is not None:
+                payload[keyserver.KEY_ROTATION_CLAIM] = rotation_claim
+            token = jwt.encode(payload, private_key, "RS256", headers=headers)
+            self.putResponse(
+                "key_server.put_service_key",
+                service="sample_service",
+                kid="proposed-key",
+                expiration=int(time.time()) + 300,
+                headers={
+                    "Authorization": "Bearer %s" % token,
+                    "Content-Type": "application/json",
+                },
+                data=proposed_key.as_dict(),
+                expected_code=expected_code,
+            )
+
+        payload = self._get_test_jwt_payload()
+        payload[keyserver.KEY_ROTATION_CLAIM] = "proposed-key"
+        payload["exp"] = payload["iat"] + keyserver.KEY_SERVER_TOKEN_MAX_AGE_S + 1
+        token = jwt.encode(payload, private_key, "RS256", headers=headers)
+        self.putResponse(
+            "key_server.put_service_key",
+            service="sample_service",
+            kid="proposed-key",
+            expiration=int(time.time()) + 300,
+            headers={
+                "Authorization": "Bearer %s" % token,
+                "Content-Type": "application/json",
+            },
+            data=proposed_key.as_dict(),
+            expected_code=400,
+        )
+
+    def test_delete_service_key_is_scoped_to_service(self):
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", None, kid="scoped-signer"
+        )
+        model.service_keys.approve_service_key(
+            "scoped-signer", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+        model.service_keys.generate_service_key("other_service", None, kid="other-service-key")
+        token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key,
+            "RS256",
+            headers={"kid": "scoped-signer"},
+        )
+
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            service="sample_service",
+            kid="other-service-key",
+            headers={"Authorization": "Bearer %s" % token},
+            expected_code=404,
+        )
+        model.service_keys.get_service_key(
+            "other-service-key",
+            service="other_service",
+            alive_only=False,
+            approved_only=False,
+        )
+
+    def test_attempt_delete_service_key_with_no_kid_signer(self):
+        # Generate two keys, approving the first.
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", None, kid="first"
+        )
+
+        # Mint a JWT with our test payload but *no kid*.
+        token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            "RS256",
+            headers={},
+        )
+
+        # Using the credentials of our key, attempt to delete our unapproved key
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            headers={"Authorization": "Bearer %s" % token},
+            expected_code=400,
+            service="sample_service",
+            kid="first",
+        )
+
+    def test_attempt_delete_service_key_with_expired_key(self):
+        # Generate two keys, approving the first.
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", None, kid="first"
+        )
+        model.service_keys.approve_service_key(
+            "first", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+        model.service_keys.generate_service_key("sample_service", None, kid="second")
+
+        # Mint a JWT with our test payload
+        token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            "RS256",
+            headers={"kid": "first"},
+        )
+
+        # Set the expiration of the first to now - some time.
+        model.service_keys.set_key_expiration("first", datetime.utcnow() - timedelta(seconds=100))
+
+        # Using the credentials of our second key, attempt to delete our unapproved key
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            headers={"Authorization": "Bearer %s" % token},
+            expected_code=403,
+            service="sample_service",
+            kid="second",
+        )
+
+        # Set the expiration to the future and delete the key.
+        model.service_keys.set_key_expiration("first", datetime.utcnow() + timedelta(seconds=100))
+
+        with assert_action_logged("service_key_delete"):
+            self.deleteEmptyResponse(
+                "key_server.delete_service_key",
+                headers={"Authorization": "Bearer %s" % token},
+                expected_code=204,
+                service="sample_service",
+                kid="second",
+            )
+
+    def test_delete_unapproved_service_key(self):
+        # No Authorization header should yield a 400
+        self.deleteResponse(
+            "key_server.delete_service_key", expected_code=400, service="sample_service", kid="kid1"
+        )
+
+        # Generate an unapproved key.
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", None, kid="unapprovedkeyhere"
+        )
+
+        # Mint a JWT with our test payload
+        token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            "RS256",
+            headers={"kid": "unapprovedkeyhere"},
+        )
+
+        # Delete our unapproved key with itself.
+        with assert_action_logged("service_key_delete"):
+            self.deleteEmptyResponse(
+                "key_server.delete_service_key",
+                headers={"Authorization": "Bearer %s" % token},
+                expected_code=204,
+                service="sample_service",
+                kid="unapprovedkeyhere",
+            )
+
+    def test_delete_chained_service_key(self):
+        # No Authorization header should yield a 400
+        self.deleteResponse(
+            "key_server.delete_service_key", expected_code=400, service="sample_service", kid="kid1"
+        )
+
+        # Generate two keys.
+        private_key, _ = model.service_keys.generate_service_key(
+            "sample_service", None, kid="kid123"
+        )
+        model.service_keys.generate_service_key("sample_service", None, kid="kid321")
+
+        # Mint a JWT with our test payload
+        token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            "RS256",
+            headers={"kid": "kid123"},
+        )
+
+        # Using the credentials of our second key, attempt tp delete our unapproved key
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            headers={"Authorization": "Bearer %s" % token},
+            expected_code=403,
+            service="sample_service",
+            kid="kid321",
+        )
+
+        # Approve the second key.
+        model.service_keys.approve_service_key(
+            "kid123", ServiceKeyApprovalType.SUPERUSER, approver=1
+        )
+
+        # Using the credentials of our approved key, delete our unapproved key
+        with assert_action_logged("service_key_delete"):
+            self.deleteEmptyResponse(
+                "key_server.delete_service_key",
+                headers={"Authorization": "Bearer %s" % token},
+                expected_code=204,
+                service="sample_service",
+                kid="kid321",
+            )
+
+        # Attempt to delete a key signed by a key from a different service
+        bad_token = jwt.encode(
+            self._get_test_jwt_payload(),
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            "RS256",
+            headers={"kid": "kid5"},
+        )
+        self.deleteResponse(
+            "key_server.delete_service_key",
+            headers={"Authorization": "Bearer %s" % bad_token},
+            expected_code=403,
+            service="sample_service",
+            kid="kid123",
+        )
+
+        # Delete a self-signed, approved key
+        with assert_action_logged("service_key_delete"):
+            self.deleteEmptyResponse(
+                "key_server.delete_service_key",
+                headers={"Authorization": "Bearer %s" % token},
+                expected_code=204,
+                service="sample_service",
+                kid="kid123",
+            )
 
 
-  def test_get_service_key(self):
-    # 200 for an approved key
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid1')
+class AssignOauthAppTestCase(EndpointTestCase):
+    def test_assign_user(self):
+        self.login("devtable", "password")
+        assigned_user = get_user("randomuser")
+        org = get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        assigned_auths = model.oauth.list_assigned_authorizations_for_user(assigned_user)
+        assert len(assigned_auths) == 0
+        notifications = list_notifications(assigned_user)
+        assert len(notifications) == 0
 
-    # 409 for an unapproved key
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid3',
-                     expected_code=409)
+        response = self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=True,
+            expected_code=200,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="randomuser",
+            response_type="token",
+        )
 
-    # 404 for a non-existant key
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid9999',
-                     expected_code=404)
+        assert "Token assigned successfully" in response.data.decode("utf-8")
+        assigned_auths = model.oauth.list_assigned_authorizations_for_user(assigned_user)
+        assert len(assigned_auths) == 1
+        assert assigned_auths[0].application == app
+        notifications = list_notifications(assigned_user)
+        assert len(notifications) == 1
+        assert (
+            notifications[0].kind
+            == NotificationKind.select()
+            .where(NotificationKind.name == "assigned_authorization")
+            .get()
+        )
 
-    # 403 for an approved but expired key that is inside of the 2 week window.
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid6',
-                     expected_code=403)
+    def test_assign_user_nocsrf(self):
+        self.login("devtable", "password")
+        org = get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=False,
+            expected_code=403,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="randomuser",
+            response_type="token",
+        )
 
-    # 404 for an approved, expired key that is outside of the 2 week window.
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid7',
-                     expected_code=404)
+    def test_assign_user_unauthenticated(self):
+        org = get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=True,
+            expected_code=401,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="randomuser",
+            response_type="token",
+        )
 
-  def test_put_service_key(self):
-    # No Authorization header should yield a 400
-    self.putResponse('key_server.put_service_key', service='sample_service', kid='kid420',
-                     expected_code=400)
+    def test_assign_user_user_does_not_exist(self):
+        self.login("devtable", "password")
+        org = get_organization("buynlarge")
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=True,
+            expected_code=404,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="doesnotexist",
+            response_type="token",
+        )
 
-    # Mint a JWT with our test payload
-    private_key = RSA.generate(2048)
-    jwk = RSAKey(key=private_key.publickey()).serialize()
-    payload = self._get_test_jwt_payload()
-    token = jwt.encode(payload, private_key.exportKey('PEM'), 'RS256')
+    def test_assign_user_app_does_not_exist(self):
+        self.login("devtable", "password")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=True,
+            expected_code=404,
+            client_id="doesnotexist",
+            redirect_uri="http://foo/bar/baz",
+            scope="user:admin",
+            username="randomuser",
+            response_type="token",
+        )
 
-    # Invalid service name should yield a 400.
-    self.putResponse('key_server.put_service_key', service='sample service', kid='kid420',
-                     headers={
-                      'Authorization': 'Bearer %s' % token,
-                      'Content-Type': 'application/json',
-                     }, data=jwk, expected_code=400)
+    def test_assign_user_not_org_admin(self):
+        self.login("devtable", "password")
+        user = get_user("randomuser")
+        org = create_organization("neworg", "neworg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        self.postResponse(
+            "web.assign_user_to_app",
+            with_csrf=True,
+            expected_code=403,
+            client_id=app.client_id,
+            redirect_uri=app.redirect_uri,
+            scope="user:admin",
+            username="freshuser",
+            response_type="token",
+        )
 
-    # Publish a new key
-    with assert_action_logged('service_key_create'):
-      self.putResponse('key_server.put_service_key', service='sample_service', kid='kid420',
-                       headers={
-                        'Authorization': 'Bearer %s' % token,
-                        'Content-Type': 'application/json',
-                       }, data=jwk, expected_code=202)
-
-    # Ensure that the key exists but is unapproved.
-    self.getResponse('key_server.get_service_key', service='sample_service', kid='kid420',
-                     expected_code=409)
-
-    # Attempt to rotate the key. Since not approved, it will fail.
-    token = jwt.encode(payload, private_key.exportKey('PEM'), 'RS256', headers={'kid': 'kid420'})
-    self.putResponse('key_server.put_service_key', service='sample_service', kid='kid6969',
-                     headers={
-                       'Authorization': 'Bearer %s' % token,
-                       'Content-Type': 'application/json',
-                     }, data=jwk, expected_code=403)
-
-    # Approve the key.
-    model.service_keys.approve_service_key('kid420', ServiceKeyApprovalType.SUPERUSER, approver=1)
-
-    # Rotate that new key
-    with assert_action_logged('service_key_rotate'):
-      token = jwt.encode(payload, private_key.exportKey('PEM'), 'RS256', headers={'kid': 'kid420'})
-      self.putResponse('key_server.put_service_key', service='sample_service', kid='kid6969',
-                       headers={
-                         'Authorization': 'Bearer %s' % token,
-                         'Content-Type': 'application/json',
-                       }, data=jwk, expected_code=200)
-
-    # Rotation should only work when signed by the previous key
-    private_key = RSA.generate(2048)
-    jwk = RSAKey(key=private_key.publickey()).serialize()
-    token = jwt.encode(payload, private_key.exportKey('PEM'), 'RS256', headers={'kid': 'kid420'})
-    self.putResponse('key_server.put_service_key', service='sample_service', kid='kid6969',
-                     headers={
-                       'Authorization': 'Bearer %s' % token,
-                       'Content-Type': 'application/json',
-                     }, data=jwk, expected_code=403)
-
-
-  def test_attempt_delete_service_key_with_no_kid_signer(self):
-    # Generate two keys, approving the first.
-    private_key, _ = model.service_keys.generate_service_key('sample_service', None, kid='first')
-
-    # Mint a JWT with our test payload but *no kid*.
-    token = jwt.encode(self._get_test_jwt_payload(), private_key.exportKey('PEM'), 'RS256',
-                       headers={})
-
-    # Using the credentials of our key, attempt to delete our unapproved key
-    self.deleteResponse('key_server.delete_service_key',
-                        headers={'Authorization': 'Bearer %s' % token},
-                        expected_code=400, service='sample_service', kid='first')
-
-
-  def test_attempt_delete_service_key_with_expired_key(self):
-    # Generate two keys, approving the first.
-    private_key, _ = model.service_keys.generate_service_key('sample_service', None, kid='first')
-    model.service_keys.approve_service_key('first', ServiceKeyApprovalType.SUPERUSER, approver=1)
-    model.service_keys.generate_service_key('sample_service', None, kid='second')
-
-    # Mint a JWT with our test payload
-    token = jwt.encode(self._get_test_jwt_payload(), private_key.exportKey('PEM'), 'RS256',
-                       headers={'kid': 'first'})
-
-    # Set the expiration of the first to now - some time.
-    model.service_keys.set_key_expiration('first', datetime.utcnow() - timedelta(seconds=100))
-
-    # Using the credentials of our second key, attempt to delete our unapproved key
-    self.deleteResponse('key_server.delete_service_key',
-                        headers={'Authorization': 'Bearer %s' % token},
-                        expected_code=403, service='sample_service', kid='second')
-
-    # Set the expiration to the future and delete the key.
-    model.service_keys.set_key_expiration('first', datetime.utcnow() + timedelta(seconds=100))
-
-    with assert_action_logged('service_key_delete'):
-      self.deleteEmptyResponse('key_server.delete_service_key',
-                          headers={'Authorization': 'Bearer %s' % token},
-                          expected_code=204, service='sample_service', kid='second')
-
-
-  def test_delete_unapproved_service_key(self):
-    # No Authorization header should yield a 400
-    self.deleteResponse('key_server.delete_service_key', expected_code=400,
-                        service='sample_service', kid='kid1')
-
-    # Generate an unapproved key.
-    private_key, _ = model.service_keys.generate_service_key('sample_service', None,
-                                                             kid='unapprovedkeyhere')
-
-    # Mint a JWT with our test payload
-    token = jwt.encode(self._get_test_jwt_payload(), private_key.exportKey('PEM'), 'RS256',
-                       headers={'kid': 'unapprovedkeyhere'})
-
-    # Delete our unapproved key with itself.
-    with assert_action_logged('service_key_delete'):
-      self.deleteEmptyResponse('key_server.delete_service_key',
-                          headers={'Authorization': 'Bearer %s' % token},
-                          expected_code=204, service='sample_service', kid='unapprovedkeyhere')
+    def test_assign_user_disabled(self):
+        self.login("devtable", "password")
+        user = get_user("randomuser")
+        org = create_organization("neworg", "neworg@devtable.com", user)
+        app = model.oauth.create_application(org, "test", "http://foo/bar", "http://foo/bar/baz")
+        with toggle_feature("ASSIGN_OAUTH_TOKEN", False):
+            self.postResponse(
+                "web.assign_user_to_app",
+                with_csrf=True,
+                expected_code=404,
+                client_id=app.client_id,
+                redirect_uri=app.redirect_uri,
+                scope="user:admin",
+                username="freshuser",
+                response_type="token",
+            )
 
 
-  def test_delete_chained_service_key(self):
-    # No Authorization header should yield a 400
-    self.deleteResponse('key_server.delete_service_key', expected_code=400,
-                        service='sample_service', kid='kid1')
-
-    # Generate two keys.
-    private_key, _ = model.service_keys.generate_service_key('sample_service', None, kid='kid123')
-    model.service_keys.generate_service_key('sample_service', None, kid='kid321')
-
-    # Mint a JWT with our test payload
-    token = jwt.encode(self._get_test_jwt_payload(), private_key.exportKey('PEM'), 'RS256',
-                       headers={'kid': 'kid123'})
-
-    # Using the credentials of our second key, attempt tp delete our unapproved key
-    self.deleteResponse('key_server.delete_service_key',
-                        headers={'Authorization': 'Bearer %s' % token},
-                        expected_code=403, service='sample_service', kid='kid321')
-
-    # Approve the second key.
-    model.service_keys.approve_service_key('kid123', ServiceKeyApprovalType.SUPERUSER, approver=1)
-
-    # Using the credentials of our approved key, delete our unapproved key
-    with assert_action_logged('service_key_delete'):
-      self.deleteEmptyResponse('key_server.delete_service_key',
-                          headers={'Authorization': 'Bearer %s' % token},
-                          expected_code=204, service='sample_service', kid='kid321')
-
-    # Attempt to delete a key signed by a key from a different service
-    bad_token = jwt.encode(self._get_test_jwt_payload(), private_key.exportKey('PEM'), 'RS256',
-                           headers={'kid': 'kid5'})
-    self.deleteResponse('key_server.delete_service_key',
-                        headers={'Authorization': 'Bearer %s' % bad_token},
-                        expected_code=403, service='sample_service', kid='kid123')
-
-    # Delete a self-signed, approved key
-    with assert_action_logged('service_key_delete'):
-      self.deleteEmptyResponse('key_server.delete_service_key',
-                          headers={'Authorization': 'Bearer %s' % token},
-                          expected_code=204, service='sample_service', kid='kid123')
-
-
-if __name__ == '__main__':
-  unittest.main()
+if __name__ == "__main__":
+    unittest.main()
